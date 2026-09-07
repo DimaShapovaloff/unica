@@ -44,13 +44,19 @@ description: "Оптимизация запросов 1С и СКД. Испол�
 ## Query syntax guards
 
 - Do not generate `ПЕРВЫЕ &Количество` or any parameter immediately after `ПЕРВЫЕ`: the 1C query parser expects a numeric constant there and reports `Ожидается константа`.
-- For a dynamic row limit, keep the stored query constructor-safe, for example `ВЫБРАТЬ ПЕРВЫЕ 1`, then before execution replace only that sentinel with a normalized number:
+- For a dynamic row limit, keep the stored query constructor-safe, for example `ВЫБРАТЬ ПЕРВЫЕ 1`. Before execution, include the following line break in the sentinel so that it cannot match the prefix of `ПЕРВЫЕ 10`, and require exactly one occurrence before replacing it with a normalized number:
 
 ```bsl
+МаркерОграничения = "ПЕРВЫЕ 1" + Символы.ПС;
+
+Если СтрЧислоВхождений(Запрос.Текст, МаркерОграничения) <> 1 Тогда
+	ВызватьИсключение "В тексте запроса ожидается один маркер ограничения";
+КонецЕсли;
+
 Запрос.Текст = СтрЗаменить(
 	Запрос.Текст,
-	"ПЕРВЫЕ 1",
-	"ПЕРВЫЕ " + Формат(Количество, "ЧГ=0"));
+	МаркерОграничения,
+	"ПЕРВЫЕ " + Формат(Количество, "ЧГ=0") + Символы.ПС);
 ```
 
 ## Review checklist
