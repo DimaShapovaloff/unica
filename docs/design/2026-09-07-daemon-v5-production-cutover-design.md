@@ -276,6 +276,62 @@ raw-borrow — переменную с таким именем брать по �
 (#778); ночной `large` на Windows не уложился в час — срок джобы Rust для
 `profile: large` поднят до трёх часов (#777).
 
+**Шаг D, 07.09.2026, после вливания #776 (`main` = 30b9d4bf).**
+Push-прогон `main`: с первой попытки красный на ubuntu —
+`two_frontend_processes_race_to_one_daemon_pid_record_and_endpoint`, второй
+ping fixture после ухода конкурента получил EAGAIN через 5 с; перезапуск
+джобы зелёный, локально 5 из 5 — нагрузочный флейк: под дисковой нагрузкой
+проба authority в акторе ledger тянется дольше 2 с, обработчик ping ждёт
+её дважды в пределах своего 10-секундного потолка, клиент сдаётся раньше.
+Финальный ping в fixture теперь повторяется на новой сессии до трёх раз.
+Полный контур (`workflow_dispatch`, `profile: main`): сборка и дым
+упакованного MCP на трёх ОС зелёные с daemon v5, пакет и проба bootstrap
+зелёные; красной осталась оценка на BSP 3.2.1.446 — четыре сценария
+(`workspace-check`, `configuration-view`, `literal-search`, `identity-diff`)
+отпали ровно на 7,2 с с «protocol-v5 deadline expired during connect»:
+daemon занят первым захватом большой конфигурации, ответ на submit
+теряется на cutoff, а восстановлению по ключу не оставалось бюджета. У v3
+здесь был закрытый отказ «daemon deadline expired during invocation submit
+response», который оценка переигрывает один раз для read-only инструментов.
+Правка: восстановление получает собственное ограниченное окно 750 мс после
+cutoff — daemon к этому моменту уже передал работу в Task, и хост получает
+квитанцию вместо ошибки, — а если и окно закрылось, роутер отвечает тем же
+закрытым отказом, что v3: правило хоста «read-only можно переиграть,
+мутацию нельзя» не меняется. Ночь: большой ярус на ubuntu и macOS зелёный,
+Windows — под новым трёхчасовым сроком, итог ниже.
+
+**Ночь 07.09.2026 (run 34152595981).** Ubuntu и macOS: девять тестов
+яруса `large` зелёные, настенные ворота
+`wall_clock_writer_sustains_32_receipts_per_second_on_posix` держат
+32 квитанции в секунду на обоих раннерах (60 с) — открытый вопрос записки
+закрыт. Модель горизонта: 415 с на ubuntu, 465 с на macOS. Windows уложился
+в 85 минут при новом сроке 180: контракт ledger 64 из 65, не влезла в два
+срока `large` только детерминированная модель горизонта
+(`deterministic_horizon_load_does_not_saturate`) — она платформе
+безразлична и снята с Windows-ночи (#781); ещё два красных теста на Windows —
+`invocation_protocol_round_trips_all_four_strict_requests_and_closed_responses`
+и `truncated_handshake_transport_closes_without_a_protocol_response` из
+`daemon/mod.rs` — тесты v3, красные там и до перехода (прогон 34052206875
+от 06.09), уходят вместе с v3 на шаге E.
+
+**Выкидка #780 из очереди (run 34155030958).** Приёмочный корпус
+(`ci-medium`): пятнадцать из двадцати одного сценария `unica.docs` получили
+отказ «daemon invocation receipt is still pending at the frontend cutoff»
+вместо `ok | provider | task`. Причина глубже окна восстановления: роутер
+считал бюджет daemon до подключения, а daemon отсчитывает handoff от приёма
+кадра — при медленном connect (или запуске daemon) его передача в Task
+приходила уже после cutoff фронтенда, ответ терялся, recover находил
+квитанцию pending, срок которой лежит за окном, и отвечал отказом, которого
+корпус не знает. На `main` тот же случай выглядел как «protocol-v5 deadline
+expired during connect» и проходил корпус только благодаря подстроке
+«deadline expired» — класс `provider`. Правка в том же PR: бюджет daemon —
+остаток бюджета фронтенда после установленного соединения (тест
+`daemon_budget_is_what_remains_of_the_frontend_budget_once_the_connection_stands`),
+так что handoff daemon укладывается до cutoff, а окно 750 мс покрывает
+только задержку самой durable-промоции; квитанция, чей срок лежит за окном,
+получает тот же закрытый отказ, что потерянная отправка, — как и записано
+выше, а не отдельный `receipt_pending`.
+
 **Шаг E, план по инвентаризации после C.** Снаружи ядра v3 ссылки остались
 в четырёх файлах: пробы «v5 отвергает v3/v4» в `receipt_scenario_v5.rs`
 (кадры `protocol_v3`), ветка V3 тестового входа в `interfaces/daemon.rs`,
