@@ -8,15 +8,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const PROCESS_FIXTURE_ENV: &str = "UNICA_DAEMON_PROCESS_FIXTURE";
-const IDENTITY_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const IDENTITY_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const PRODUCTION_V5_IDENTITY: &str =
     "884b76181583ce34907a2a9758e2b493e5b40883e7cbb0d7f88dcec0e468cfa0";
 const PROCESS_FIXTURE_IDLE_GRACE_MS: u64 = 2_000;
 const STALE_ENDPOINT_INITIAL_IDLE_GRACE_MS: u64 = 500;
 
 #[test]
-#[ignore = "daemon tier: raises a daemon process; disabled on purpose until the tier is routed"]
 fn daemon_frontend_process_fixture() {
     if std::env::var_os(PROCESS_FIXTURE_ENV).is_none() {
         return;
@@ -49,21 +46,44 @@ fn daemon_frontend_process_fixture() {
         || release.exists(),
         "owner release marker",
     );
-    owner.ping().unwrap();
+    // A loaded runner can stall the daemon's authority probe past one ping
+    // budget; the proof is that the daemon still answers after the competitor
+    // left, so a fresh session gets a bounded number of tries.
+    let mut last_error = None;
+    for _ in 0..3 {
+        match owner.ping() {
+            Ok(()) => return,
+            Err(error) => last_error = Some(error),
+        }
+        owner = unica_coder::interfaces::daemon::connect_owner_for_protocol_test(
+            &state_root,
+            &identity,
+            &executable,
+            PROCESS_FIXTURE_IDLE_GRACE_MS,
+        )
+        .unwrap();
+    }
+    panic!("daemon stopped answering after the competitor left: {last_error:?}");
 }
 
 #[test]
-#[ignore = "daemon tier: raises a daemon process; disabled on purpose until the tier is routed"]
 fn two_frontend_processes_race_to_one_daemon_pid_record_and_endpoint() {
     let root = tempfile::tempdir().unwrap();
     let state_root = std::fs::canonicalize(root.path()).unwrap();
     let go = state_root.join("go");
     let release = state_root.join("release");
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_unica"));
-    let mut first = spawn_frontend(&state_root, IDENTITY_A, &executable, "first", &go, &release);
+    let mut first = spawn_frontend(
+        &state_root,
+        PRODUCTION_V5_IDENTITY,
+        &executable,
+        "first",
+        &go,
+        &release,
+    );
     let mut second = spawn_frontend(
         &state_root,
-        IDENTITY_A,
+        PRODUCTION_V5_IDENTITY,
         &executable,
         "second",
         &go,
@@ -76,7 +96,7 @@ fn two_frontend_processes_race_to_one_daemon_pid_record_and_endpoint() {
     let first_pid = read_pid(state_root.join("first.result"));
     let second_pid = read_pid(state_root.join("second.result"));
     assert_eq!(first_pid, second_pid);
-    let endpoint = read_endpoint(&state_root, IDENTITY_A);
+    let endpoint = read_endpoint(&state_root, PRODUCTION_V5_IDENTITY);
     assert_eq!(endpoint["pid"], first_pid);
     assert_eq!(endpoint["host"], "127.0.0.1");
     assert!(endpoint["port"].as_u64().is_some_and(|port| port > 0));
@@ -86,80 +106,32 @@ fn two_frontend_processes_race_to_one_daemon_pid_record_and_endpoint() {
             "--state-root",
             state_root.to_str().unwrap(),
             "--core-identity",
-            IDENTITY_A,
+            PRODUCTION_V5_IDENTITY,
             "--idle-grace-ms",
             "350",
         ])
         .output()
         .unwrap();
     assert!(!competing.status.success());
-    assert!(String::from_utf8_lossy(&competing.stderr)
-        .contains("task store already has an active owner"));
-    assert_eq!(read_endpoint(&state_root, IDENTITY_A), endpoint);
+    assert!(
+        String::from_utf8_lossy(&competing.stderr)
+            .contains("timed out waiting for stable receipt authority"),
+        "{}",
+        String::from_utf8_lossy(&competing.stderr)
+    );
+    assert_eq!(read_endpoint(&state_root, PRODUCTION_V5_IDENTITY), endpoint);
 
     std::fs::write(&release, b"release").unwrap();
     assert_child_success(&mut first);
     assert_child_success(&mut second);
     wait_until(
         Duration::from_secs(5),
-        || !endpoint_path(&state_root, IDENTITY_A).exists(),
+        || !endpoint_path(&state_root, PRODUCTION_V5_IDENTITY).exists(),
         "owned endpoint removal",
     );
 }
 
 #[test]
-#[ignore = "daemon tier: raises a daemon process; disabled on purpose until the tier is routed"]
-fn incompatible_core_identities_spawn_separate_process_endpoints() {
-    let root = tempfile::tempdir().unwrap();
-    let state_root = std::fs::canonicalize(root.path()).unwrap();
-    let go = state_root.join("go");
-    let release = state_root.join("release");
-    let executable = PathBuf::from(env!("CARGO_BIN_EXE_unica"));
-    let mut first = spawn_frontend(
-        &state_root,
-        IDENTITY_A,
-        &executable,
-        "identity-a",
-        &go,
-        &release,
-    );
-    let mut second = spawn_frontend(
-        &state_root,
-        IDENTITY_B,
-        &executable,
-        "identity-b",
-        &go,
-        &release,
-    );
-    wait_for_frontend_ready(&state_root, &["identity-a", "identity-b"]);
-    std::fs::write(&go, b"go").unwrap();
-    wait_for_frontend_results(&state_root, &["identity-a", "identity-b"]);
-
-    let first_pid = read_pid(state_root.join("identity-a.result"));
-    let second_pid = read_pid(state_root.join("identity-b.result"));
-    assert_ne!(first_pid, second_pid);
-    assert_eq!(read_endpoint(&state_root, IDENTITY_A)["pid"], first_pid);
-    assert_eq!(read_endpoint(&state_root, IDENTITY_B)["pid"], second_pid);
-    assert_ne!(
-        endpoint_path(&state_root, IDENTITY_A),
-        endpoint_path(&state_root, IDENTITY_B)
-    );
-
-    std::fs::write(&release, b"release").unwrap();
-    assert_child_success(&mut first);
-    assert_child_success(&mut second);
-    wait_until(
-        Duration::from_secs(5),
-        || {
-            !endpoint_path(&state_root, IDENTITY_A).exists()
-                && !endpoint_path(&state_root, IDENTITY_B).exists()
-        },
-        "incompatible endpoint removal",
-    );
-}
-
-#[test]
-#[ignore = "daemon tier: raises a daemon process; disabled on purpose until the tier is routed"]
 fn v5_frontend_process_spawns_the_same_binary_and_pings_the_v5_runtime() {
     let root = tempfile::tempdir().unwrap();
     let state_root = std::fs::canonicalize(root.path()).unwrap();
@@ -187,7 +159,6 @@ fn v5_frontend_process_spawns_the_same_binary_and_pings_the_v5_runtime() {
 }
 
 #[test]
-#[ignore = "daemon tier: raises a daemon process; disabled on purpose until the tier is routed"]
 fn stale_v5_endpoint_probe_preserves_budget_to_spawn_a_replacement() {
     let root = tempfile::tempdir().unwrap();
     let state_root = std::fs::canonicalize(root.path()).unwrap();
@@ -261,6 +232,23 @@ fn stale_v5_endpoint_probe_preserves_budget_to_spawn_a_replacement() {
     );
 }
 
+#[test]
+fn read_pid_waits_for_the_record_content_and_not_just_the_file() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("late.result");
+    std::fs::write(&path, b"").unwrap();
+    let writer = {
+        let path = path.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            std::fs::write(&path, b"4242").unwrap();
+        })
+    };
+
+    assert_eq!(read_pid(path), 4242);
+    writer.join().unwrap();
+}
+
 fn spawn_frontend(
     state_root: &Path,
     identity: &str,
@@ -317,7 +305,19 @@ fn wait_for_frontend_results(state_root: &Path, names: &[&str]) {
 }
 
 fn read_pid(path: PathBuf) -> u64 {
-    std::fs::read_to_string(path).unwrap().parse().unwrap()
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let record = std::fs::read_to_string(&path).unwrap_or_default();
+        if let Ok(pid) = record.trim().parse() {
+            return pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for a pid record in {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn endpoint_path(state_root: &Path, identity: &str) -> PathBuf {

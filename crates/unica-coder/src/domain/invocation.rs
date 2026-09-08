@@ -1,8 +1,8 @@
+use crate::domain::refusal::{RefusalCode, RefusalDetail};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::fmt;
 use std::str::FromStr;
-use std::time::Instant;
 use uuid::{Uuid, Variant, Version};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -196,12 +196,17 @@ impl DomainResult {
         }
     }
 
-    pub(crate) fn canonical_rejection(
+    /// Отказ со свободным кодом — только для стенда
+    /// `receipt-ledger-test-support`, который проигрывает протокол демона v5.
+    /// Этот протокол в продукт не входит, и его коды в канонический словарь
+    /// не объявляются. На поверхности код приходит типом:
+    /// см. [`Self::canonical_rejection`].
+    #[cfg(feature = "receipt-ledger-test-support")]
+    pub(crate) fn scenario_rejection(
         at: Option<String>,
-        code: impl Into<String>,
+        code: &str,
         message: impl Into<String>,
     ) -> Self {
-        let code = code.into();
         let message = message.into();
         let mut result = Self::success(message.clone());
         result.ok = false;
@@ -209,70 +214,52 @@ impl DomainResult {
         result.diagnostics = vec![serde_json::json!({"code": code, "message": message})];
         result
     }
-}
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct DeliveryResume {
-    work_identity_hash: SafeIdentityHash,
-}
-
-impl DeliveryResume {
-    pub(crate) fn new(work_identity_hash: SafeIdentityHash) -> Self {
-        Self { work_identity_hash }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct IndexResume {
-    workspace_identity_hash: SafeIdentityHash,
-    source_revision_hash: SafeIdentityHash,
-}
-
-impl IndexResume {
-    pub(crate) fn new(
-        workspace_identity_hash: SafeIdentityHash,
-        source_revision_hash: SafeIdentityHash,
+    pub(crate) fn canonical_rejection(
+        at: Option<String>,
+        code: RefusalCode,
+        message: impl Into<String>,
     ) -> Self {
-        Self {
-            workspace_identity_hash,
-            source_revision_hash,
+        Self::rejection(at, code, None, message)
+    }
+
+    /// Отказ с уточнением: исход выбирает уточнение, а не умолчание кода.
+    /// Нужен там, где один код покрывает несколько исходов, — иначе читатель
+    /// не может выбрать действие, ради чего исход и вводится.
+    pub(crate) fn canonical_rejection_detailed(
+        at: Option<String>,
+        detail: RefusalDetail,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::rejection(at, detail.code(), Some(detail), message)
+    }
+
+    fn rejection(
+        at: Option<String>,
+        code: RefusalCode,
+        detail: Option<RefusalDetail>,
+        message: impl Into<String>,
+    ) -> Self {
+        // Исход выводится, а не выбирается рядом с кодом: два закрытых словаря
+        // со временем разошлись бы. Уточнение, когда оно есть, перекрывает
+        // умолчание кода — так один код обслуживает несколько исходов, не
+        // теряя различия.
+        let outcome = detail.map_or_else(|| code.outcome(), RefusalDetail::outcome);
+        let message = message.into();
+        let mut result = Self::success(message.clone());
+        result.ok = false;
+        result.at = at;
+        let mut diagnostic = serde_json::json!({
+            "code": code.as_str(),
+            "outcome": outcome.as_str(),
+            "message": message,
+        });
+        if let Some(detail) = detail {
+            diagnostic["detailCode"] = serde_json::Value::from(detail.as_str());
         }
+        result.diagnostics = vec![diagnostic];
+        result
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ProviderResume {
-    work_identity_hash: SafeIdentityHash,
-}
-
-impl ProviderResume {
-    pub(crate) fn new(work_identity_hash: SafeIdentityHash) -> Self {
-        Self { work_identity_hash }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct RuntimeResume {
-    work_identity_hash: SafeIdentityHash,
-}
-
-impl RuntimeResume {
-    pub(crate) fn new(work_identity_hash: SafeIdentityHash) -> Self {
-        Self { work_identity_hash }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
-pub(crate) enum ResumeDescriptor {
-    Delivery(DeliveryResume),
-    Index(IndexResume),
-    Provider(ProviderResume),
-    Runtime(RuntimeResume),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,53 +287,9 @@ impl InvocationFailure {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct TaskSnapshot {
-    pub(crate) task_id: TaskId,
-    pub(crate) invocation_id: InvocationId,
-    pub(crate) status: InvocationStatus,
-    pub(crate) result: Option<DomainResult>,
-    pub(crate) failure: Option<InvocationFailure>,
-    pub(crate) resume: Option<ResumeDescriptor>,
-    pub(crate) created_at: Instant,
-    pub(crate) updated_at: Instant,
-    /// Restart-stable persisted Task timestamps. The monotonic fields above
-    /// remain local state-machine evidence and are never projected onto MCP.
-    pub(crate) created_at_epoch_ms: u64,
-    pub(crate) updated_at_epoch_ms: u64,
-    pub(crate) ttl_ms: u64,
-    pub(crate) poll_interval_ms: u64,
-}
-
-impl TaskSnapshot {
-    pub(crate) fn terminal_result(&self) -> Option<&DomainResult> {
-        (self.status == InvocationStatus::Completed)
-            .then_some(self.result.as_ref())
-            .flatten()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum InvocationOutcome {
-    Direct(DomainResult),
-    Task(TaskSnapshot),
-}
-
-impl InvocationOutcome {
-    pub(crate) fn terminal_result(&self) -> Option<&DomainResult> {
-        match self {
-            Self::Direct(result) => Some(result),
-            Self::Task(task) => task.terminal_result(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        DeliveryResume, DomainResult, IndexResume, InvocationId, NormalizedArgumentsHash,
-        ProviderResume, ResumeDescriptor, RuntimeResume, SafeIdentityHash, TaskId,
-    };
+    use super::{DomainResult, InvocationId, NormalizedArgumentsHash, SafeIdentityHash, TaskId};
     use serde_json::{json, Value};
 
     #[test]
@@ -440,47 +383,6 @@ mod tests {
     }
 
     #[test]
-    fn resume_descriptors_are_closed_and_contain_only_safe_typed_hashes() {
-        let identity = || SafeIdentityHash::from_sha256([0x11; 32]);
-        let descriptors = [
-            ResumeDescriptor::Delivery(DeliveryResume::new(identity())),
-            ResumeDescriptor::Index(IndexResume::new(identity(), identity())),
-            ResumeDescriptor::Provider(ProviderResume::new(identity())),
-            ResumeDescriptor::Runtime(RuntimeResume::new(identity())),
-        ];
-
-        let serialized = serde_json::to_value(descriptors).expect("serialize resume descriptors");
-        let text = serialized.to_string();
-        for forbidden in ["command", "credential", "password", "url", "path", "args"] {
-            assert!(!text.contains(forbidden), "unsafe resume slot {forbidden}");
-        }
-        assert_eq!(
-            serialized,
-            json!([
-                {"kind": "delivery", "workIdentityHash": "11".repeat(32)},
-                {
-                    "kind": "index",
-                    "workspaceIdentityHash": "11".repeat(32),
-                    "sourceRevisionHash": "11".repeat(32)
-                },
-                {"kind": "provider", "workIdentityHash": "11".repeat(32)},
-                {"kind": "runtime", "workIdentityHash": "11".repeat(32)}
-            ])
-        );
-    }
-
-    #[test]
-    fn resume_descriptors_reject_extra_unsafe_payload_slots() {
-        let with_command = json!({
-            "kind": "runtime",
-            "workIdentityHash": "11".repeat(32),
-            "command": ["runner", "--password", "secret"]
-        });
-
-        assert!(serde_json::from_value::<ResumeDescriptor>(with_command).is_err());
-    }
-
-    #[test]
     fn durable_ids_round_trip_as_canonical_uuid_v4_strings() {
         let invocation_id = InvocationId::new();
         let invocation_json = serde_json::to_value(invocation_id).unwrap();
@@ -522,6 +424,72 @@ mod tests {
             assert!(encoded.parse::<TaskId>().is_err(), "accepted {encoded}");
             assert!(serde_json::from_value::<InvocationId>(json!(encoded)).is_err());
             assert!(serde_json::from_value::<TaskId>(json!(encoded)).is_err());
+        }
+    }
+
+    mod refusal_envelope {
+        use super::super::*;
+        use crate::domain::refusal::{Outcome, RefusalCode, RefusalDetail};
+
+        #[test]
+        fn a_refusal_carries_code_outcome_and_message_and_nothing_else() {
+            let result = DomainResult::canonical_rejection(
+                Some("main:Catalog.Валюты".to_string()),
+                RefusalCode::NotFound,
+                "node was not found",
+            );
+            assert!(!result.ok);
+            assert_eq!(result.diagnostics.len(), 1);
+            let diagnostic = &result.diagnostics[0];
+            assert_eq!(diagnostic["code"], "not_found");
+            assert_eq!(diagnostic["outcome"], "fixCall");
+            assert_eq!(diagnostic["message"], "node was not found");
+            assert!(
+                diagnostic.get("detailCode").is_none(),
+                "уточнения не просили — поля быть не должно, иначе читатель \
+                 не отличит «уточнения нет» от «уточнение пустое»"
+            );
+            let keys: Vec<&str> = diagnostic
+                .as_object()
+                .expect("диагностика — объект")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(keys, vec!["code", "outcome", "message"]);
+        }
+
+        #[test]
+        fn a_detail_overrides_the_default_outcome_of_its_code() {
+            // Умолчание `provider_unavailable` — «нужен человек»; уточнение
+            // «исходник не читается» отправляет агента чинить предмет.
+            assert_eq!(
+                RefusalCode::ProviderUnavailable.outcome(),
+                Outcome::NeedsHuman
+            );
+            let result = DomainResult::canonical_rejection_detailed(
+                None,
+                RefusalDetail::SourceUnreadable,
+                "Configuration.xml is not UTF-8",
+            );
+            let diagnostic = &result.diagnostics[0];
+            assert_eq!(diagnostic["code"], "provider_unavailable");
+            assert_eq!(diagnostic["detailCode"], "source_unreadable");
+            assert_eq!(diagnostic["outcome"], "fixSource");
+        }
+
+        #[test]
+        fn every_code_answers_with_one_of_the_six_outcomes() {
+            for code in RefusalCode::ALL {
+                let result = DomainResult::canonical_rejection(None, code, "проба");
+                let outcome = result.diagnostics[0]["outcome"]
+                    .as_str()
+                    .expect("исход обязателен у всякого отказа")
+                    .to_string();
+                assert!(
+                    Outcome::ALL_WIRE_NAMES.contains(&outcome.as_str()),
+                    "{code} ответил исходом {outcome} вне закрытого набора"
+                );
+            }
         }
     }
 }

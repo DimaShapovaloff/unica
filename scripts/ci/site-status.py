@@ -18,6 +18,9 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pipeline_metrics  # noqa: E402
+
 LINE_BRANCH = re.compile(r"\Arelease-v(\d+)\.(\d+)\Z")
 # Линия патчей живёт ещё месяц после того, как вышла следующая minor.
 LINE_GRACE = timedelta(days=30)
@@ -85,13 +88,16 @@ def open_lines(repo: str, now: datetime) -> list[str]:
 
 
 def site_lines(branch: str, repo: str, now: datetime) -> list[str]:
-    """Линия прогона и открытые релизные линии, каждая по одному разу.
+    """`main`, линия прогона и открытые релизные линии, каждая по одному разу.
 
-    Прогон релизной линии приходит с самой линии, поэтому её имя стоит и в
-    `--branch`, и в списке открытых. Без свёртки отчёт этой линии собирался бы
-    дважды, а на странице появлялась бы вторая такая же строка.
+    `main` стоит всегда: прогон релизной линии не отменяет его карточку. Ветка
+    прогона попадает в список, только если она линия: с прогона по тегу
+    приходит имя тега `vX.Y.Z`, его результаты сайт кладёт в линию тега, и
+    карточка «vX.Y.Z — нет прогонов» была бы ложью. Без свёртки отчёт линии
+    собирался бы дважды, а на странице появлялась бы вторая такая же строка.
     """
-    return list(dict.fromkeys([branch, *open_lines(repo, now)]))
+    own = [branch] if LINE_BRANCH.match(branch) else []
+    return list(dict.fromkeys(["main", *own, *open_lines(repo, now)]))
 
 
 def line_run(path: Path | None, repo: str) -> dict[str, str]:
@@ -160,6 +166,8 @@ def main() -> int:
     parser.add_argument("--print-lines", action="store_true", help="напечатать открытые линии и выйти")
     parser.add_argument("--telegram", default="unica_ai", help="публичная группа Telegram")
     parser.add_argument("--report-url", default="allure/main/")
+    parser.add_argument("--site", default="", help="адрес сайта: тренды отчёта для метрик конвейера")
+    parser.add_argument("--metrics", action="store_true", help="посчитать критерии конвейера по прогонам за окно")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
 
@@ -199,14 +207,18 @@ def main() -> int:
     }
 
     # Пререлиз показывается только пока он впереди опубликованной версии:
-    # прошлогодний rc уже ничего не готовит.
+    # прошлогодний rc уже ничего не готовит. Список из нуля или одного
+    # элемента: страница не показывает «планируется» вместо пустого места.
     newest = max(prereleases, key=lambda r: moment(r["published_at"]), default=None)
+    status["prereleases"] = []
     if newest and moment(newest["published_at"]) > moment(latest["published_at"]):
-        status["prerelease"] = newest["tag_name"]
-        status["prerelease_note"] = "опубликован " + human(moment(newest["published_at"]))
-    else:
-        status["prerelease"] = "Планируется"
-        status["prerelease_note"] = "сборка перед публикацией"
+        status["prereleases"].append(
+            {
+                "prerelease": newest["tag_name"],
+                "prerelease_date": human(moment(newest["published_at"])),
+                "prerelease_url": newest["html_url"],
+            }
+        )
 
     tested, plain = [], []
     for line in site_lines(args.branch, args.repo, now):
@@ -234,6 +246,19 @@ def main() -> int:
             )
     status["tested_lines"] = tested
     status["plain_lines"] = plain
+
+    # Критерии конвейера считаются по прогонам за окно только в итоговой
+    # сборке страниц: черновой прогон рисует таблицу пустой и не ходит в API
+    # дважды. Значения без источника показывают прочерк, а не ноль.
+    status.update({"metrics": [], "metrics_days": str(pipeline_metrics.WINDOW_DAYS), "metrics_since": "—", "metrics_until": "—"})
+    if args.metrics:
+        document = pipeline_metrics.gather(args.repo, args.site, now=now)
+        status.update({
+            "metrics": document["metrics"],
+            "metrics_days": str(document["window_days"]),
+            "metrics_since": document["since"],
+            "metrics_until": document["until"],
+        })
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(status, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

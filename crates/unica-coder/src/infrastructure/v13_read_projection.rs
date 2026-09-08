@@ -2,6 +2,7 @@ use crate::application::v13::view::ViewError;
 use crate::domain::address::{AddressSegment, NodeKind, QualifiedAddress};
 use crate::domain::module_projection::EventProjection;
 use crate::domain::node_view::{BranchRef, CollectionView, NodeView, NodeViewData};
+use crate::domain::refusal::RefusalCode;
 use crate::infrastructure::logical_tree::{LogicalReader, LogicalTreeRoute};
 use serde_json::{json, Map, Value};
 
@@ -138,14 +139,14 @@ fn project_form(
     let first = &suffix[0];
     let mut values = form_child_values(payload, first.kind()).ok_or_else(|| {
         ViewError::new(
-            "not_found",
+            RefusalCode::NotFound,
             format!("form has no {} collection", first.kind().as_str()),
         )
     })?;
     if first.name().is_none() {
         if suffix.len() != 1 {
             return Err(ViewError::new(
-                "not_found",
+                RefusalCode::NotFound,
                 "form collection did not consume the complete suffix",
             ));
         }
@@ -154,7 +155,7 @@ fn project_form(
     let mut kind = first.kind();
     let mut item = select_named(values, first.name().unwrap()).ok_or_else(|| {
         ViewError::new(
-            "not_found",
+            RefusalCode::NotFound,
             format!(
                 "form {} `{}` was not found",
                 first.kind().as_str(),
@@ -166,7 +167,7 @@ fn project_form(
         kind = segment.kind();
         values = form_nested_values(item, kind).ok_or_else(|| {
             ViewError::new(
-                "not_found",
+                RefusalCode::NotFound,
                 format!("form node has no {} collection", kind.as_str()),
             )
         })?;
@@ -174,7 +175,7 @@ fn project_form(
         let Some(name) = segment.name() else {
             if !terminal {
                 return Err(ViewError::new(
-                    "not_found",
+                    RefusalCode::NotFound,
                     "form collection did not consume the complete suffix",
                 ));
             }
@@ -182,7 +183,7 @@ fn project_form(
         };
         item = select_named(values, name).ok_or_else(|| {
             ViewError::new(
-                "not_found",
+                RefusalCode::NotFound,
                 format!("form {} `{name}` was not found", kind.as_str()),
             )
         })?;
@@ -205,15 +206,15 @@ fn project_semantic_form_event(
         .expect("the semantic event route has an Event suffix");
     if event.name().is_none() {
         let address_text = address.to_string();
-        let owner_at = address_text
-            .strip_suffix(".Event")
-            .ok_or_else(|| ViewError::new("not_found", "event collection owner is invalid"))?;
+        let owner_at = address_text.strip_suffix(".Event").ok_or_else(|| {
+            ViewError::new(RefusalCode::NotFound, "event collection owner is invalid")
+        })?;
         let items = form_owner_events(owner_at, events)
             .map(crate::infrastructure::v13_read::event_node_value)
             .collect::<Vec<_>>();
         if items.is_empty() {
             return Err(ViewError::new(
-                "not_found",
+                RefusalCode::NotFound,
                 "form owner has no applicable events",
             ));
         }
@@ -234,7 +235,7 @@ fn project_semantic_form_event(
         .map(NodeViewData::Node)
         .ok_or_else(|| {
             ViewError::new(
-                "not_found",
+                RefusalCode::NotFound,
                 format!(
                     "form Event `{}` was not found",
                     event.name().unwrap_or_default()
@@ -364,11 +365,11 @@ fn project_dcs(
     }
     let datasets = payload
         .get("dataSets")
-        .ok_or_else(|| ViewError::new("not_found", "DCS has no datasets"))?;
+        .ok_or_else(|| ViewError::new(RefusalCode::NotFound, "DCS has no datasets"))?;
     let Some(dataset_name) = dataset_segment.name() else {
         if suffix.len() != 1 {
             return Err(ViewError::new(
-                "not_found",
+                RefusalCode::NotFound,
                 "DCS dataset collection cannot have a child suffix",
             ));
         }
@@ -379,7 +380,7 @@ fn project_dcs(
     };
     let dataset = select_named(datasets, dataset_name).ok_or_else(|| {
         ViewError::new(
-            "not_found",
+            RefusalCode::NotFound,
             format!("DCS dataset `{dataset_name}` was not found"),
         )
     })?;
@@ -400,7 +401,7 @@ fn project_dcs(
     }
     let [detail] = &suffix[1..] else {
         return Err(ViewError::new(
-            "not_found",
+            RefusalCode::NotFound,
             "DCS projection did not consume the complete suffix",
         ));
     };
@@ -412,7 +413,7 @@ fn project_dcs(
     }
     .ok_or_else(|| {
         ViewError::new(
-            "not_found",
+            RefusalCode::NotFound,
             format!("DCS dataset has no {} projection", detail.kind().as_str()),
         )
     })?;
@@ -430,7 +431,7 @@ fn project_dcs(
     let name = detail.name().unwrap();
     let item = select_named(selected, name).ok_or_else(|| {
         ViewError::new(
-            "not_found",
+            RefusalCode::NotFound,
             format!("DCS {} `{name}` was not found", detail.kind().as_str()),
         )
     })?;
@@ -457,15 +458,18 @@ fn project_mxl(
     }
     let area_segment = &suffix[0];
     if area_segment.kind() != NodeKind::Area {
-        return Err(ViewError::new("not_found", "MXL projection starts at Area"));
+        return Err(ViewError::new(
+            RefusalCode::NotFound,
+            "MXL projection starts at Area",
+        ));
     }
     let areas = payload
         .get("areas")
-        .ok_or_else(|| ViewError::new("not_found", "MXL has no named areas"))?;
+        .ok_or_else(|| ViewError::new(RefusalCode::NotFound, "MXL has no named areas"))?;
     let Some(area_name) = area_segment.name() else {
         if suffix.len() != 1 {
             return Err(ViewError::new(
-                "not_found",
+                RefusalCode::NotFound,
                 "MXL area collection cannot have a child suffix",
             ));
         }
@@ -475,7 +479,10 @@ fn project_mxl(
         )));
     };
     let area = select_named(areas, area_name).ok_or_else(|| {
-        ViewError::new("not_found", format!("MXL area `{area_name}` was not found"))
+        ViewError::new(
+            RefusalCode::NotFound,
+            format!("MXL area `{area_name}` was not found"),
+        )
     })?;
     if suffix.len() == 1 {
         let mut node = node_from_value(LogicalReader::Mxl, address, NodeKind::Area, area);
@@ -493,19 +500,19 @@ fn project_mxl(
     }
     let [parameter] = &suffix[1..] else {
         return Err(ViewError::new(
-            "not_found",
+            RefusalCode::NotFound,
             "MXL projection did not consume the complete suffix",
         ));
     };
     if parameter.kind() != NodeKind::Parameter {
         return Err(ViewError::new(
-            "not_found",
+            RefusalCode::NotFound,
             "MXL area has only Parameter child nodes",
         ));
     }
     let params = area
         .get("params")
-        .ok_or_else(|| ViewError::new("not_found", "MXL area has no parameters"))?;
+        .ok_or_else(|| ViewError::new(RefusalCode::NotFound, "MXL area has no parameters"))?;
     let Some(name) = parameter.name() else {
         return Ok(NodeViewData::Collection(CollectionView::new(
             NodeView::new(address.to_string(), "Parameter", "Parameter", Map::new()),
@@ -531,7 +538,7 @@ fn project_mxl(
         .any(|value| value.as_str() == Some(name))
     {
         return Err(ViewError::new(
-            "not_found",
+            RefusalCode::NotFound,
             format!("MXL area parameter `{name}` was not found"),
         ));
     }
@@ -550,7 +557,7 @@ fn project_configuration(
 ) -> Result<NodeViewData, ViewError> {
     if !suffix.is_empty() {
         return Err(ViewError::new(
-            "not_found",
+            RefusalCode::NotFound,
             "configuration projection does not accept an address suffix",
         ));
     }
@@ -620,7 +627,7 @@ pub(super) fn project_registered_metadata_branch(
         .segments()
         .last()
         .map(AddressSegment::kind)
-        .ok_or_else(|| ViewError::new("not_found", "metadata branch kind is missing"))?;
+        .ok_or_else(|| ViewError::new(RefusalCode::NotFound, "metadata branch kind is missing"))?;
     let items = payload
         .get("registeredObjects")
         .and_then(Value::as_array)
@@ -652,7 +659,7 @@ pub(super) fn project_registered_metadata_branch(
 fn validate_reader_payload(reader: LogicalReader, payload: &Value) -> Result<(), ViewError> {
     let object = payload.as_object().ok_or_else(|| {
         ViewError::new(
-            "provider_unavailable",
+            RefusalCode::ProviderUnavailable,
             "typed reader returned a non-object root payload",
         )
     })?;
@@ -761,7 +768,7 @@ fn validate_reader_payload(reader: LogicalReader, payload: &Value) -> Result<(),
         ],
         LogicalReader::Module => {
             return Err(ViewError::new(
-                "provider_unavailable",
+                RefusalCode::ProviderUnavailable,
                 "module projection bypassed its Task 13 adapter",
             ));
         }
@@ -782,7 +789,7 @@ fn validate_reader_payload(reader: LogicalReader, payload: &Value) -> Result<(),
             && !EXPLICITLY_DISCARDED_PROVIDER_KEYS.contains(&key.as_str())
     }) {
         return Err(ViewError::new(
-            "provider_unavailable",
+            RefusalCode::ProviderUnavailable,
             format!("typed {reader:?} reader returned unknown field `{key}`"),
         ));
     }
@@ -800,14 +807,14 @@ pub(super) fn project_known_suffix(
         let terminal = index + 1 == suffix.len();
         let selected = select_kind_value(reader, current, segment.kind()).ok_or_else(|| {
             ViewError::new(
-                "not_found",
+                RefusalCode::NotFound,
                 format!("typed reader has no {} projection", segment.kind().as_str()),
             )
         })?;
         if let Some(name) = segment.name() {
             current = select_named(selected, name).ok_or_else(|| {
                 ViewError::new(
-                    "not_found",
+                    RefusalCode::NotFound,
                     format!(
                         "typed reader has no {} named {name}",
                         segment.kind().as_str()
@@ -836,7 +843,7 @@ pub(super) fn project_known_suffix(
         }
     }
     Err(ViewError::new(
-        "not_found",
+        RefusalCode::NotFound,
         "typed reader did not resolve the complete logical address",
     ))
 }
@@ -928,7 +935,7 @@ fn project_metadata(
     let first = &suffix[0];
     let collection = metadata_collection(payload, first.kind()).ok_or_else(|| {
         ViewError::new(
-            "not_found",
+            RefusalCode::NotFound,
             format!("metadata has no {} collection", first.kind().as_str()),
         )
     })?;
@@ -943,11 +950,17 @@ fn project_metadata(
             metadata_items(address, first.kind(), collection),
         )));
     }
-    let name = first
-        .name()
-        .ok_or_else(|| ViewError::new("not_found", "metadata collection name is required"))?;
+    let name = first.name().ok_or_else(|| {
+        ViewError::new(
+            RefusalCode::NotFound,
+            "metadata collection name is required",
+        )
+    })?;
     let mut item = select_named(collection, name).ok_or_else(|| {
-        ViewError::new("not_found", format!("metadata node `{name}` was not found"))
+        ViewError::new(
+            RefusalCode::NotFound,
+            format!("metadata node `{name}` was not found"),
+        )
     })?;
     let mut kind = first.kind();
     for segment in &suffix[1..] {
@@ -957,11 +970,16 @@ fn project_metadata(
         } else {
             None
         }
-        .ok_or_else(|| ViewError::new("not_found", "metadata child collection was not found"))?;
+        .ok_or_else(|| {
+            ViewError::new(
+                RefusalCode::NotFound,
+                "metadata child collection was not found",
+            )
+        })?;
         if let Some(name) = segment.name() {
             item = select_named(next, name).ok_or_else(|| {
                 ViewError::new(
-                    "not_found",
+                    RefusalCode::NotFound,
                     format!("metadata child `{name}` was not found"),
                 )
             })?;
@@ -1089,7 +1107,7 @@ fn project_subsystem_interface(
 ) -> Result<NodeViewData, ViewError> {
     if !matches!(suffix.first(), Some(segment) if segment.kind() == NodeKind::Interface) {
         return Err(ViewError::new(
-            "not_found",
+            RefusalCode::NotFound,
             "subsystem interface projection is missing",
         ));
     }
@@ -1097,12 +1115,20 @@ fn project_subsystem_interface(
         .get("commandInterface")
         .filter(|value| !value.is_null())
         .ok_or_else(|| {
-            ViewError::new("not_found", "subsystem has no command interface document")
+            ViewError::new(
+                RefusalCode::NotFound,
+                "subsystem has no command interface document",
+            )
         })?;
     let commands = interface_commands(interface);
+    // Имя команды в CommandInterface.xml — это ссылка на команду, живущую в
+    // другом месте: `CommonCommand.Печать` или `Catalog.Валюты.Command.Создать`.
+    // Приписывать её к адресу интерфейса нельзя — получается адрес, которого
+    // грамматика не знает. Команда адресуется по своему настоящему месту.
+    let (addressable, dangling) = split_interface_commands(address, &commands);
     if suffix.len() > 2 {
         return Err(ViewError::new(
-            "not_found",
+            RefusalCode::NotFound,
             "subsystem interface projection did not consume the complete suffix",
         ));
     }
@@ -1115,28 +1141,32 @@ fn project_subsystem_interface(
                 Map::new(),
             )
             .with_branches(
-                (!commands.is_empty())
-                    .then(|| BranchRef::new(format!("{}.Command", address), commands.len()))
+                (!addressable.is_empty())
+                    .then(|| BranchRef::new(format!("{}.Command", address), addressable.len()))
                     .into_iter()
                     .collect(),
-            ),
+            )
+            .with_limits(dangling_limits(&dangling)),
         ));
     }
     let command = &suffix[1];
     match (command.kind(), command.name()) {
         (NodeKind::Command, None) => Ok(NodeViewData::Collection(CollectionView::new(
-            NodeView::new(address.to_string(), "Command", "Commands", Map::new()),
-            commands
+            NodeView::new(address.to_string(), "Command", "Commands", Map::new())
+                .with_limits(dangling_limits(&dangling)),
+            addressable
                 .iter()
-                .filter_map(|item| {
+                .filter_map(|(at, item)| {
                     let name = item.get("name")?.as_str()?;
-                    let at = QualifiedAddress::parse(&format!("{address}.{name}")).ok()?;
-                    serde_json::to_value(NodeView::new(
-                        at.to_string(),
-                        "Command",
-                        name,
-                        reader_node_props(LogicalReader::Interface, NodeKind::Command, item),
-                    ))
+                    serde_json::to_value(
+                        NodeView::new(
+                            at.to_string(),
+                            at.segments().last()?.kind().as_str(),
+                            name,
+                            reader_node_props(LogicalReader::Interface, NodeKind::Command, item),
+                        )
+                        .with_limits(Vec::new()),
+                    )
                     .ok()
                 })
                 .collect(),
@@ -1154,15 +1184,53 @@ fn project_subsystem_interface(
             })
             .ok_or_else(|| {
                 ViewError::new(
-                    "not_found",
+                    RefusalCode::NotFound,
                     format!("interface command `{name}` was not found"),
                 )
             }),
         _ => Err(ViewError::new(
-            "not_found",
+            RefusalCode::NotFound,
             "interface projection was not found",
         )),
     }
+}
+
+/// Разводит записи командного интерфейса на адресуемые и повисшие.
+///
+/// Ссылка `CommonCommand.Печать` или `Catalog.Валюты.Command.Создать` читается
+/// как адрес в том же наборе исходников. Ссылка по идентификатору
+/// (`0:78b4152e-…`) логического адреса не имеет: платформа так пишет указатель
+/// на исчезнувший объект.
+fn split_interface_commands(
+    address: &QualifiedAddress,
+    commands: &[Value],
+) -> (Vec<(QualifiedAddress, Value)>, Vec<String>) {
+    let source_set = address.source_set();
+    let mut addressable = Vec::new();
+    let mut dangling = Vec::new();
+    for item in commands {
+        let Some(reference) = item.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        match QualifiedAddress::parse(&format!("{source_set}:{reference}")) {
+            Ok(at) => addressable.push((at, item.clone())),
+            Err(_) => dangling.push(reference.to_string()),
+        }
+    }
+    (addressable, dangling)
+}
+
+/// Повисшие ссылки называются слотом `limits`, а не выбрасываются молча: иначе
+/// счёт ветви и страница расходятся, а читатель считает, что видел всё.
+fn dangling_limits(dangling: &[String]) -> Vec<String> {
+    if dangling.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "{} команд заданы ссылкой по идентификатору и логического адреса не имеют: {}",
+        dangling.len(),
+        dangling.join(", ")
+    )]
 }
 
 fn interface_commands(interface: &Value) -> Vec<Value> {
@@ -1259,7 +1327,9 @@ fn project_xdto(
         let namespace = payload
             .get("targetNamespace")
             .and_then(Value::as_str)
-            .ok_or_else(|| ViewError::new("not_found", "XDTO target namespace is absent"))?;
+            .ok_or_else(|| {
+                ViewError::new(RefusalCode::NotFound, "XDTO target namespace is absent")
+            })?;
         return Ok(NodeViewData::Node(NodeView::new(
             address.to_string(),
             "Namespace",
@@ -1275,7 +1345,7 @@ fn project_xdto(
         NodeKind::Property => payload.get("globalProperties"),
         _ => None,
     }
-    .ok_or_else(|| ViewError::new("not_found", "XDTO projection was not found"))?;
+    .ok_or_else(|| ViewError::new(RefusalCode::NotFound, "XDTO projection was not found"))?;
     if segment.name().is_none() {
         return Ok(NodeViewData::Collection(CollectionView::new(
             NodeView::new(
@@ -1288,8 +1358,12 @@ fn project_xdto(
         )));
     }
     let name = segment.name().unwrap();
-    let item = select_named(selected, name)
-        .ok_or_else(|| ViewError::new("not_found", format!("XDTO node `{name}` was not found")))?;
+    let item = select_named(selected, name).ok_or_else(|| {
+        ViewError::new(
+            RefusalCode::NotFound,
+            format!("XDTO node `{name}` was not found"),
+        )
+    })?;
     if suffix.len() == 1 {
         let mut props = reader_node_props(LogicalReader::Xdto, segment.kind(), item);
         if let Some(base) = item.get("base") {
@@ -1312,13 +1386,13 @@ fn project_xdto(
     let property = &suffix[1];
     if suffix.len() != 2 {
         return Err(ViewError::new(
-            "not_found",
+            RefusalCode::NotFound,
             "XDTO property projection did not consume the complete suffix",
         ));
     }
     let properties = item
         .get("properties")
-        .ok_or_else(|| ViewError::new("not_found", "XDTO type has no properties"))?;
+        .ok_or_else(|| ViewError::new(RefusalCode::NotFound, "XDTO type has no properties"))?;
     if property.name().is_none() {
         return Ok(NodeViewData::Collection(CollectionView::new(
             NodeView::new(address.to_string(), "Property", "Properties", Map::new()),
@@ -1328,7 +1402,7 @@ fn project_xdto(
     let property_name = property.name().unwrap();
     let property = select_named(properties, property_name).ok_or_else(|| {
         ViewError::new(
-            "not_found",
+            RefusalCode::NotFound,
             format!("XDTO property `{property_name}` was not found"),
         )
     })?;
@@ -1576,5 +1650,127 @@ fn data_row(value: &Value) -> Value {
         Value::Null | Value::Bool(_) | Value::Number(_) => json!({"value": value}),
         Value::String(text) if text.len() <= MAX_COMPACT_PROP_BYTES => json!({"value": text}),
         Value::String(_) | Value::Array(_) | Value::Object(_) => json!({"value": "<omitted>"}),
+    }
+}
+
+#[cfg(test)]
+mod interface_command_tests {
+    use super::*;
+
+    /// Формы ссылок взяты из настоящего `CommandInterface.xml` конфигурации
+    /// класса УТ: двухсегментная общая команда, четырёхсегментная команда
+    /// объекта и повисшая ссылка по идентификатору — платформа так пишет
+    /// указатель на исчезнувший объект.
+    /// Адрес коллекции — тот самый, который объявляет ветвь узла. Прежде он
+    /// нёс `Command` дважды: разбор шёл парами `<Вид>.<Имя>`, и безымянный
+    /// `Interface` забирал первый `Command` себе под имя. С правилом
+    /// безымянных видов объявленная ветвь и адрес коллекции — одно и то же.
+    const COLLECTION: &str = "main:Subsystem.Администрирование.Interface.Command";
+
+    fn payload() -> Value {
+        json!({
+            "commandInterface": {
+                "visibility": [
+                    {"command": "CommonCommand.ПанельОтчетовCRM", "visible": true},
+                    {"command": "Catalog.Валюты.Command.СоздатьНаОсновании", "visible": true},
+                    {"command": "0:78b4152e-8a04-45f1-a08f-397423e76fc8", "visible": false}
+                ]
+            }
+        })
+    }
+
+    fn view(at: &str) -> NodeViewData {
+        let address = QualifiedAddress::parse(at).expect("адрес разбирается");
+        let suffix: Vec<AddressSegment> = address
+            .segments()
+            .iter()
+            .skip_while(|segment| segment.kind() != NodeKind::Interface)
+            .cloned()
+            .collect();
+        project_subsystem_interface(&address, &payload(), &suffix).expect("проекция отвечает")
+    }
+
+    #[test]
+    fn a_command_item_is_addressed_where_the_command_actually_lives() {
+        let NodeViewData::Collection(page) = view(COLLECTION) else {
+            panic!("ожидалась страница");
+        };
+        let page = serde_json::to_value(&page).expect("страница сериализуется");
+        let addresses: Vec<&str> = page["items"]
+            .as_array()
+            .expect("страница несёт элементы")
+            .iter()
+            .filter_map(|item| item["at"].as_str())
+            .collect();
+        assert_eq!(
+            addresses,
+            vec![
+                "main:Catalog.Валюты.Command.СоздатьНаОсновании",
+                "main:CommonCommand.ПанельОтчетовCRM",
+            ],
+            "команда живёт вне интерфейса, и адресуется по своему месту"
+        );
+    }
+
+    #[test]
+    fn the_branch_count_equals_what_the_page_can_show() {
+        let NodeViewData::Node(node) = view("main:Subsystem.Администрирование.Interface")
+        else {
+            panic!("ожидался узел");
+        };
+        let declared = serde_json::to_value(&node).expect("узел сериализуется")["branches"][0]
+            ["count"]
+            .as_u64()
+            .expect("ветвь объявляет счёт");
+
+        let NodeViewData::Collection(page) = view(COLLECTION) else {
+            panic!("ожидалась страница");
+        };
+        let page = serde_json::to_value(&page).expect("страница сериализуется");
+        assert_eq!(
+            declared as usize,
+            page["items"].as_array().expect("элементы").len(),
+            "счёт ветви и страница обязаны сойтись: расхождение и было дефектом"
+        );
+    }
+
+    /// Ветвь, которую объявляет узел, обязана вести к коллекции. Это и был
+    /// дефект целиком: счёт называл команды, а спуск по объявленному адресу
+    /// возвращал тот же узел, потому что безымянный `Interface` забирал
+    /// сегмент `Command` себе под имя.
+    #[test]
+    fn the_branch_the_node_declares_leads_to_the_collection() {
+        let NodeViewData::Node(node) = view("main:Subsystem.Администрирование.Interface")
+        else {
+            panic!("ожидался узел");
+        };
+        let declared = serde_json::to_value(&node).expect("узел сериализуется")["branches"][0]
+            ["at"]
+            .as_str()
+            .expect("ветвь объявляет адрес")
+            .to_string();
+        assert_eq!(
+            declared, COLLECTION,
+            "объявленный адрес — это адрес коллекции"
+        );
+
+        let NodeViewData::Collection(_) = view(&declared) else {
+            panic!("спуск по объявленному адресу обязан дать страницу, а не тот же узел");
+        };
+    }
+
+    #[test]
+    fn a_reference_without_a_logical_address_is_named_not_dropped() {
+        let NodeViewData::Node(node) = view("main:Subsystem.Администрирование.Interface")
+        else {
+            panic!("ожидался узел");
+        };
+        let limits = serde_json::to_value(&node).expect("узел сериализуется")["limits"].clone();
+        let named = limits[0].as_str().unwrap_or_default().to_string();
+        assert!(
+            named.contains("78b4152e-8a04-45f1-a08f-397423e76fc8"),
+            "повисшая ссылка обязана быть названа, иначе читатель считает, что \
+             видел всё: {limits}"
+        );
     }
 }

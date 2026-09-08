@@ -15,6 +15,7 @@ use super::server::{
     V5CanonicalInvocationRuntime, V5CanonicalPrepareError, MAX_HANDSHAKES, MAX_OWNER_SESSIONS,
 };
 use crate::application::invocation::{RESPONSE_SERIALIZATION_MARGIN, TASK_RECONCILIATION_BUDGET};
+use crate::application::invocation_store::SystemEpochMillisClock;
 use crate::application::invocation_store::{EpochMillisClock, ToolIdentity};
 use crate::application::invocation_store_v5::{
     InvocationStoreV5, NewV5InvocationRecord, RecoveryTerminalReason, TaskStoreRecoveryCatalog,
@@ -45,6 +46,7 @@ use crate::application::receipt_ledger::{
 };
 use crate::application::receipt_ledger_actor::ReceiptLedgerActor;
 use crate::domain::cancellation::CancellationToken;
+use crate::domain::refusal::RefusalCode;
 use crate::infrastructure::platform::filesystem::RetainedDirectoryCapability;
 use crate::infrastructure::receipt_ledger::canonical_staged_transfer_certificate;
 use crate::infrastructure::receipt_ledger::ReceiptLedgerStore;
@@ -59,7 +61,6 @@ use crate::infrastructure::task_lifecycle_link_store_v5::{
     TaskLifecycleLinkCatalogEntry, TaskLifecycleLinkRecord, TaskLifecycleLinkStoreError,
     TaskLifecycleLinkStoreV5, TaskLinkReservation,
 };
-use crate::infrastructure::task_store::SystemEpochMillisClock;
 use crate::infrastructure::task_store_v5::FileInvocationStoreV5;
 #[cfg(feature = "receipt-ledger-test-support")]
 use crate::infrastructure::task_store_v5::PublicationFailure;
@@ -74,9 +75,7 @@ use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(feature = "receipt-ledger-test-support")]
 use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::{Arc, Mutex};
-#[cfg(feature = "receipt-ledger-test-support")]
-use std::sync::{Condvar, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -93,6 +92,12 @@ const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const OWNER_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const TASK_TERMINAL_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(30);
+/// The session handler owning an inline invocation re-reads its cutoff at
+/// least this often while the worker runs; the worker wakes it earlier.
+const INLINE_CUTOFF_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// The durable handoff committed at the cutoff runs under its own bound: the
+/// operation budget of the submit is spent by definition at that moment.
+const CUTOFF_HANDOFF_COMMIT_BUDGET: Duration = TASK_RECONCILIATION_BUDGET;
 const V5_TASK_POLL_INTERVAL_MS: u64 = 100;
 static NEXT_RETIREMENT_PROCESS_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -1053,6 +1058,29 @@ impl V5ActiveTaskCancellations {
         ))
     }
 
+    /// Registers the token an inline worker already executes under: the
+    /// cutoff turned that execution into a Task without restarting it.
+    fn register_existing(
+        self: &Arc<Self>,
+        task_id: crate::domain::invocation::TaskId,
+        token: CancellationToken,
+    ) -> Result<V5ActiveTaskCancellationGuard, ReceiptLedgerError> {
+        let mut tokens = self
+            .tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tokens.contains_key(&task_id) {
+            return Err(ReceiptLedgerError::Corrupt(
+                "Task already owns an active cancellation token",
+            ));
+        }
+        tokens.insert(task_id, token);
+        Ok(V5ActiveTaskCancellationGuard {
+            registry: Arc::clone(self),
+            task_id,
+        })
+    }
+
     fn cancel(&self, task_id: crate::domain::invocation::TaskId) {
         if let Some(token) = self
             .tokens
@@ -1086,6 +1114,119 @@ impl Drop for V5ActiveTaskCancellationGuard {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.task_id);
     }
+}
+
+/// What the inline worker hands back to the session handler.
+enum InlineWorkerReport {
+    Rejected(Box<crate::domain::invocation::DomainResult>),
+    KnownLong(super::server::V5PreparedCanonicalInvocation),
+    Outcome(ReceiptTerminalOutcome),
+}
+
+/// Who delivers the outcome of an inline invocation once the worker has it.
+enum InlineHandoffDecision {
+    /// The session handler waits for the worker under the cutoff.
+    Waiting,
+    /// The cutoff passed: the handler commits the durable handoff.
+    HandoffInProgress,
+    /// The handler took the report itself; the worker has nothing to publish.
+    HandlerOwns,
+    /// The invocation is a durable Task: whoever holds the outcome publishes
+    /// it there, under this cancellation registration.
+    Task(Box<InlineTaskOwnership>),
+    /// The handoff failed after the cutoff: no reply can carry the outcome and
+    /// the receipt is reconciled like any interrupted attempt.
+    Abandoned,
+}
+
+/// The Task an inline attempt continues into after its cutoff.
+struct InlineTaskOwnership {
+    bound: TaskBoundReceipt,
+    task_id: crate::domain::invocation::TaskId,
+    guard: Option<V5ActiveTaskCancellationGuard>,
+}
+
+struct InlineSlotState {
+    decision: InlineHandoffDecision,
+    report: Option<InlineWorkerReport>,
+}
+
+/// One inline invocation shared between the session handler that owns the
+/// cutoff and the worker that runs prepare and execute.
+struct InlineExecutionSlot {
+    state: Mutex<InlineSlotState>,
+    changed: Condvar,
+}
+
+impl InlineExecutionSlot {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(InlineSlotState {
+                decision: InlineHandoffDecision::Waiting,
+                report: None,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, InlineSlotState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The worker deposits its report and learns who publishes it. While the
+    /// handler commits a handoff the worker waits for that decision instead of
+    /// racing it.
+    fn settle(&self, report: InlineWorkerReport) -> InlineSettlement {
+        let mut state = self.lock();
+        state.report = Some(report);
+        self.changed.notify_all();
+        loop {
+            match &mut state.decision {
+                InlineHandoffDecision::Waiting | InlineHandoffDecision::HandlerOwns => {
+                    return InlineSettlement::HandlerOwns;
+                }
+                InlineHandoffDecision::Abandoned => return InlineSettlement::Abandoned,
+                InlineHandoffDecision::Task(ownership) => {
+                    let ownership = Box::new(InlineTaskOwnership {
+                        bound: ownership.bound.clone(),
+                        task_id: ownership.task_id,
+                        guard: ownership.guard.take(),
+                    });
+                    let report = state
+                        .report
+                        .take()
+                        .expect("a settled report stays in the slot until claimed");
+                    return InlineSettlement::Task { report, ownership };
+                }
+                InlineHandoffDecision::HandoffInProgress => {
+                    state = self
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            }
+        }
+    }
+}
+
+enum InlineSettlement {
+    HandlerOwns,
+    Abandoned,
+    Task {
+        report: InlineWorkerReport,
+        ownership: Box<InlineTaskOwnership>,
+    },
+}
+
+/// How the session handler continues after the inline worker settled or the
+/// cutoff took the invocation away from it.
+enum InlineDrive {
+    Rejected(Box<crate::domain::invocation::DomainResult>),
+    KnownLong(super::server::V5PreparedCanonicalInvocation),
+    Direct(ReceiptTerminalOutcome),
+    HandedOff(Box<V5RuntimeReply>),
 }
 
 struct V5TaskProjection {
@@ -2753,14 +2894,19 @@ impl V5TaskProjectionReachability {
 }
 
 struct V5InvocationExecutor {
-    invocation_runtime: V5CanonicalInvocationRuntime,
+    invocation_runtime: Arc<V5CanonicalInvocationRuntime>,
 }
 
 impl V5InvocationExecutor {
     fn new(invocation_service: Arc<dyn CanonicalInvocationService>, clock: Arc<dyn Clock>) -> Self {
-        Self {
-            invocation_runtime: V5CanonicalInvocationRuntime::new(invocation_service, clock),
-        }
+        Self::over(Arc::new(V5CanonicalInvocationRuntime::new(
+            invocation_service,
+            clock,
+        )))
+    }
+
+    fn over(invocation_runtime: Arc<V5CanonicalInvocationRuntime>) -> Self {
+        Self { invocation_runtime }
     }
 
     fn bind(
@@ -2787,7 +2933,7 @@ impl V5InvocationExecutor {
             V5CanonicalPrepareError::Rejected(Box::new(
                 crate::domain::invocation::DomainResult::canonical_rejection(
                     None,
-                    "bad_value",
+                    RefusalCode::BadValue,
                     error,
                 ),
             ))
@@ -2924,10 +3070,19 @@ impl V5ReceiptRuntime {
             epoch_clock,
             #[cfg(feature = "receipt-ledger-test-support")]
             initial_receipt_observation,
-            invocation_executor: V5InvocationExecutor::new(
-                config.invocation_service_for_v5(),
-                config.invocation_clock_for_v5(),
-            ),
+            invocation_executor: {
+                #[cfg(test)]
+                let preset = config.canonical_runtime_for_v5();
+                #[cfg(not(test))]
+                let preset: Option<Arc<V5CanonicalInvocationRuntime>> = None;
+                match preset {
+                    Some(runtime) => V5InvocationExecutor::over(runtime),
+                    None => V5InvocationExecutor::new(
+                        config.invocation_service_for_v5(),
+                        config.invocation_clock_for_v5(),
+                    ),
+                }
+            },
             task_projection,
             active_task_cancellations: Arc::new(V5ActiveTaskCancellations::default()),
             task_execution_threads: Mutex::new(Vec::new()),
@@ -4375,7 +4530,7 @@ impl V5ReceiptRuntime {
                             result: Box::new(
                                 crate::domain::invocation::DomainResult::canonical_rejection(
                                     None,
-                                    "bad_value",
+                                    RefusalCode::BadValue,
                                     "scenario validation rejected invocation",
                                 ),
                             ),
@@ -4423,7 +4578,7 @@ impl V5ReceiptRuntime {
                                 result: Box::new(
                                     crate::domain::invocation::DomainResult::canonical_rejection(
                                         None,
-                                        "bad_value",
+                                        RefusalCode::BadValue,
                                         "scenario workspace admission rejected invocation",
                                     ),
                                 ),
@@ -4827,7 +4982,7 @@ impl V5ReceiptRuntime {
                             result: Box::new(
                                 crate::domain::invocation::DomainResult::canonical_rejection(
                                     None,
-                                    "bad_value",
+                                    RefusalCode::BadValue,
                                     "scenario prepare rejected invocation",
                                 ),
                             ),
@@ -4994,7 +5149,7 @@ impl V5ReceiptRuntime {
                                 result: Box::new(
                                     crate::domain::invocation::DomainResult::canonical_rejection(
                                         None,
-                                        "bad_value",
+                                        RefusalCode::BadValue,
                                         "scenario prepare rejected invocation",
                                     ),
                                 ),
@@ -5051,7 +5206,7 @@ impl V5ReceiptRuntime {
                                 result: Box::new(
                                     crate::domain::invocation::DomainResult::canonical_rejection(
                                         None,
-                                        "bad_value",
+                                        RefusalCode::BadValue,
                                         "scenario prepare rejected invocation",
                                     ),
                                 ),
@@ -5078,7 +5233,7 @@ impl V5ReceiptRuntime {
                                 result: Box::new(
                                     crate::domain::invocation::DomainResult::canonical_rejection(
                                         None,
-                                        "bad_value",
+                                        RefusalCode::BadValue,
                                         "scenario prepare rejected invocation",
                                     ),
                                 ),
@@ -5125,7 +5280,7 @@ impl V5ReceiptRuntime {
                             result: Box::new(
                                 crate::domain::invocation::DomainResult::canonical_rejection(
                                     None,
-                                    "bad_value",
+                                    RefusalCode::BadValue,
                                     "scenario prepare rejected invocation",
                                 ),
                             ),
@@ -5136,9 +5291,8 @@ impl V5ReceiptRuntime {
                 }
             }
         }
-        let prepared = match actor_bound.prepare() {
-            Ok(prepared) => prepared,
-            Err(result) => {
+        let (prepared, direct_outcome) = match self.drive_inline_invocation(actor_bound, &begun)? {
+            InlineDrive::Rejected(result) => {
                 let terminal = crate::application::receipt_ledger::canonical_v5_terminal(
                     &crate::application::receipt_ledger::ReceiptTerminalOutcome::Completed {
                         result,
@@ -5147,11 +5301,11 @@ impl V5ReceiptRuntime {
                 .map_err(|_| ReceiptLedgerError::Corrupt("canonical v5 terminal failed"))?;
                 return self.publish_direct_terminal(begun, epoch_ms, terminal, deadline);
             }
+            InlineDrive::HandedOff(reply) => return Ok(*reply),
+            InlineDrive::KnownLong(prepared) => (Some(prepared), None),
+            InlineDrive::Direct(outcome) => (None, Some(outcome)),
         };
-        if matches!(
-            prepared.execution_class(),
-            crate::application::operation_descriptors::ExecutionClass::KnownLong(_)
-        ) {
+        if let Some(prepared) = prepared {
             let handoff = self.receipt_ledger.begin_bound_task_handoff(
                 begun.key().clone(),
                 begun.record_version(),
@@ -5348,24 +5502,8 @@ impl V5ReceiptRuntime {
                 },
             }));
         }
-        #[cfg(feature = "receipt-ledger-test-support")]
-        {
-            self.telemetry.record_execute();
-            self.telemetry
-                .record_event(V5ReceiptRuntimeEventKind::ExecuteEntered, epoch_ms);
-        }
-        #[cfg(feature = "receipt-ledger-test-support")]
-        if let Some(control) = &self.scenario_control {
-            control.record_callback_invocation_id(reservation.key().invocation_id());
-        }
-        let outcome = match prepared.execute(CancellationToken::new()) {
-            Ok(result) => crate::application::receipt_ledger::ReceiptTerminalOutcome::Completed {
-                result: Box::new(result),
-            },
-            Err(_) => crate::application::receipt_ledger::ReceiptTerminalOutcome::Failed {
-                reason: V5SafeFailureReason::InvocationFailed,
-            },
-        };
+        let outcome = direct_outcome
+            .expect("an inline drive without a handoff or a known-long class yields the outcome");
         #[cfg(feature = "receipt-ledger-test-support")]
         if self
             .scenario_control
@@ -5374,6 +5512,10 @@ impl V5ReceiptRuntime {
         {
             return Err(ReceiptLedgerError::StoreUnavailable);
         }
+        // An outcome that arrived on the last tick of the budget is still
+        // published: the ledger command gets the serialization margin, not
+        // an already spent operation deadline.
+        let deadline = deadline.max(Instant::now() + RESPONSE_SERIALIZATION_MARGIN);
         let (terminal, _oversized_result) = match canonical_v5_terminal(&outcome) {
             Ok(terminal) => (terminal, false),
             Err(CanonicalTerminalError::ResultTooLarge) => (
@@ -5422,6 +5564,370 @@ impl V5ReceiptRuntime {
         }
         #[cfg(not(feature = "receipt-ledger-test-support"))]
         self.publish_direct_terminal(begun, epoch_ms, terminal, deadline)
+    }
+
+    /// Runs prepare and the inline execution of a begun receipt on a worker
+    /// thread while the session handler owns the cutoff. An outcome before the
+    /// handoff moment stays a Direct terminal; the handoff moment itself turns
+    /// the receipt into a durable Task that the running worker completes —
+    /// the seventh second divides direct and Task, no attempt is restarted.
+    fn drive_inline_invocation(
+        self: &Arc<Self>,
+        actor_bound: super::server::V5ActorBoundCanonicalInvocation,
+        begun: &crate::application::receipt_ledger::ReservedReceipt,
+    ) -> Result<InlineDrive, ReceiptLedgerError> {
+        let response_deadline = actor_bound.response_deadline();
+        let slot = Arc::new(InlineExecutionSlot::new());
+        let cancellation = CancellationToken::new();
+        let invocation_id = begun.key().invocation_id();
+        let worker = {
+            let runtime = Arc::clone(self);
+            let slot = Arc::clone(&slot);
+            let cancellation = cancellation.clone();
+            thread::Builder::new()
+                .name("unica-v5-inline-execution".to_owned())
+                .spawn(move || {
+                    runtime.run_inline_worker(actor_bound, slot, cancellation, invocation_id)
+                })
+                .map_err(|_| {
+                    self.external_store_fail_stop.store(true, Ordering::Release);
+                    ReceiptLedgerError::StoreUnavailable
+                })?
+        };
+        // Under the scenario harness the harness itself plays the deadline
+        // owner; the production runtime owns the cutoff otherwise.
+        #[cfg(feature = "receipt-ledger-test-support")]
+        let owns_cutoff = self.scenario_control.is_none();
+        #[cfg(not(feature = "receipt-ledger-test-support"))]
+        let owns_cutoff = true;
+        let cutoff = response_deadline.filter(|_| owns_cutoff);
+
+        let mut state = slot.lock();
+        loop {
+            if let Some(report) = state.report.take() {
+                state.decision = InlineHandoffDecision::HandlerOwns;
+                drop(state);
+                let _ = worker.join();
+                return Ok(match report {
+                    InlineWorkerReport::Rejected(result) => InlineDrive::Rejected(result),
+                    InlineWorkerReport::KnownLong(prepared) => InlineDrive::KnownLong(prepared),
+                    InlineWorkerReport::Outcome(outcome) => InlineDrive::Direct(outcome),
+                });
+            }
+            if worker.is_finished() {
+                // The worker died without a report: the attempt failed and the
+                // failure is the terminal, exactly as a returned error would be.
+                state.decision = InlineHandoffDecision::HandlerOwns;
+                drop(state);
+                let _ = worker.join();
+                return Ok(InlineDrive::Direct(ReceiptTerminalOutcome::Failed {
+                    reason: V5SafeFailureReason::InvocationFailed,
+                }));
+            }
+            let remaining = cutoff
+                .as_ref()
+                .map_or(INLINE_CUTOFF_POLL_INTERVAL, |deadline| {
+                    deadline.remaining_handoff_budget()
+                });
+            if remaining.is_zero() {
+                break;
+            }
+            let (next, _) = slot
+                .changed
+                .wait_timeout(state, remaining.min(INLINE_CUTOFF_POLL_INTERVAL))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+        }
+
+        // The cutoff: from here on the receipt is a Task and the reply is its
+        // projection; the worker keeps the only attempt.
+        state.decision = InlineHandoffDecision::HandoffInProgress;
+        drop(state);
+        let committed = self.commit_cutoff_handoff(begun, cancellation.clone());
+        let mut state = slot.lock();
+        match committed {
+            Ok((bound, task_record, guard)) => {
+                let task_id = task_record.task_id;
+                if let Some(report) = state.report.take() {
+                    // The worker finished while the handoff was committing:
+                    // the outcome goes into the Task right now.
+                    state.decision = InlineHandoffDecision::HandlerOwns;
+                    slot.changed.notify_all();
+                    drop(state);
+                    let _ = worker.join();
+                    let outcome = match report {
+                        InlineWorkerReport::Outcome(outcome) => outcome,
+                        InlineWorkerReport::Rejected(result) => {
+                            ReceiptTerminalOutcome::Completed { result }
+                        }
+                        InlineWorkerReport::KnownLong(prepared) => {
+                            self.spawn_task_execution(
+                                prepared,
+                                bound,
+                                task_record.clone(),
+                                cancellation,
+                                guard,
+                            )?;
+                            return Ok(InlineDrive::HandedOff(Box::new(V5RuntimeReply::Json(
+                                V5ServerResponse::Invocation {
+                                    outcome: V5InvocationResponse::Task {
+                                        snapshot: task_store_snapshot(&task_record),
+                                    },
+                                },
+                            ))));
+                        }
+                    };
+                    let snapshot = self.publish_task_execution_outcome(
+                        &bound,
+                        task_id,
+                        outcome,
+                        Instant::now() + TASK_TERMINAL_PUBLICATION_TIMEOUT,
+                    )?;
+                    drop(guard);
+                    return Ok(InlineDrive::HandedOff(Box::new(V5RuntimeReply::Json(
+                        V5ServerResponse::Invocation {
+                            outcome: V5InvocationResponse::Task { snapshot },
+                        },
+                    ))));
+                }
+                state.decision = InlineHandoffDecision::Task(Box::new(InlineTaskOwnership {
+                    bound,
+                    task_id,
+                    guard: Some(guard),
+                }));
+                slot.changed.notify_all();
+                drop(state);
+                self.task_execution_threads
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(worker);
+                Ok(InlineDrive::HandedOff(Box::new(V5RuntimeReply::Json(
+                    V5ServerResponse::Invocation {
+                        outcome: V5InvocationResponse::Task {
+                            snapshot: task_store_snapshot(&task_record),
+                        },
+                    },
+                ))))
+            }
+            Err(error) => {
+                state.decision = InlineHandoffDecision::Abandoned;
+                slot.changed.notify_all();
+                drop(state);
+                self.task_execution_threads
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(worker);
+                Err(error)
+            }
+        }
+    }
+
+    /// The worker half of an inline invocation: prepare, then execute unless
+    /// the class is known-long and the handler still waits for it.
+    fn run_inline_worker(
+        self: Arc<Self>,
+        actor_bound: super::server::V5ActorBoundCanonicalInvocation,
+        slot: Arc<InlineExecutionSlot>,
+        cancellation: CancellationToken,
+        invocation_id: crate::domain::invocation::InvocationId,
+    ) {
+        #[cfg(not(feature = "receipt-ledger-test-support"))]
+        let _ = invocation_id;
+        let prepared = match actor_bound.prepare() {
+            Ok(prepared) => prepared,
+            Err(result) => {
+                self.publish_inline_settlement(
+                    slot.settle(InlineWorkerReport::Rejected(result)),
+                    cancellation,
+                );
+                return;
+            }
+        };
+        let prepared = if matches!(
+            prepared.execution_class(),
+            crate::application::operation_descriptors::ExecutionClass::KnownLong(_)
+        ) {
+            match slot.settle(InlineWorkerReport::KnownLong(prepared)) {
+                InlineSettlement::HandlerOwns | InlineSettlement::Abandoned => return,
+                // The cutoff already made the Task: prepare finished late and
+                // this worker executes into it, as a known-long thread would.
+                InlineSettlement::Task {
+                    report: InlineWorkerReport::KnownLong(prepared),
+                    ownership,
+                } => {
+                    let outcome = self.execute_inline(prepared, &cancellation, invocation_id);
+                    let InlineTaskOwnership {
+                        bound,
+                        task_id,
+                        guard,
+                    } = *ownership;
+                    self.publish_inline_outcome(&bound, task_id, outcome, guard);
+                    return;
+                }
+                InlineSettlement::Task { .. } => return,
+            }
+        } else {
+            prepared
+        };
+        let outcome = self.execute_inline(prepared, &cancellation, invocation_id);
+        self.publish_inline_settlement(
+            slot.settle(InlineWorkerReport::Outcome(outcome)),
+            cancellation,
+        );
+    }
+
+    fn execute_inline(
+        &self,
+        prepared: super::server::V5PreparedCanonicalInvocation,
+        cancellation: &CancellationToken,
+        invocation_id: crate::domain::invocation::InvocationId,
+    ) -> ReceiptTerminalOutcome {
+        #[cfg(not(feature = "receipt-ledger-test-support"))]
+        let _ = invocation_id;
+        #[cfg(feature = "receipt-ledger-test-support")]
+        {
+            self.telemetry.record_execute();
+            self.telemetry
+                .record_event(V5ReceiptRuntimeEventKind::ExecuteEntered, self.epoch_ms());
+            if let Some(control) = &self.scenario_control {
+                control.record_callback_invocation_id(invocation_id);
+            }
+        }
+        let result = prepared.execute(cancellation.clone());
+        if cancellation.is_cancelled() {
+            ReceiptTerminalOutcome::Cancelled
+        } else {
+            match result {
+                Ok(result) => ReceiptTerminalOutcome::Completed {
+                    result: Box::new(result),
+                },
+                Err(_) => ReceiptTerminalOutcome::Failed {
+                    reason: V5SafeFailureReason::InvocationFailed,
+                },
+            }
+        }
+    }
+
+    /// A settlement the handler does not own goes into the Task by the worker.
+    fn publish_inline_settlement(
+        self: &Arc<Self>,
+        settlement: InlineSettlement,
+        cancellation: CancellationToken,
+    ) {
+        match settlement {
+            InlineSettlement::HandlerOwns | InlineSettlement::Abandoned => {}
+            InlineSettlement::Task { report, ownership } => {
+                let InlineTaskOwnership {
+                    bound,
+                    task_id,
+                    guard,
+                } = *ownership;
+                let outcome = match report {
+                    InlineWorkerReport::Outcome(outcome) => outcome,
+                    InlineWorkerReport::Rejected(result) => {
+                        ReceiptTerminalOutcome::Completed { result }
+                    }
+                    InlineWorkerReport::KnownLong(prepared) => {
+                        self.execute_inline(prepared, &cancellation, bound.key().invocation_id())
+                    }
+                };
+                self.publish_inline_outcome(&bound, task_id, outcome, guard);
+            }
+        }
+    }
+
+    fn publish_inline_outcome(
+        &self,
+        bound: &TaskBoundReceipt,
+        task_id: crate::domain::invocation::TaskId,
+        outcome: ReceiptTerminalOutcome,
+        guard: Option<V5ActiveTaskCancellationGuard>,
+    ) {
+        let publication = self
+            .publish_task_execution_outcome(
+                bound,
+                task_id,
+                outcome,
+                Instant::now() + TASK_TERMINAL_PUBLICATION_TIMEOUT,
+            )
+            .map(|_| ());
+        if publication.is_err() {
+            self.external_store_fail_stop.store(true, Ordering::Release);
+        }
+        drop(guard);
+    }
+
+    /// The durable handoff of a begun receipt at its cutoff: the same
+    /// write-ahead intent, exact TaskStore record and `TaskBound` commit a
+    /// known-long class gets, with the worker's own cancellation registered.
+    fn commit_cutoff_handoff(
+        &self,
+        begun: &crate::application::receipt_ledger::ReservedReceipt,
+        cancellation: CancellationToken,
+    ) -> Result<
+        (
+            TaskBoundReceipt,
+            V5StoredInvocationRecord,
+            V5ActiveTaskCancellationGuard,
+        ),
+        ReceiptLedgerError,
+    > {
+        let epoch_ms = self.epoch_ms();
+        let deadline = Instant::now() + CUTOFF_HANDOFF_COMMIT_BUDGET;
+        let handoff = self.receipt_ledger.begin_bound_task_handoff(
+            begun.key().clone(),
+            begun.record_version(),
+            epoch_ms,
+            DIRECT_TERMINAL_RETENTION_MS,
+            V5_TASK_POLL_INTERVAL_MS,
+            deadline,
+        )?;
+        #[cfg(feature = "receipt-ledger-test-support")]
+        self.telemetry
+            .record_event(V5ReceiptRuntimeEventKind::BoundHandoffCommitted, epoch_ms);
+        let link_reservation = self
+            .task_projection
+            .reserve_bound_handoff_link(
+                &handoff,
+                epoch_ms,
+                deadline,
+                #[cfg(feature = "receipt-ledger-test-support")]
+                &self.telemetry,
+            )
+            .map_err(|failure| self.project_task_failure(failure))?;
+        let (task_record, bound) = self
+            .task_projection
+            .materialize_staged_bound_handoff(
+                &handoff,
+                &link_reservation,
+                epoch_ms,
+                deadline,
+                #[cfg(feature = "receipt-ledger-test-support")]
+                &self.telemetry,
+            )
+            .map_err(|failure| self.project_task_failure(failure))?;
+        self.receipt_ledger.complete_bound_task_handoff(
+            handoff.key().clone(),
+            handoff.record_version(),
+            bound.clone(),
+            deadline,
+        )?;
+        let guard = self
+            .active_task_cancellations
+            .register_existing(task_record.task_id, cancellation)?;
+        let (task_record, bound) = self
+            .task_projection
+            .start_bound_task(&bound, task_record, deadline)
+            .map_err(|failure| self.project_task_failure(failure))?;
+        #[cfg(feature = "receipt-ledger-test-support")]
+        {
+            if let Some(control) = &self.scenario_control {
+                control.record_bound_task(task_record.clone(), bound.clone());
+            }
+            self.telemetry
+                .record_event(V5ReceiptRuntimeEventKind::TaskBoundCommitted, epoch_ms);
+        }
+        Ok((bound, task_record, guard))
     }
 
     fn spawn_task_execution(
@@ -7958,7 +8464,7 @@ mod tests {
             7_000,
         )
         .expect("valid known-long invocation");
-        let mut owner = V5DaemonProcessOwner::connect_or_spawn_for_protocol_test(
+        let mut owner = V5DaemonProcessOwner::connect_or_spawn(
             &state_root,
             identity,
             std::path::PathBuf::from("unused-existing-v5-endpoint"),
@@ -8232,7 +8738,7 @@ mod tests {
             7_000,
         )
         .expect("valid long-submit request");
-        let mut owner = V5DaemonProcessOwner::connect_or_spawn_for_protocol_test(
+        let mut owner = V5DaemonProcessOwner::connect_or_spawn(
             &state_root,
             identity,
             std::path::PathBuf::from("unused-existing-v5-endpoint"),
@@ -8285,7 +8791,7 @@ mod tests {
                 request_scope_hash("workspace-a").expect("request scope"),
             ),
         );
-        let mut owner = V5DaemonProcessOwner::connect_or_spawn_for_protocol_test(
+        let mut owner = V5DaemonProcessOwner::connect_or_spawn(
             &state_root,
             identity.clone(),
             std::path::PathBuf::from("unused-existing-v5-endpoint"),
@@ -8369,7 +8875,7 @@ mod tests {
             RESPONSE_SERIALIZATION_MARGIN,
             "response serialization gets exactly one non-renewable margin"
         );
-        let mut owner = V5DaemonProcessOwner::connect_or_spawn_for_protocol_test(
+        let mut owner = V5DaemonProcessOwner::connect_or_spawn(
             &state_root,
             identity.clone(),
             std::path::PathBuf::from("unused-existing-v5-endpoint"),
@@ -8492,7 +8998,7 @@ mod tests {
                 request_scope_hash("workspace-a").expect("request scope"),
             ),
         );
-        let mut owner = V5DaemonProcessOwner::connect_or_spawn_for_protocol_test(
+        let mut owner = V5DaemonProcessOwner::connect_or_spawn(
             &state_root,
             identity.clone(),
             std::path::PathBuf::from("unused-existing-v5-endpoint"),
@@ -8659,7 +9165,7 @@ mod tests {
             })
         });
         let _record = wait_for_v5_record(state_root, identity);
-        let mut owner = V5DaemonProcessOwner::connect_or_spawn_for_protocol_test(
+        let mut owner = V5DaemonProcessOwner::connect_or_spawn(
             state_root,
             identity.clone(),
             std::path::PathBuf::from("unused-existing-v5-endpoint"),
@@ -9951,7 +10457,7 @@ mod tests {
         .expect("strict invocation");
         let unused_executable = std::path::PathBuf::from("unused-existing-v5-endpoint");
 
-        let mut cancel_owner = V5DaemonProcessOwner::connect_or_spawn_for_protocol_test(
+        let mut cancel_owner = V5DaemonProcessOwner::connect_or_spawn(
             &state_root,
             identity.clone(),
             unused_executable.clone(),
@@ -9972,7 +10478,7 @@ mod tests {
             }
         ));
 
-        let mut submit_owner = V5DaemonProcessOwner::connect_or_spawn_for_protocol_test(
+        let mut submit_owner = V5DaemonProcessOwner::connect_or_spawn(
             &state_root,
             identity.clone(),
             unused_executable.clone(),
@@ -9990,7 +10496,7 @@ mod tests {
                 && receipt.receipt_key() == &key
         ));
 
-        let mut recover_owner = V5DaemonProcessOwner::connect_or_spawn_for_protocol_test(
+        let mut recover_owner = V5DaemonProcessOwner::connect_or_spawn(
             &state_root,
             identity,
             unused_executable,
@@ -10325,7 +10831,10 @@ mod tests {
         use std::str::FromStr;
 
         for identity in [
-            CoreIdentity::production(),
+            CoreIdentity::from_str(
+                "2f4dd5713d11e5211a92c5fa01b1ec5722dc3a3160b9b1e0b667f8d8da3d9c28",
+            )
+            .expect("the retired protocol-v3 digest still parses as a canonical identity"),
             CoreIdentity::from_str(
                 "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             )
