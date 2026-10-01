@@ -246,6 +246,11 @@ def _validate_baseline(baseline: dict[str, Any]) -> tuple[str, set[str]]:
 def _validate_package(
     package: dict[str, Any], package_dir: Path, expected_source_commit: str
 ) -> dict[str, Any]:
+    """Bind package evidence to the expected source commit and downloaded bytes.
+
+    Even when hashes match, every host manifest must declare the evidence's
+    version and the runtime manifest must exist. This is not a runtime check.
+    """
     if package.get("schemaVersion") != SCHEMA_VERSION:
         raise ProofError(f"package evidence schemaVersion must be {SCHEMA_VERSION}")
     if package.get("packageHashFormat") != PACKAGE_HASH_FORMAT:
@@ -269,12 +274,13 @@ def _validate_package(
     manifest_paths = [
         plugin_dir / ".codex-plugin" / "plugin.json",
         plugin_dir / ".claude-plugin" / "plugin.json",
+        plugin_dir / ".zcode-plugin" / "plugin.json",
     ]
     versions: list[str] = []
     for manifest_path in manifest_paths:
         manifest = read_json(manifest_path)
         versions.append(_require_string(manifest.get("version"), "packaged plugin version"))
-    if versions != [version, version]:
+    if any(manifest_version != version for manifest_version in versions):
         raise ProofError("packaged host manifest versions do not match package evidence")
     runtime_manifest = plugin_dir / "runtime-manifest.json"
     if not runtime_manifest.is_file():
