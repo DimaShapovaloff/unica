@@ -413,6 +413,22 @@ impl ProviderDeadline {
         }
     }
 
+    pub(crate) fn earlier(self, other: Self) -> Self {
+        let (first, second) = if self.started_at <= other.started_at {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        let second_end = second
+            .budget
+            .saturating_add(second.started_at.duration_since(first.started_at));
+        if first.budget <= second_end {
+            first
+        } else {
+            second
+        }
+    }
+
     pub fn remaining(self) -> Duration {
         #[cfg(test)]
         let now = (self.now)();
@@ -1599,6 +1615,18 @@ mod tests {
             ProviderDeadline::new(deadline),
             ProviderDeadline::new(deadline)
         );
+        let start = Instant::now();
+        let earlier = ProviderDeadline::from_started_at(start, Duration::from_millis(20));
+        let later = ProviderDeadline::from_started_at(
+            start + Duration::from_millis(10),
+            Duration::from_millis(15),
+        );
+        // The later deadline has the smaller budget; selecting by budget alone
+        // would replenish the earlier invocation's remaining lifetime.
+        assert_eq!(earlier.earlier(later), earlier);
+        assert_eq!(later.earlier(earlier), earlier);
+        let expired = ProviderDeadline::from_started_at(start, Duration::ZERO);
+        assert_eq!(earlier.earlier(expired), expired);
     }
 
     #[test]

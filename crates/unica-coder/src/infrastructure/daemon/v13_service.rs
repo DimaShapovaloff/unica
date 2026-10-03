@@ -3037,7 +3037,12 @@ fn run_bsl_diagnostics(
             },
         ),
     };
-    match DiagnosticCoordinator::new(registry, &mapping).execute(&request, context, cancellation) {
+    match DiagnosticCoordinator::new(registry, &mapping).execute_scoped(
+        &request,
+        context,
+        cancellation,
+        Some((mapping.module_scope(), source.deadline())),
+    ) {
         Ok(result) => {
             // Провайдер, который не отработал, не доказывает чистоту кода.
             // Пустой список находок при незавершённом прогоне выглядел бы как
