@@ -7337,6 +7337,159 @@ struct ActorLogicalReadLease {"#,
             .contains("после перезапуска"));
     }
 
+    fn scheduled_handler_workspace(source_kind: &str, handler: &str) -> tempfile::TempDir {
+        let (workspace, source) = source_selection_read_fixture();
+        std::fs::write(
+            workspace.path().join("v8project.yaml"),
+            format!("format: DESIGNER\nsource-set:\n  - name: main\n    type: {source_kind}\n    path: src\n"),
+        )
+        .unwrap();
+        let extension_properties = if source_kind == "EXTENSION" {
+            "<ObjectBelonging>Adopted</ObjectBelonging><NamePrefix/>"
+        } else {
+            ""
+        };
+        std::fs::write(
+            source.join("Configuration.xml"),
+            format!(r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Configuration><Properties><Name>Store</Name>{extension_properties}</Properties><ChildObjects><Catalog>Items</Catalog><CommonModule>Handlers</CommonModule></ChildObjects></Configuration></MetaDataObject>"#),
+        )
+        .unwrap();
+        std::fs::create_dir_all(source.join("CommonModules/Handlers/Ext")).unwrap();
+        std::fs::write(
+            source.join("CommonModules/Handlers.xml"),
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><CommonModule uuid="11111111-1111-4111-8111-111111111111"><Properties><Name>Handlers</Name><Synonym/><Comment/><Global>false</Global><ClientManagedApplication>false</ClientManagedApplication><Server>true</Server><ExternalConnection>false</ExternalConnection><ClientOrdinaryApplication>false</ClientOrdinaryApplication><ServerCall>true</ServerCall><Privileged>false</Privileged><ReturnValuesReuse>DontUse</ReturnValuesReuse></Properties></CommonModule></MetaDataObject>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("CommonModules/Handlers/Ext/Module.bsl"),
+            handler,
+        )
+        .unwrap();
+        workspace
+    }
+
+    fn scheduled_job_create_plan() -> serde_json::Value {
+        serde_json::json!({
+            "at": "main:Configuration",
+            "ops": [{"op": "object.create", "args": {"values": {
+                "kind": "ScheduledJob", "name": "Nightly"
+            }}}]
+        })
+    }
+
+    #[test]
+    fn canonical_scheduled_job_defaulted_handler_saved_plan_round_trips_cf_and_cfe() {
+        for (source_kind, handler, method) in [
+            ("CONFIGURATION", "Procedure Run(Profile = Undefined, Manual = False) Export\nEndProcedure\n", "Run"),
+            ("EXTENSION", "Процедура Запустить(\nПрофиль = Неопределено,\nРучнойЗапуск = Ложь\n) Экспорт\nКонецПроцедуры\n", "Запустить"),
+        ] {
+            let workspace = scheduled_handler_workspace(source_kind, handler);
+            let source = workspace.path().join("src");
+            let before = crate::test_support::tree_snapshot(&source);
+            let runtime = bootstrap_runtime();
+            let planned = submit_canonical(&runtime, workspace.path(), ToolIdentity::Apply, scheduled_job_create_plan());
+            assert!(planned.ok, "{source_kind}: {planned:?}");
+            assert_eq!(crate::test_support::tree_snapshot(&source), before);
+            let plan = planned.data.as_ref().unwrap();
+            assert!(plan["executionToken"].as_str().is_some_and(|token| !token.is_empty()));
+            let applied = submit_canonical(
+                &runtime, workspace.path(), ToolIdentity::Apply,
+                serde_json::json!({"executionToken": plan["executionToken"]}),
+            );
+            assert!(applied.ok, "{source_kind}: {applied:?}");
+            assert_eq!(applied.data.as_ref().unwrap()["planHash"], plan["planHash"]);
+            let viewed = submit_canonical(
+                &runtime, workspace.path(), ToolIdentity::View,
+                serde_json::json!({"at": "main:ScheduledJob.Nightly"}),
+            );
+            assert!(viewed.ok, "{source_kind}: {viewed:?}");
+            let props = &viewed.data.as_ref().unwrap()["props"];
+            assert_eq!(props["handlerModule"], "CommonModule.Handlers");
+            assert_eq!(props["handlerMethod"], method);
+            let descriptor = std::fs::read_to_string(source.join("ScheduledJobs/Nightly.xml")).unwrap();
+            let parsed = roxmltree::Document::parse(descriptor.trim_start_matches('\u{feff}')).unwrap();
+            let selected = parsed.descendants().find(|node| node.has_tag_name(("http://v8.1c.ru/8.3/MDClasses", "MethodName"))).unwrap();
+            assert_eq!(selected.text(), Some(format!("CommonModule.Handlers.{method}").as_str()));
+            assert_eq!(std::fs::read_to_string(source.join("CommonModules/Handlers/Ext/Module.bsl")).unwrap(), handler);
+        }
+    }
+
+    #[test]
+    fn canonical_scheduled_job_required_handler_refuses_plan_without_writes() {
+        for source_kind in ["CONFIGURATION", "EXTENSION"] {
+            let workspace = scheduled_handler_workspace(
+                source_kind,
+                "Procedure Run(Required, Optional = False) Export\nEndProcedure\n",
+            );
+            let source = workspace.path().join("src");
+            let before = crate::test_support::tree_snapshot(&source);
+            let runtime = bootstrap_runtime();
+            let refused = submit_canonical(
+                &runtime,
+                workspace.path(),
+                ToolIdentity::Apply,
+                scheduled_job_create_plan(),
+            );
+            assert!(!refused.ok, "{source_kind}: {refused:?}");
+            assert_eq!(refused.diagnostics[0]["code"], "bad_value", "{refused:?}");
+            assert!(refused
+                .data
+                .as_ref()
+                .and_then(|data| data.get("executionToken"))
+                .is_none());
+            assert!(refused.changed.is_empty());
+            assert_eq!(crate::test_support::tree_snapshot(&source), before);
+            assert!(!source.join("ScheduledJobs/Nightly.xml").exists());
+        }
+    }
+
+    #[test]
+    fn canonical_scheduled_job_saved_plan_refuses_changed_handler_without_publication() {
+        for source_kind in ["CONFIGURATION", "EXTENSION"] {
+            let workspace = scheduled_handler_workspace(
+                source_kind,
+                "Procedure Run(Manual = False) Export\nEndProcedure\n",
+            );
+            let source = workspace.path().join("src");
+            let owner_before = std::fs::read(source.join("Configuration.xml")).unwrap();
+            let runtime = bootstrap_runtime();
+            let planned = submit_canonical(
+                &runtime,
+                workspace.path(),
+                ToolIdentity::Apply,
+                scheduled_job_create_plan(),
+            );
+            assert!(planned.ok, "{source_kind}: {planned:?}");
+            // Still callable: only the retained input changed, not its admissibility.
+            let foreign = "Procedure Run(Manual = True) Export\nEndProcedure\n";
+            let module = source.join("CommonModules/Handlers/Ext/Module.bsl");
+            std::fs::write(&module, foreign).unwrap();
+            let before_execution = crate::test_support::tree_snapshot(&source);
+            let refused = submit_canonical(
+                &runtime,
+                workspace.path(),
+                ToolIdentity::Apply,
+                serde_json::json!({"executionToken": planned.data.as_ref().unwrap()["executionToken"]}),
+            );
+            assert!(!refused.ok, "{source_kind}: {refused:?}");
+            assert_eq!(
+                refused.diagnostics[0]["code"], "stale_revision",
+                "{refused:?}"
+            );
+            assert!(refused.changed.is_empty());
+            assert_eq!(
+                crate::test_support::tree_snapshot(&source),
+                before_execution
+            );
+            assert_eq!(std::fs::read_to_string(module).unwrap(), foreign);
+            assert_eq!(
+                std::fs::read(source.join("Configuration.xml")).unwrap(),
+                owner_before
+            );
+            assert!(!source.join("ScheduledJobs").exists());
+        }
+    }
+
     #[test]
     fn canonical_apply_view_round_trip_common_module_ordinary_client() {
         let workspace = tempfile::tempdir().unwrap();
@@ -7459,6 +7612,486 @@ struct ActorLogicalReadLease {"#,
                 assert_eq!(unchanged.data, before_view.data);
             }
         }
+    }
+
+    #[test]
+    fn canonical_html_field_creation_binding_and_neighbor_edit_preserve_form_contract() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("src");
+        std::fs::create_dir_all(source.join("Documents")).unwrap();
+        std::fs::write(
+            workspace.path().join("v8project.yaml"),
+            "format: DESIGNER\nsource-set:\n  - name: main\n    type: CONFIGURATION\n    path: src\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("Configuration.xml"),
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Configuration><Properties><Name>Store</Name></Properties><ChildObjects><Document>Order</Document></ChildObjects></Configuration></MetaDataObject>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("Documents/Order.xml"),
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:app="http://v8.1c.ru/8.2/managed-application/core" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.20"><Document uuid="11111111-1111-4111-8111-111111111111"><Properties><Name>Order</Name><Synonym/><Comment/></Properties><ChildObjects/></Document></MetaDataObject>"#,
+        )
+        .unwrap();
+        let runtime = V5CanonicalInvocationRuntime::new(
+            Arc::new(
+                crate::infrastructure::daemon::v13_service::CanonicalV13ReadService::default(),
+            ),
+            Arc::new(TokioClock),
+        );
+        let workspace_hint = std::fs::canonicalize(workspace.path()).unwrap();
+        let call = |tool, arguments| {
+            let request =
+                InvocationRequest::new(tool, arguments, workspace_hint.to_string_lossy(), 7_000)
+                    .unwrap();
+            direct_v5(&runtime, request).unwrap()
+        };
+        let apply_pair = |at: &str, ops: serde_json::Value| {
+            let before = crate::test_support::tree_snapshot(&source);
+            let preview = call(
+                ToolIdentity::Apply,
+                serde_json::json!({"at": at, "ops": ops}),
+            );
+            assert!(preview.ok, "preview failed: {preview:?}");
+            assert_eq!(crate::test_support::tree_snapshot(&source), before);
+            let token = &preview.data.as_ref().unwrap()["executionToken"];
+            assert!(token.is_string(), "{preview:?}");
+            let published = call(
+                ToolIdentity::Apply,
+                serde_json::json!({"executionToken": token}),
+            );
+            assert!(published.ok, "publication failed: {published:?}");
+            let plan_hash = &preview.data.as_ref().unwrap()["planHash"];
+            assert!(plan_hash.is_string(), "{preview:?}");
+            assert_eq!(plan_hash, &published.data.as_ref().unwrap()["planHash"]);
+        };
+        let at = "main:Document.Order.Form.Main";
+        let item_at = "main:Document.Order.Form.Main.Item.Content.Item.Html";
+        apply_pair(
+            at,
+            serde_json::json!([{"op": "form.create", "args": {
+                "values": {"name": "Main", "type": "ObjectForm"}
+            }}]),
+        );
+        apply_pair(
+            at,
+            serde_json::json!([
+                {"op": "formAttribute.add", "args": {"items": [
+                    {"name": "HtmlSource", "type": "String"}
+                ]}},
+                {"op": "element.add", "args": {"items": [
+                    {"name": "Content", "type": "Group"}, {
+                    "name": "Html", "type": "HTMLDocumentField", "path": "HtmlSource", "into": "Content",
+                    "titleLocation": "none", "width": 1, "height": 1,
+                    "autoMaxWidth": false, "skipOnInput": true, "on": ["OnClick"]
+                }]}}
+            ]),
+        );
+        apply_pair(
+            at,
+            serde_json::json!([{"op": "event.bind", "args": {"values": {
+                "element": "Html", "event": "DocumentComplete", "handler": "HtmlDocumentComplete"
+            }}}]),
+        );
+
+        let form_path = source.join("Documents/Order/Forms/Main/Ext/Form.xml");
+        let xml = std::fs::read_to_string(&form_path).unwrap();
+        let xml = xml.trim_start_matches('\u{feff}');
+        let parsed = roxmltree::Document::parse(xml).unwrap();
+        let html = parsed
+            .descendants()
+            .find(|node| {
+                node.has_tag_name("HTMLDocumentField") && node.attribute("name") == Some("Html")
+            })
+            .expect("typed element.add creates the platform HTML element");
+        let group = html.parent().unwrap().parent().unwrap();
+        assert!(group.has_tag_name("UsualGroup"), "{xml}");
+        assert_eq!(group.attribute("name"), Some("Content"));
+        for (property, value) in [
+            ("DataPath", "HtmlSource"),
+            ("TitleLocation", "None"),
+            ("Width", "1"),
+            ("Height", "1"),
+            ("AutoMaxWidth", "false"),
+            ("SkipOnInput", "true"),
+        ] {
+            assert_eq!(
+                html.children()
+                    .find(|node| node.has_tag_name(property))
+                    .and_then(|node| node.text()),
+                Some(value),
+                "{property}: {xml}"
+            );
+        }
+        for companion in ["ContextMenu", "ExtendedTooltip"] {
+            let nodes: Vec<_> = html
+                .children()
+                .filter(|node| node.has_tag_name(companion))
+                .collect();
+            assert_eq!(nodes.len(), 1, "{companion}: {xml}");
+            assert!(nodes[0].attribute("id").is_some(), "{xml}");
+        }
+        let events: Vec<_> = html
+            .descendants()
+            .filter(|node| node.has_tag_name("Event"))
+            .collect();
+        assert_eq!(events.len(), 2, "{xml}");
+        assert!(
+            events
+                .iter()
+                .any(|node| node.attribute("name") == Some("OnClick")
+                    && node.text().is_some_and(|handler| !handler.is_empty())),
+            "{xml}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|node| node.attribute("name") == Some("DocumentComplete")
+                    && node.text() == Some("HtmlDocumentComplete")),
+            "{xml}"
+        );
+        let preserved_html = xml[html.range()].to_string();
+
+        for target in [at, item_at] {
+            let viewed = call(ToolIdentity::View, serde_json::json!({"at": target}));
+            assert!(viewed.ok, "{viewed:?}");
+            assert_eq!(viewed.at.as_deref(), Some(target));
+            if target == item_at {
+                assert_eq!(
+                    viewed.data.as_ref().unwrap()["props"]["tag"],
+                    "[HTMLDocumentField]"
+                );
+            }
+        }
+        let checked = call(ToolIdentity::Check, serde_json::json!({"at": at}));
+        assert!(checked.ok, "{checked:?}");
+        assert_eq!(
+            checked.data.as_ref().unwrap()["diagnosticCount"],
+            0,
+            "{checked:?}"
+        );
+
+        // A later operation must not discard an HTML field it did not create.
+        apply_pair(
+            at,
+            serde_json::json!([{"op": "element.add", "args": {"items": [
+                {"name": "Neighbor", "type": "InputField", "path": "HtmlSource", "into": "Content", "after": "Html"}
+            ]}}]),
+        );
+        let with_neighbor = std::fs::read_to_string(&form_path).unwrap();
+        let with_neighbor = with_neighbor.trim_start_matches('\u{feff}');
+        let parsed = roxmltree::Document::parse(with_neighbor).unwrap();
+        let html = parsed
+            .descendants()
+            .find(|node| node.has_tag_name("HTMLDocumentField"))
+            .unwrap();
+        assert_eq!(&with_neighbor[html.range()], preserved_html);
+        assert_eq!(
+            html.next_sibling_element().unwrap().attribute("name"),
+            Some("Neighbor")
+        );
+        let child_items = parsed
+            .descendants()
+            .find(|node| node.has_tag_name("ChildItems"))
+            .unwrap();
+        let ids: Vec<_> = child_items
+            .descendants()
+            .filter_map(|node| node.attribute("id"))
+            .collect();
+        let unique: std::collections::BTreeSet<_> = ids.iter().copied().collect();
+        assert_eq!(
+            ids.len(),
+            unique.len(),
+            "UI elements and companions have distinct IDs: {with_neighbor}"
+        );
+
+        // Poison a batch after a valid addition: neither operation may leak to disk.
+        let before = crate::test_support::tree_snapshot(&source);
+        {
+            let refused = call(
+                ToolIdentity::Apply,
+                serde_json::json!({
+                    "at": at,
+                    "ops": [
+                        {"op": "element.add", "args": {"items": [{"name": "MustNotAppear", "type": "InputField", "path": "HtmlSource"}]}},
+                        {"op": "event.bind", "args": {"values": {"element": "Html", "event": "OnChange", "handler": "InvalidHandler"}}}
+                    ]
+                }),
+            );
+            assert!(!refused.ok, "{refused:?}");
+            assert!(refused
+                .data
+                .as_ref()
+                .is_none_or(|data| data.get("executionToken").is_none()));
+            assert!(
+                refused
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.to_string().contains("FORM_EVENT_NOT_ALLOWED")),
+                "{refused:?}"
+            );
+            assert_eq!(crate::test_support::tree_snapshot(&source), before);
+        }
+        for invalid_item in [
+            serde_json::json!({"name": "MixedInput", "type": "InputField", "html": "MixedInput", "path": "HtmlSource"}),
+            serde_json::json!({"name": "MixedGroup", "type": "Group", "html": "MixedGroup"}),
+            serde_json::json!({"name": "MixedBar", "type": "CommandBar", "html": "MixedBar"}),
+            serde_json::json!({"name": "LegacyHtml", "html": "LegacyHtml", "path": "HtmlSource"}),
+            serde_json::json!({"name": "RepeatedHtml", "type": "HTMLDocumentField", "html": "RepeatedHtml"}),
+            serde_json::json!({"name": "InvalidHtml", "type": "HTMLDocumentField", "on": ["OnChange"]}),
+            serde_json::json!({"name": "InvalidHtml", "type": "HTMLDocumentField", "width": -1}),
+            serde_json::json!({"name": "InvalidGroup", "type": "Group", "children": [
+                {"name": "InvalidHtml", "type": "HTMLDocumentField"}
+            ]}),
+        ] {
+            {
+                let refused = call(
+                    ToolIdentity::Apply,
+                    serde_json::json!({
+                        "at": at,
+                        "ops": [{"op": "element.add", "args": {"items": [invalid_item]}}]
+                    }),
+                );
+                assert!(
+                    !refused.ok,
+                    "invalid HTML definition was accepted: {refused:?}"
+                );
+                assert!(!refused.diagnostics.is_empty(), "{refused:?}");
+                assert!(refused
+                    .data
+                    .as_ref()
+                    .is_none_or(|data| data.get("executionToken").is_none()));
+                assert_eq!(crate::test_support::tree_snapshot(&source), before);
+            }
+        }
+
+        let original = std::fs::read_to_string(&form_path).unwrap();
+        let parsed = roxmltree::Document::parse(original.trim_start_matches('\u{feff}')).unwrap();
+        let imported_id = parsed
+            .descendants()
+            .find(|node| node.attribute("name") == Some("Html"))
+            .unwrap()
+            .attribute("id")
+            .unwrap();
+        let marker = format!("name=\"Html\" id=\"{imported_id}\"");
+        assert_eq!(original.matches(&marker).count(), 1);
+        for highest in [usize::MAX, usize::MAX - 1, usize::MAX - 2] {
+            let exhausted = original.replace(&marker, &format!("name=\"Html\" id=\"{highest}\""));
+            std::fs::write(&form_path, exhausted).unwrap();
+            let before = crate::test_support::tree_snapshot(&source);
+            let refused = call(
+                ToolIdentity::Apply,
+                serde_json::json!({
+                    "at": at,
+                    "ops": [{"op": "element.add", "args": {"items": [{
+                        "name": "OverflowHtml", "type": "HTMLDocumentField", "path": "HtmlSource"
+                    }]}}]
+                }),
+            );
+            assert!(!refused.ok, "highest={highest}: {refused:?}");
+            assert!(
+                refused
+                    .data
+                    .as_ref()
+                    .is_none_or(|data| data.get("executionToken").is_none()),
+                "{refused:?}"
+            );
+            assert!(
+                refused
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.to_string().contains("Form ID space exhausted")),
+                "{refused:?}"
+            );
+            assert!(refused.changed.is_empty(), "{refused:?}");
+            assert_eq!(crate::test_support::tree_snapshot(&source), before);
+        }
+    }
+
+    #[test]
+    fn canonical_apply_constant_type_create_edit_view_and_atomic_refusal() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            workspace.path().join("v8project.yaml"),
+            "format: DESIGNER\nsource-set:\n  - name: main\n    type: CONFIGURATION\n    path: src\n",
+        ).unwrap();
+        std::fs::write(
+            source.join("Configuration.xml"),
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Configuration><Properties><Name>Store</Name></Properties><ChildObjects/></Configuration></MetaDataObject>"#,
+        ).unwrap();
+        let runtime = V5CanonicalInvocationRuntime::new(
+            Arc::new(
+                crate::infrastructure::daemon::v13_service::CanonicalV13ReadService::default(),
+            ),
+            Arc::new(TokioClock),
+        );
+        let workspace_hint = std::fs::canonicalize(workspace.path()).unwrap();
+        let call = |tool, arguments| {
+            let request =
+                InvocationRequest::new(tool, arguments, workspace_hint.to_string_lossy(), 7_000)
+                    .unwrap();
+            direct_v5(&runtime, request).unwrap()
+        };
+        let publish = |ops: serde_json::Value| {
+            let before = crate::test_support::tree_snapshot(workspace.path());
+            let creates_object = ops[0]["op"] == "object.create";
+            let at = if creates_object {
+                "main:Configuration"
+            } else {
+                ops[0]["args"]["at"].as_str().expect("edit target")
+            };
+            let preview = call(
+                ToolIdentity::Apply,
+                serde_json::json!({"at": at, "ops": ops}),
+            );
+            assert!(preview.ok, "{preview:?}");
+            assert_eq!(
+                crate::test_support::tree_snapshot(workspace.path()),
+                before,
+                "planning writes nothing"
+            );
+            let token = &preview.data.as_ref().unwrap()["executionToken"];
+            assert!(token.as_str().is_some_and(|token| !token.is_empty()));
+            let applied = call(
+                ToolIdentity::Apply,
+                serde_json::json!({"executionToken": token}),
+            );
+            assert!(applied.ok, "{applied:?}");
+            let preview_data = preview.data.as_ref().unwrap();
+            let applied_data = applied.data.as_ref().unwrap();
+            assert_eq!(preview_data["operations"], applied_data["operations"]);
+            assert_eq!(preview_data["effects"], applied_data["effects"]);
+            assert_eq!(preview.changed, applied.changed);
+            assert_eq!(preview_data["planHash"], applied_data["planHash"]);
+            applied
+        };
+        let view_type = || {
+            let viewed = call(
+                ToolIdentity::View,
+                serde_json::json!({"at": "main:Constant.Enabled"}),
+            );
+            assert!(viewed.ok, "{viewed:?}");
+            let props = &viewed.data.as_ref().unwrap()["props"];
+            assert!(
+                props.get("Type").is_none(),
+                "type has one public projection: {props}"
+            );
+            serde_json::from_str::<serde_json::Value>(props["type"].as_str().expect("compact type"))
+                .unwrap()
+        };
+        let assert_xml_type = |expected: &str| {
+            let xml = std::fs::read_to_string(source.join("Constants/Enabled.xml")).unwrap();
+            let document = roxmltree::Document::parse(xml.trim_start_matches('\u{feff}')).unwrap();
+            let types: Vec<_> = document
+                .descendants()
+                .filter(|node| node.has_tag_name(("http://v8.1c.ru/8.1/data/core", "Type")))
+                .collect();
+            assert_eq!(types.len(), 1, "{xml}");
+            let (prefix, local) = types[0].text().unwrap().split_once(':').unwrap();
+            assert_eq!(local, expected);
+            assert_eq!(
+                types[0].lookup_namespace_uri(Some(prefix)),
+                Some(if expected == "boolean" {
+                    "http://www.w3.org/2001/XMLSchema"
+                } else {
+                    "http://v8.1c.ru/8.1/data/enterprise/current-config"
+                })
+            );
+            assert!(
+                !document
+                    .descendants()
+                    .any(|node| node
+                        .has_tag_name(("http://v8.1c.ru/8.1/data/core", "StringQualifiers"))),
+                "old string qualifiers survived: {xml}"
+            );
+        };
+        publish(serde_json::json!([
+            {"op": "object.create", "args": {"values": {"kind": "Constant", "name": "Enabled"}}},
+            {"op": "props.set", "args": {"at": "main:Constant.Enabled", "values": {"Type": {"variants": [{"kind": "boolean"}]}}}}
+        ]));
+        assert_xml_type("boolean");
+        assert_eq!(view_type()["variants"][0]["kind"], "boolean");
+        publish(serde_json::json!([
+            {"op": "object.create", "args": {"values": {"kind": "Catalog", "name": "Products"}}}
+        ]));
+        let reference = serde_json::json!([
+            {"op": "props.set", "args": {"at": "main:Constant.Enabled", "values": {"Type": {"variants": [{"kind": "reference", "metadataPath": "Catalog.Products"}]}}}}
+        ]);
+        publish(reference.clone());
+        assert_xml_type("CatalogRef.Products");
+        let observed = view_type();
+        assert_eq!(observed["variants"][0]["kind"], "reference");
+        assert_eq!(observed["variants"][0]["metadataPath"], "Catalog.Products");
+        let before_noop = crate::test_support::tree_snapshot(&source);
+        let noop = publish(reference);
+        assert_eq!(noop.data.as_ref().unwrap()["effects"], 0);
+        assert_eq!(crate::test_support::tree_snapshot(&source), before_noop);
+
+        for (name, invalid_arguments) in [("Enabled", false), ("NewInvalidConst", true)] {
+            let before = crate::test_support::tree_snapshot(workspace.path());
+            let mut create_args = serde_json::json!({"values": {"kind": "Constant", "name": name}});
+            if invalid_arguments {
+                create_args["bogus"] = serde_json::json!(true);
+            }
+            let refused = call(
+                ToolIdentity::Apply,
+                serde_json::json!({
+                    "at": "main:Configuration",
+                    "ops": [
+                        {"op": "object.create", "args": create_args},
+                        {"op": "props.set", "args": {"at": format!("main:Constant.{name}"), "values": {"Comment": "must not publish"}}}
+                    ]
+                }),
+            );
+            assert!(
+                !refused.ok,
+                "a failed creation cannot authorize configuration: {refused:?}"
+            );
+            assert!(
+                refused
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("executionToken"))
+                    .is_none(),
+                "failed planning must not mint an executable token: {refused:?}"
+            );
+            assert_eq!(
+                crate::test_support::tree_snapshot(workspace.path()),
+                before,
+                "{name}: failed create batch must not publish"
+            );
+        }
+
+        // A valid first operation must not leak when a later type is invalid.
+        let before = crate::test_support::tree_snapshot(workspace.path());
+        let refused = call(
+            ToolIdentity::Apply,
+            serde_json::json!({
+                "at": "main:Constant.Enabled",
+                "ops": [
+                    {"op": "props.set", "args": {"at": "main:Constant.Enabled", "values": {"Comment": "must not publish"}}},
+                    {"op": "props.set", "args": {"at": "main:Constant.Enabled", "values": {"Type": {"variants": [{"kind": "boolean", "unknownQualifier": true}]}}}}
+                ]
+            }),
+        );
+        assert!(!refused.ok, "{refused:?}");
+        assert_eq!(refused.diagnostics[0]["code"], "bad_value", "{refused:?}");
+        assert!(
+            refused
+                .data
+                .as_ref()
+                .and_then(|data| data.get("executionToken"))
+                .is_none(),
+            "invalid batch must not mint an executable token: {refused:?}"
+        );
+        assert_eq!(
+            crate::test_support::tree_snapshot(workspace.path()),
+            before,
+            "invalid batch must be atomic"
+        );
     }
 
     #[test]
