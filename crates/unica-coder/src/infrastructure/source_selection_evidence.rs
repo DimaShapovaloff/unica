@@ -21,7 +21,7 @@ const MAX_ACTOR_ROUTE_AND_NAME_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone, Copy)]
 struct SelectionEvidenceBudgets {
     exact_bytes: usize,
-    exact_work_bytes: usize,
+    exact_work_bytes: Option<usize>,
     evidence_records: usize,
     enumerated_members: usize,
     unique_directories: usize,
@@ -32,7 +32,7 @@ impl SelectionEvidenceBudgets {
     fn actor_admission() -> Self {
         let production = Self {
             exact_bytes: MAX_ACTOR_EXACT_RETAINED_BYTES,
-            exact_work_bytes: MAX_ACTOR_EXACT_RETAINED_BYTES,
+            exact_work_bytes: None,
             evidence_records: MAX_ACTOR_EVIDENCE_RECORDS,
             enumerated_members: MAX_ACTOR_ENUMERATED_MEMBERS,
             unique_directories: MAX_ACTOR_UNIQUE_RETAINED_DIRECTORIES,
@@ -42,7 +42,7 @@ impl SelectionEvidenceBudgets {
         if let Some(test) = actor_selection_test_budgets() {
             return Self {
                 exact_bytes: test.exact_bytes,
-                exact_work_bytes: test.exact_work_bytes,
+                exact_work_bytes: Some(test.exact_work_bytes),
                 evidence_records: test.evidence_records,
                 enumerated_members: test.enumerated_members,
                 unique_directories: test.unique_directories,
@@ -91,14 +91,17 @@ impl SelectionEvidenceUsage {
     }
 
     fn charge_exact_work(&mut self, bytes: usize) -> Result<(), String> {
-        ensure_budget(
-            self.exact_work_bytes,
-            bytes,
-            self.budgets.exact_work_bytes,
-            "project source-map actor exact-work budget",
-            "bytes",
-        )?;
-        self.exact_work_bytes += bytes;
+        let next = self.exact_work_bytes.checked_add(bytes).ok_or_else(|| {
+            "project source-map actor exact-work byte count overflowed".to_string()
+        })?;
+        if let Some(limit) = self.budgets.exact_work_bytes {
+            if next > limit {
+                return Err(format!(
+                    "project source-map actor exact-work budget exceeds {limit} bytes"
+                ));
+            }
+        }
+        self.exact_work_bytes = next;
         Ok(())
     }
 
@@ -676,6 +679,10 @@ impl CompleteProjectSourceSelection {
 }
 
 impl RetainedSelectionPass {
+    pub(in crate::infrastructure) fn remaining_member_budget(&self) -> usize {
+        self.usage.remaining_members()
+    }
+
     pub(in crate::infrastructure) fn new(
         workspace: RetainedDirectoryCapability,
     ) -> Result<Self, String> {
@@ -2324,6 +2331,17 @@ pub(crate) mod tests {
 
     #[test]
     pub(crate) fn actor_admission_rejects_aggregate_exact_byte_budget() {
+        let defaults = SelectionEvidenceBudgets::actor_admission();
+        assert_eq!(
+            [
+                defaults.exact_bytes,
+                defaults.evidence_records,
+                defaults.enumerated_members,
+                defaults.unique_directories,
+                defaults.route_and_name_bytes,
+            ],
+            [32 * 1024 * 1024, 65_536, 16_384, 128, 8 * 1024 * 1024]
+        );
         let root = configured_workspace("unica-source-selection-byte-budget");
         let _budgets = install_actor_selection_test_budgets(ActorSelectionTestBudgets {
             exact_bytes: 32,
@@ -2378,6 +2396,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    pub(crate) fn production_exact_work_can_cross_the_former_byte_ceiling() {
+        let mut usage = SelectionEvidenceUsage::actor_admission();
+        usage
+            .charge_exact_work(MAX_ACTOR_EXACT_RETAINED_BYTES)
+            .unwrap();
+        usage.charge_exact_work(1).unwrap();
+        assert_eq!(usage.exact_work_bytes, MAX_ACTOR_EXACT_RETAINED_BYTES + 1);
+    }
+
+    #[test]
+    pub(crate) fn unlimited_exact_work_still_rejects_counter_overflow() {
+        let mut usage = SelectionEvidenceUsage::actor_admission();
+        usage.exact_work_bytes = usize::MAX;
+        assert_eq!(
+            usage.charge_exact_work(1).unwrap_err(),
+            "project source-map actor exact-work byte count overflowed"
+        );
+    }
+
+    #[test]
+    #[ignore = "capacity proof rechecks 8 MiB content five times"]
+    pub(crate) fn repeated_exact_observations_do_not_exhaust_a_pass_work_ceiling() {
+        let root = tempfile::tempdir().unwrap();
+        let relative = Path::new("shared/ConfigDumpInfo.xml");
+        let bytes = vec![b' '; 8 * 1024 * 1024];
+        write(&root.path().join(relative), &bytes);
+        let workspace =
+            RetainedDirectoryCapability::open(&root.path().canonicalize().unwrap()).unwrap();
+        let mut pass = RetainedSelectionPass::new(workspace).unwrap();
+        let mut checkpoint = || Ok(());
+
+        for attempt in 0..5 {
+            assert!(
+                matches!(
+                    pass.observe_regular(relative, bytes.len(), &mut checkpoint),
+                    Ok(RetainedRegularObservation::Exact(_))
+                ),
+                "observation {attempt} hit a pass-wide work ceiling"
+            );
+        }
+        assert_eq!(pass.usage.exact_retained_bytes, bytes.len());
+    }
+
+    #[test]
     pub(crate) fn actor_admission_bounds_unique_retained_directories_without_ulimit() {
         let root = tempfile::tempdir().unwrap();
         write(
@@ -2427,6 +2489,48 @@ pub(crate) mod tests {
             2,
             "retained directory evidence exceeded its deterministic handle budget"
         );
+    }
+
+    #[test]
+    fn actor_admission_accepts_external_processor_and_report_with_non_evidence_members() {
+        let root = tempfile::tempdir().unwrap();
+        write(
+            &root.path().join("v8project.yaml"),
+            concat!(
+                "format: DESIGNER\nsource-set:\n",
+                "  - name: processors\n    type: EXTERNAL_DATA_PROCESSORS\n    path: epf\n",
+                "  - name: reports\n    type: EXTERNAL_REPORTS\n    path: erf\n",
+            ),
+        );
+        for (directory, kind, name) in [
+            ("epf", "ExternalDataProcessor", "Import"),
+            ("erf", "ExternalReport", "Sales"),
+        ] {
+            write(
+                &root.path().join(format!("{directory}/{name}.xml")),
+                format!("<MetaDataObject xmlns=\"http://v8.1c.ru/8.3/MDClasses\" version=\"2.20\"><{kind}><Properties><Name>{name}</Name></Properties></{kind}></MetaDataObject>"),
+            );
+            write(
+                &root
+                    .path()
+                    .join(format!("{directory}/{name}/Ext/ObjectModule.bsl")),
+                "Procedure Execute() Export\nEndProcedure\n",
+            );
+        }
+        // Each directory consumes two member slots but contributes one format marker.
+        // The second enumeration must fit the remaining member budget, not reserve
+        // the larger format-evidence ceiling all over again.
+        let mut checkpoint = || Ok(());
+        let admitted = discover_project_source_admission(root.path(), &mut checkpoint)
+            .expect("two small external source sets must share one admission pass");
+        let sets = &admitted.map().source_sets;
+        assert_eq!(sets.len(), 2);
+        assert_eq!(sets[0].kind, SourceSetKind::ExternalProcessor);
+        assert_eq!(sets[1].kind, SourceSetKind::ExternalReport);
+        assert_eq!(sets[0].source_format, SourceFormat::PlatformXml);
+        assert_eq!(sets[1].source_format, SourceFormat::PlatformXml);
+        assert_eq!(sets[0].format_evidence, ["epf/Import.xml"]);
+        assert_eq!(sets[1].format_evidence, ["erf/Sales.xml"]);
     }
 
     #[test]
@@ -2972,6 +3076,26 @@ pub(crate) mod tests {
         assert_eq!(
             error,
             "project source-map actor observation changed within one pass: marker.xml"
+        );
+
+        let root = configured_workspace("unica-source-selection-two-pass-change");
+        let config = root.path().join("v8project.yaml");
+        let mut first = std::fs::read(&config).unwrap();
+        first.extend_from_slice(b"# first\n");
+        write(&config, &first);
+        let later = String::from_utf8(first.clone())
+            .unwrap()
+            .replace("# first", "# later")
+            .into_bytes();
+        assert_eq!(first.len(), later.len());
+        let _read_hook = install_regular_exact_after_read_hook(move || write(&config, later));
+
+        let error = discover_project_source_admission(root.path(), &mut checkpoint)
+            .expect_err("two different observations of the same source map were accepted");
+
+        assert_eq!(
+            error,
+            "project source-map changed during retained actor admission"
         );
     }
 

@@ -919,8 +919,7 @@ impl CfeBorrowWritePlan {
     }
 
     /// Identity the descriptor at `path` already carries, or an empty one when
-    /// there is nothing there yet. ADR-0050 makes this the single source of the
-    /// policy for every borrowed descriptor, object and form alike.
+    /// there is nothing there yet. Both object and form borrowing use this reader.
     fn existing_identity(
         &mut self,
         path: &Path,
@@ -1330,18 +1329,48 @@ pub(crate) fn cfe_borrow_object_shell(
 ///
 /// `cfe.borrow` rewrites the whole descriptor on every call, so without this a
 /// second borrow of the same object minted all of it again and moved an
-/// identity that the extension and its callers may already reference. ADR-0050
-/// makes a borrow idempotent instead: a value read from the existing
+/// identity that the extension and its callers may already reference.
+/// To preserve that identity, a value read from the existing
 /// descriptor reuses what is there, and the default value — what a first borrow
 /// gets — mints fresh.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CfeBorrowIdentity {
+    plan_seed: Option<[u8; 32]>,
     wrapper_uuid: Option<String>,
     this_node: Option<String>,
     generated_types: BTreeMap<String, (Option<String>, Option<String>)>,
 }
 
 impl CfeBorrowIdentity {
+    /// Canonical preview and apply regenerate the same identities from their
+    /// input plan. Legacy callers without a seed continue issuing fresh IDs.
+    pub(crate) fn for_plan(seed: [u8; 32]) -> Self {
+        Self {
+            plan_seed: Some(seed),
+            ..Self::default()
+        }
+    }
+
+    fn new_uuid(&self, role: &str, name: &str) -> String {
+        let Some(seed) = self.plan_seed else {
+            return fresh_uuid();
+        };
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"unica-canonical-borrow-uuid-v1\0");
+        hash.update(seed);
+        for value in [role, name] {
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+        let digest = hash.finalize();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        uuid::Builder::from_custom_bytes(bytes)
+            .into_uuid()
+            .to_string()
+    }
+
     fn read(text: &str, child_name: &str) -> Result<Self, String> {
         let document = Document::parse(text.trim_start_matches('\u{feff}'))
             .map_err(|error| error.to_string())?;
@@ -1361,7 +1390,8 @@ impl CfeBorrowIdentity {
             for generated in meta_info_children(internal_info, "GeneratedType") {
                 // Each identifier is preserved on its own: a descriptor that
                 // lost one of them must keep the other, or reissuing both would
-                // move an identity that is still referenced (ADR-0050 §3).
+                // move an identity that is still referenced. Rejecting damaged
+                // descriptors instead of repairing them remains a gap in #935/#931.
                 let Some(name) = generated.attribute("name") else {
                     continue;
                 };
@@ -1378,11 +1408,15 @@ impl CfeBorrowIdentity {
     }
 
     fn wrapper_uuid(&self) -> String {
-        self.wrapper_uuid.clone().unwrap_or_else(fresh_uuid)
+        self.wrapper_uuid
+            .clone()
+            .unwrap_or_else(|| self.new_uuid("wrapper", ""))
     }
 
     fn this_node(&self) -> String {
-        self.this_node.clone().unwrap_or_else(fresh_uuid)
+        self.this_node
+            .clone()
+            .unwrap_or_else(|| self.new_uuid("this-node", ""))
     }
 
     fn generated_type(&self, name: &str) -> (String, String) {
@@ -1392,8 +1426,8 @@ impl CfeBorrowIdentity {
             .cloned()
             .unwrap_or((None, None));
         (
-            type_id.unwrap_or_else(fresh_uuid),
-            value_id.unwrap_or_else(fresh_uuid),
+            type_id.unwrap_or_else(|| self.new_uuid("type", name)),
+            value_id.unwrap_or_else(|| self.new_uuid("value", name)),
         )
     }
 }
@@ -1465,7 +1499,7 @@ pub(crate) fn cfe_borrow_object_xml(
         }
     }
     lines.push("\t\t</Properties>".to_string());
-    if cfe_borrow_type_has_child_objects(type_name) {
+    if cfe_borrow_type_has_child_objects(type_name)? {
         lines.push("\t\t<ChildObjects/>".to_string());
     }
     lines.push(format!("\t</{type_name}>"));
@@ -1516,23 +1550,9 @@ pub(crate) fn cfe_borrow_generated_types(
     metadata_generated_types_8_3_27(type_name)
 }
 
-pub(crate) fn cfe_borrow_type_has_child_objects(type_name: &str) -> bool {
-    matches!(
-        type_name,
-        "Catalog"
-            | "Document"
-            | "ExchangePlan"
-            | "ChartOfAccounts"
-            | "ChartOfCharacteristicTypes"
-            | "ChartOfCalculationTypes"
-            | "BusinessProcess"
-            | "Task"
-            | "Enum"
-            | "InformationRegister"
-            | "AccumulationRegister"
-            | "AccountingRegister"
-            | "CalculationRegister"
-    )
+pub(crate) fn cfe_borrow_type_has_child_objects(type_name: &str) -> Result<bool, String> {
+    crate::infrastructure::metadata_kinds::metadata_kind_requires_child_objects_8_3_27(type_name)
+        .ok_or_else(|| format!("Type '{type_name}' has no 8.3.27 ChildObjects profile"))
 }
 
 #[derive(Clone, Debug)]
@@ -4644,6 +4664,7 @@ pub(crate) fn cfe_validate_borrowed_objects(
     let mut check9_ok = true;
     let mut check10_ok = true;
     let mut sub_item_count = 0usize;
+    let mut module_count = 0usize;
     for child in child_obj_node.children().filter(|child| child.is_element()) {
         let type_name = child.tag_name().name();
         let child_name = child.text().unwrap_or("");
@@ -4667,10 +4688,31 @@ pub(crate) fn cfe_validate_borrowed_objects(
         let Some(obj_el) = doc.root_element().children().find(|node| node.is_element()) else {
             continue;
         };
+        let context = format!("{type_name}.{child_name}");
+        match crate::infrastructure::metadata_kinds::metadata_kind_requires_child_objects_8_3_27(
+            type_name,
+        ) {
+            Some(true) => {
+                if !cfe_validate_has_exact_md_child(obj_el, "ChildObjects") {
+                    report.error(format!("9. {context}: ChildObjects is required"));
+                    check9_ok = false;
+                } else if !cfe_validate_md_child_follows(obj_el, "ChildObjects", "Properties") {
+                    report.error(format!("9. {context}: ChildObjects must follow Properties"));
+                    check9_ok = false;
+                }
+            }
+            Some(false) => {}
+            None => {
+                report.error(format!("9. {context}: no ChildObjects profile"));
+                check9_ok = false;
+            }
+        }
         let Some(obj_props) = meta_info_child(obj_el, "Properties") else {
             continue;
         };
-        if meta_info_child_text(obj_props, "ObjectBelonging").as_deref() == Some("Adopted") {
+        let borrowed =
+            meta_info_child_text(obj_props, "ObjectBelonging").as_deref() == Some("Adopted");
+        if borrowed {
             borrowed_count += 1;
             let extended =
                 meta_info_child_text(obj_props, "ExtendedConfigurationObject").unwrap_or_default();
@@ -4687,9 +4729,27 @@ pub(crate) fn cfe_validate_borrowed_objects(
             } else {
                 borrowed_ok_count += 1;
             }
+            match cfe_validate_module_layouts(type_name, child_name) {
+                Ok(modules) => {
+                    for (relative_module, property) in modules {
+                        if config_dir.join(&relative_module).is_file() {
+                            module_count += 1;
+                            if !cfe_validate_has_extended_property_state(obj_el, property) {
+                                report.error(format!(
+                                    "9. {context}: Ext/{property}.bsl exists but PropertyState {property}=Extended is missing or invalid"
+                                ));
+                                check9_ok = false;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    report.error(format!("9. {context}: {error}"));
+                    check9_ok = false;
+                }
+            }
         }
         if let Some(child_objects) = meta_info_child(obj_el, "ChildObjects") {
-            let context = format!("{type_name}.{child_name}");
             for sub_item in child_objects.children().filter(|node| node.is_element()) {
                 let sub_type = sub_item.tag_name().name();
                 if matches!(sub_type, "Attribute" | "TabularSection" | "EnumValue")
@@ -4736,7 +4796,7 @@ pub(crate) fn cfe_validate_borrowed_objects(
         report.ok("9. Borrowed objects: none found");
     } else if check9_ok {
         report.ok(format!(
-            "9. Borrowed objects: {borrowed_ok_count}/{borrowed_count} validated"
+            "9. Borrowed objects: {borrowed_ok_count}/{borrowed_count} validated; {module_count} module state(s) checked"
         ));
     }
     if sub_item_count == 0 {
@@ -4747,6 +4807,94 @@ pub(crate) fn cfe_validate_borrowed_objects(
         ));
     }
     forms
+}
+
+/// Enumerate roles from the domain profile, then use the same physical adapter
+/// as the writer. This check covers top-level direct, owner and command modules.
+fn cfe_validate_module_layouts(
+    kind: &str,
+    name: &str,
+) -> Result<Vec<(PathBuf, &'static str)>, String> {
+    use crate::domain::address::QualifiedAddress;
+    use crate::domain::platform_profile::{ModuleSourceLayout, PlatformProfile};
+    use crate::infrastructure::logical_event_source::module_source_address;
+    use crate::infrastructure::platform_xml_source_targets::{
+        platform_xml_module_identity, platform_xml_module_relative,
+    };
+    let owner = QualifiedAddress::parse(&format!("extension:{kind}.{name}"))
+        .map_err(|error| error.to_string())?;
+    let branch =
+        QualifiedAddress::parse(&format!("{owner}.Module")).map_err(|error| error.to_string())?;
+    let profile = PlatformProfile::v8_3_27();
+    let children = profile.module_children(&branch);
+    let candidates = profile
+        .module_capability(&owner)
+        .map(|capability| (&owner, capability))
+        .into_iter()
+        .chain(
+            children
+                .iter()
+                .map(|module| (module.at(), module.capability())),
+        );
+    let mut modules = Vec::new();
+    for (at, capability) in candidates {
+        if !matches!(
+            capability.source_layout(),
+            ModuleSourceLayout::Direct
+                | ModuleSourceLayout::Common
+                | ModuleSourceLayout::Service
+                | ModuleSourceLayout::Bot
+                | ModuleSourceLayout::CommonCommand
+        ) {
+            continue;
+        }
+        let address = module_source_address(at, capability)?;
+        let relative = platform_xml_module_relative(&address)?;
+        let identity = platform_xml_module_identity(&relative)?;
+        modules.push((relative, identity.role.as_str()));
+    }
+    Ok(modules)
+}
+
+fn cfe_validate_has_extended_property_state(
+    object: roxmltree::Node<'_, '_>,
+    property: &str,
+) -> bool {
+    if !cfe_validate_has_exact_md_child(object, "InternalInfo") {
+        return false;
+    }
+    let internal = object
+        .children()
+        .find(|node| node.has_tag_name((CFE_PATCH_MD_NAMESPACE, "InternalInfo")))
+        .expect("exact InternalInfo verified");
+    super::cfe_property_states::read_property_states(internal)
+        .is_ok_and(|states| states.get(property) == Some(&"Extended"))
+}
+
+fn cfe_validate_has_exact_md_child(object: roxmltree::Node<'_, '_>, local_name: &str) -> bool {
+    let matching = object
+        .children()
+        .filter(|node| node.is_element() && node.tag_name().name() == local_name)
+        .collect::<Vec<_>>();
+    matching.len() == 1 && matching[0].tag_name().namespace() == Some(CFE_PATCH_MD_NAMESPACE)
+}
+
+fn cfe_validate_md_child_follows(
+    object: roxmltree::Node<'_, '_>,
+    child_name: &str,
+    predecessor_name: &str,
+) -> bool {
+    let children = object
+        .children()
+        .filter(roxmltree::Node::is_element)
+        .collect::<Vec<_>>();
+    let child = children
+        .iter()
+        .position(|node| node.has_tag_name((CFE_PATCH_MD_NAMESPACE, child_name)));
+    let predecessor = children
+        .iter()
+        .position(|node| node.has_tag_name((CFE_PATCH_MD_NAMESPACE, predecessor_name)));
+    matches!((predecessor, child), (Some(before), Some(after)) if before < after)
 }
 
 pub(crate) fn cfe_is_borrowed_sub_item(sub_item: roxmltree::Node<'_, '_>) -> bool {
@@ -5751,7 +5899,7 @@ fn cfe_patch_validate_form_xml(module_path: &str, path: &Path, raw: &[u8]) -> Re
     Ok(())
 }
 
-fn cfe_patch_mark_extended_property(
+pub(super) fn cfe_patch_mark_extended_property(
     module_path: &str,
     path: &Path,
     raw: &[u8],
@@ -5786,46 +5934,16 @@ fn cfe_patch_mark_extended_property(
             )
         })?;
     let internal_info = cfe_patch_exact_md_child(object, "InternalInfo", module_path, path)?;
-    let matching_states = internal_info
-        .children()
-        .filter(|node| node.is_element() && node.tag_name().name() == "PropertyState")
-        .filter_map(|state| {
-            let state_namespace = state.tag_name().namespace();
-            let property_node = state.children().find(|node| {
-                node.is_element()
-                    && node.tag_name().namespace() == Some(CFE_PATCH_XR_NAMESPACE)
-                    && node.tag_name().name() == "Property"
-            });
-            let value_node = state.children().find(|node| {
-                node.is_element()
-                    && node.tag_name().namespace() == Some(CFE_PATCH_XR_NAMESPACE)
-                    && node.tag_name().name() == "State"
-            });
-            property_node
-                .and_then(|node| node.text())
-                .filter(|value| *value == property)
-                .map(|_| (state_namespace, value_node.and_then(|node| node.text())))
-        })
-        .collect::<Vec<_>>();
-    match matching_states.as_slice() {
-        [] => {}
-        [(Some(namespace), Some("Extended"))] if *namespace == CFE_PATCH_XR_NAMESPACE => {
-            return Ok(raw.to_vec());
-        }
-        [state] => {
+    let states = super::cfe_property_states::read_property_states(internal_info)
+        .map_err(|error| cfe_patch_precondition_error(module_path, error))?;
+    match states.get(property) {
+        None => {}
+        Some(&"Extended") => return Ok(raw.to_vec()),
+        Some(state) => {
             return Err(cfe_patch_precondition_error(
                 module_path,
                 format!(
                     "{} has incompatible PropertyState for {property}: {state:?}",
-                    path.display()
-                ),
-            ));
-        }
-        _ => {
-            return Err(cfe_patch_precondition_error(
-                module_path,
-                format!(
-                    "{} has duplicate PropertyState entries for {property}",
                     path.display()
                 ),
             ));
@@ -5876,6 +5994,9 @@ fn cfe_patch_mark_extended_property(
         let insertion = fragment[..close]
             .rfind('\n')
             .map(|line_break| line_break + 1)
+            // A closing tag may share its line with the preceding child.
+            // Only indentation belongs before the new sibling state.
+            .filter(|start| fragment[*start..close].trim().is_empty())
             .unwrap_or(close);
         format!(
             "{}{}{}",
@@ -5918,20 +6039,13 @@ fn cfe_patch_mark_extended_property(
     let updated_with_bom = format!("{bom}{updated}");
     let verified = Document::parse(&updated)
         .map_err(|error| format!("failed to build platform XML {}: {error}", path.display()))?;
-    let matching = verified
-        .descendants()
-        .filter(|node| node.has_tag_name((CFE_PATCH_XR_NAMESPACE, "PropertyState")))
-        .filter(|state| {
-            state.children().any(|node| {
-                node.has_tag_name((CFE_PATCH_XR_NAMESPACE, "Property"))
-                    && node.text() == Some(property)
-            }) && state.children().any(|node| {
-                node.has_tag_name((CFE_PATCH_XR_NAMESPACE, "State"))
-                    && node.text() == Some("Extended")
-            })
-        })
-        .count();
-    if matching != 1 {
+    let verified_object =
+        cfe_patch_direct_md_child(&verified, object.tag_name().name(), module_path, path)?;
+    let verified_info =
+        cfe_patch_exact_md_child(verified_object, "InternalInfo", module_path, path)?;
+    if super::cfe_property_states::read_property_states(verified_info)?.get(property)
+        != Some(&"Extended")
+    {
         return Err(format!(
             "failed to build exactly one Extended PropertyState for {property} in {}",
             path.display()
@@ -6866,6 +6980,290 @@ pub(crate) mod tests {
     use std::fs;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn cfe_borrow_report_emits_required_empty_child_objects() {
+        let xml = cfe_borrow_object_xml(
+            "Report",
+            "PriceList",
+            "11111111-1111-1111-1111-111111111111",
+            None,
+            "2.20",
+            &CfeBorrowIdentity::default(),
+        )
+        .unwrap();
+
+        let generated = Document::parse(&xml).unwrap();
+        let report = generated
+            .descendants()
+            .find(|node| node.has_tag_name((CFE_PATCH_MD_NAMESPACE, "Report")))
+            .unwrap();
+        assert!(
+            meta_info_child(report, "ChildObjects").is_some(),
+            "8.3.27 requires ChildObjects even for a report without forms or templates: {xml}"
+        );
+    }
+
+    #[test]
+    fn cfe_borrow_emits_child_objects_for_every_proven_platform_kind() {
+        for type_name in [
+            "Subsystem",
+            "FilterCriterion",
+            "Sequence",
+            "SettingsStorage",
+            "DocumentJournal",
+            "HTTPService",
+            "WebService",
+            "IntegrationService",
+        ] {
+            let xml = cfe_borrow_object_xml(
+                type_name,
+                "Evidence",
+                "11111111-1111-1111-1111-111111111111",
+                None,
+                "2.20",
+                &CfeBorrowIdentity::default(),
+            )
+            .unwrap();
+
+            let generated = Document::parse(&xml).unwrap();
+            let object = generated
+                .root_element()
+                .children()
+                .find(roxmltree::Node::is_element)
+                .unwrap();
+            assert!(
+                object
+                    .children()
+                    .any(|node| { node.has_tag_name((CFE_PATCH_MD_NAMESPACE, "ChildObjects")) }),
+                "{type_name} must follow the proven 8.3.27 ChildObjects contract: {xml}"
+            );
+        }
+    }
+
+    #[test]
+    fn cfe_validate_rejects_report_without_required_child_objects() {
+        let context = temp_context("validate-report-child-objects");
+        write_minimal_borrow_fixture(&context, "2.20", "2.20", "2.20", None);
+        register_borrowed_patch_object(&context, "Report", "PriceList", "");
+        let args = Map::from_iter([("ExtensionPath".to_string(), json!("ext"))]);
+
+        let outcome = validate_cfe(&args, &context);
+
+        assert!(!outcome.ok, "{outcome:?}");
+        assert!(
+            outcome
+                .errors
+                .join("\n")
+                .contains("Report.PriceList: ChildObjects is required"),
+            "{outcome:?}"
+        );
+        let _ = fs::remove_dir_all(&context.cwd);
+    }
+
+    #[test]
+    fn cfe_validate_rejects_foreign_child_objects_namespace() {
+        let context = temp_context("validate-child-objects-namespace");
+        write_minimal_borrow_fixture(&context, "2.20", "2.20", "2.20", None);
+        register_borrowed_patch_object(
+            &context,
+            "Report",
+            "PriceList",
+            r#"<x:ChildObjects xmlns:x="urn:foreign"/>"#,
+        );
+        let args = Map::from_iter([("ExtensionPath".to_string(), json!("ext"))]);
+
+        let outcome = validate_cfe(&args, &context);
+
+        assert!(!outcome.ok, "{outcome:?}");
+        assert!(
+            outcome
+                .errors
+                .join("\n")
+                .contains("Report.PriceList: ChildObjects is required"),
+            "{outcome:?}"
+        );
+        let _ = fs::remove_dir_all(&context.cwd);
+    }
+
+    #[test]
+    fn cfe_validate_rejects_child_objects_before_properties() {
+        let context = temp_context("validate-child-objects-order");
+        write_minimal_borrow_fixture(&context, "2.20", "2.20", "2.20", None);
+        let descriptor =
+            register_borrowed_patch_object(&context, "Report", "PriceList", "<ChildObjects/>");
+        let text = fs::read_to_string(&descriptor)
+            .unwrap()
+            .replacen(
+                "\t\t<Properties>",
+                "\t\t<ChildObjects/>\n\t\t<Properties>",
+                1,
+            )
+            .replacen("\n\t\t<ChildObjects/>\n\t</Report>", "\n\t</Report>", 1);
+        fs::write(&descriptor, text).unwrap();
+        let args = Map::from_iter([("ExtensionPath".to_string(), json!("ext"))]);
+
+        let outcome = validate_cfe(&args, &context);
+
+        assert!(!outcome.ok, "{outcome:?}");
+        assert!(
+            outcome
+                .errors
+                .join("\n")
+                .contains("Report.PriceList: ChildObjects must follow Properties"),
+            "{outcome:?}"
+        );
+        let _ = fs::remove_dir_all(&context.cwd);
+    }
+
+    #[test]
+    fn cfe_validate_rejects_module_file_without_extended_property_state() {
+        let context = temp_context("validate-module-property-state");
+        write_minimal_borrow_fixture(&context, "2.20", "2.20", "2.20", None);
+        register_borrowed_patch_object(&context, "Catalog", "Items", "<ChildObjects/>");
+        write_file(
+            &context.cwd.join("ext/Catalogs/Items/Ext/ObjectModule.bsl"),
+            "&Before(\"Run\")\nProcedure GE_Run()\nEndProcedure\n",
+        );
+        let args = Map::from_iter([("ExtensionPath".to_string(), json!("ext"))]);
+
+        let outcome = validate_cfe(&args, &context);
+
+        assert!(!outcome.ok, "{outcome:?}");
+        assert!(
+            outcome
+                .errors
+                .join("\n")
+                .contains("Catalog.Items: Ext/ObjectModule.bsl exists but PropertyState ObjectModule=Extended is missing"),
+            "{outcome:?}"
+        );
+        let _ = fs::remove_dir_all(&context.cwd);
+    }
+
+    #[test]
+    fn cfe_validate_rejects_conflicting_extended_property_state_children() {
+        let context = temp_context("validate-conflicting-property-state");
+        write_minimal_borrow_fixture(&context, "2.20", "2.20", "2.20", None);
+        let descriptor =
+            register_borrowed_patch_object(&context, "Catalog", "Items", "<ChildObjects/>");
+        let text = fs::read_to_string(&descriptor).unwrap().replacen(
+            "<InternalInfo/>",
+            r#"<InternalInfo><xr:PropertyState xmlns:xr="http://v8.1c.ru/8.3/xcf/readable"><xr:Property>ObjectModule</xr:Property><xr:State>Notify</xr:State><xr:State>Extended</xr:State></xr:PropertyState></InternalInfo>"#,
+            1,
+        );
+        fs::write(&descriptor, text).unwrap();
+        write_file(
+            &context.cwd.join("ext/Catalogs/Items/Ext/ObjectModule.bsl"),
+            "&Before(\"Run\")\nProcedure GE_Run()\nEndProcedure\n",
+        );
+        let args = Map::from_iter([("ExtensionPath".to_string(), json!("ext"))]);
+
+        let outcome = validate_cfe(&args, &context);
+
+        assert!(!outcome.ok, "{outcome:?}");
+        assert!(
+            outcome.errors.join("\n").contains(
+                "Catalog.Items: Ext/ObjectModule.bsl exists but PropertyState ObjectModule=Extended is missing"
+            ),
+            "{outcome:?}"
+        );
+        let _ = fs::remove_dir_all(&context.cwd);
+    }
+
+    #[test]
+    fn cfe_validate_rejects_reversed_extended_property_state_children() {
+        let context = temp_context("validate-reversed-property-state");
+        write_minimal_borrow_fixture(&context, "2.20", "2.20", "2.20", None);
+        let descriptor =
+            register_borrowed_patch_object(&context, "Catalog", "Items", "<ChildObjects/>");
+        let text = fs::read_to_string(&descriptor).unwrap().replacen(
+            "<InternalInfo/>",
+            r#"<InternalInfo><xr:PropertyState xmlns:xr="http://v8.1c.ru/8.3/xcf/readable"><xr:State>Extended</xr:State><xr:Property>ObjectModule</xr:Property></xr:PropertyState></InternalInfo>"#,
+            1,
+        );
+        fs::write(&descriptor, text).unwrap();
+        write_file(
+            &context.cwd.join("ext/Catalogs/Items/Ext/ObjectModule.bsl"),
+            "&Before(\"Run\")\nProcedure GE_Run()\nEndProcedure\n",
+        );
+        let args = Map::from_iter([("ExtensionPath".to_string(), json!("ext"))]);
+
+        let outcome = validate_cfe(&args, &context);
+
+        assert!(!outcome.ok, "{outcome:?}");
+        assert!(
+            outcome.errors.join("\n").contains(
+                "Catalog.Items: Ext/ObjectModule.bsl exists but PropertyState ObjectModule=Extended is missing"
+            ),
+            "{outcome:?}"
+        );
+        let _ = fs::remove_dir_all(&context.cwd);
+    }
+
+    #[test]
+    fn cfe_validate_checks_every_platform_direct_and_owner_module_role() {
+        for (type_name, role) in [
+            ("Report", "ObjectModule"),
+            ("Report", "ManagerModule"),
+            ("DataProcessor", "ObjectModule"),
+            ("Catalog", "ObjectModule"),
+            ("InformationRegister", "RecordSetModule"),
+            ("InformationRegister", "ManagerModule"),
+            ("Constant", "ValueManagerModule"),
+            ("Constant", "ManagerModule"),
+            ("CommonModule", "Module"),
+            ("SettingsStorage", "ManagerModule"),
+            ("Bot", "Module"),
+            ("HTTPService", "Module"),
+            ("WebService", "Module"),
+            ("IntegrationService", "Module"),
+            ("CommonCommand", "CommandModule"),
+        ] {
+            let context = temp_context(&format!("validate-{type_name}-{role}"));
+            write_minimal_borrow_fixture(&context, "2.20", "2.20", "2.20", None);
+            let descriptor = register_borrowed_patch_object(
+                &context,
+                type_name,
+                "Evidence",
+                if cfe_borrow_type_has_child_objects(type_name).unwrap() {
+                    "<ChildObjects/>"
+                } else {
+                    ""
+                },
+            );
+            let dir_name = cf_validate_child_type_dir(type_name).unwrap();
+            write_file(
+                &context
+                    .cwd
+                    .join("ext")
+                    .join(dir_name)
+                    .join("Evidence/Ext")
+                    .join(format!("{role}.bsl")),
+                "Procedure Evidence()\nEndProcedure\n",
+            );
+            let args = Map::from_iter([("ExtensionPath".to_string(), json!("ext"))]);
+
+            let outcome = validate_cfe(&args, &context);
+
+            assert!(!outcome.ok, "{type_name}.{role}: {outcome:?}");
+            assert!(
+                outcome.errors.join("\n").contains(&format!(
+                    "{type_name}.Evidence: Ext/{role}.bsl exists but PropertyState {role}=Extended is missing"
+                )),
+                "{type_name}.{role}: {outcome:?}"
+            );
+            let xml = fs::read_to_string(&descriptor).unwrap();
+            let connected = xml.replace("<InternalInfo/>", &format!(
+                "<InternalInfo><xr:PropertyState xmlns:xr=\"{CFE_PATCH_XR_NAMESPACE}\"><xr:Property>{role}</xr:Property><xr:State>Extended</xr:State></xr:PropertyState></InternalInfo>"
+            ));
+            assert_ne!(connected, xml);
+            fs::write(&descriptor, &connected).unwrap();
+            let valid = validate_cfe(&args, &context);
+            assert!(valid.ok, "{type_name}.{role}: {valid:?}");
+            assert_eq!(fs::read_to_string(&descriptor).unwrap(), connected);
+            let _ = fs::remove_dir_all(&context.cwd);
+        }
+    }
 
     fn temp_context(name: &str) -> WorkspaceContext {
         let nanos = SystemTime::now()
@@ -8449,7 +8847,22 @@ pub(crate) mod tests {
         let _ = fs::remove_dir_all(&context.cwd);
     }
 
-    /// ADR-0050. A borrowed descriptor is issued its identity once, so
+    #[test]
+    fn seeded_borrow_uuid_is_custom_and_separates_seed_role_and_name() {
+        let identity = super::CfeBorrowIdentity::for_plan([1; 32]);
+        let value = identity.new_uuid("wrapper", "Demo");
+        let parsed = uuid::Uuid::parse_str(&value).unwrap();
+        assert_eq!(parsed.get_version_num(), 8);
+        assert_eq!(value, identity.new_uuid("wrapper", "Demo"));
+        assert_ne!(value, identity.new_uuid("node", "Demo"));
+        assert_ne!(value, identity.new_uuid("wrapper", "Other"));
+        assert_ne!(
+            value,
+            super::CfeBorrowIdentity::for_plan([2; 32]).new_uuid("wrapper", "Demo")
+        );
+    }
+
+    /// With an unchanged parent, a descriptor keeps its identity, so
     /// borrowing the same object again leaves the descriptor byte-identical
     /// and publishes nothing — the write plan already reports an identical
     /// image as no change.
@@ -8501,9 +8914,9 @@ pub(crate) mod tests {
         let _ = fs::remove_dir_all(&context.cwd);
     }
 
-    /// Review of #440. A partially damaged descriptor must keep what it still
-    /// has: reissuing both identifiers because one is missing would move a
-    /// `TypeId` that is still referenced (ADR-0050 §3).
+    /// Legacy behavior: borrowing accepts a damaged identifier pair.
+    /// This test records the gap in #935/#931; the target behavior rejects
+    /// the damaged descriptor without attempting to repair it.
     #[test]
     fn borrow_cfe_keeps_a_surviving_identifier_when_its_pair_is_missing() {
         for (kept, dropped) in [("TypeId", "ValueId"), ("ValueId", "TypeId")] {

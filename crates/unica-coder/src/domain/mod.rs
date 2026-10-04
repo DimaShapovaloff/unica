@@ -5,6 +5,7 @@ pub(crate) mod address;
 #[allow(dead_code)]
 pub(crate) mod apply;
 pub mod cache;
+pub(crate) mod call_graph_identity;
 pub mod cancellation;
 pub mod code_intelligence;
 pub mod diagnostics;
@@ -33,6 +34,7 @@ pub mod refusal;
 pub mod role;
 pub mod source_location;
 pub mod source_resources;
+#[cfg(test)]
 pub mod source_revision;
 pub mod source_roots;
 pub mod source_target;

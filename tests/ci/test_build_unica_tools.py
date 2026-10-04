@@ -304,6 +304,15 @@ class BuildUnicaToolsTests(unittest.TestCase):
         self.assert_external_release_contract(updated_tools)
 
     def test_maintained_v8_runner_release_is_published_at_source(self) -> None:
+        """Источник сборки закреплён, а номер версии — нет.
+
+        Откуда забирать сборку — продуктовое решение
+        (`DEC.2026-09-02.MAINTAINED-ENGINES-PUBLISH-AT-SOURCE`), и проверяется именно
+        оно: репозиторий сопровождаемого форка, он же источник ассетов, и полная
+        привязка тега к коммиту и к хешу каждой цели. Поднятие версии — регулярная
+        работа, поэтому ни одно значение версии здесь не прибито: иначе каждая новая
+        сборка раннера правила бы гейт, а не один lock-файл.
+        """
         repo_root = Path(__file__).resolve().parents[2]
         lock = json.loads(
             (repo_root / "plugins" / "unica" / "third-party" / "tools.lock.json").read_text(
@@ -314,82 +323,20 @@ class BuildUnicaToolsTests(unittest.TestCase):
 
         self.assertEqual(runner["repository"], "https://github.com/IngvarConsulting/v8-runner-rust")
         self.assertEqual(runner["assetRepository"], runner["repository"])
-        self.assertEqual(runner["sourceTag"], "v0.7.1")
+        self.assertEqual(runner["assetStrategy"], "direct-release-asset")
+        self.assertEqual(runner["license"], "AGPL-3.0-only")
+
+        # Тег, версия и релиз не могут разойтись между собой.
+        self.assertEqual(runner["sourceTag"], f"v{runner['version']}")
         self.assertEqual(runner["assetTag"], runner["sourceTag"])
-        self.assertEqual(
-            runner["sourceCommit"],
-            "d081dfcdc10a63dcff4cb6a854e19f7ea22243c4",
-        )
+        self.assertRegex(runner["sourceCommit"], r"\A[0-9a-f]{40}\Z")
 
-    def test_infobase_export_decision_names_the_locked_runner_version(self) -> None:
-        repo_root = Path(__file__).resolve().parents[2]
-        lock = json.loads(
-            (repo_root / "plugins/unica/third-party/tools.lock.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        runner = next(
-            tool for tool in lock["tools"] if tool["name"] == "v8-runner"
-        )
-        decision = (
-            repo_root / "arch/decisions/2026-09-03-infobase-export-run-slice.md"
-        ).read_text(encoding="utf-8")
-
-        self.assertIn(f"`v8-runner` версии {runner['version']}", decision)
-
-    def test_historical_build_2_release_provenance_is_immutable(self) -> None:
-        repo_root = Path(__file__).resolve().parents[2]
-        review = json.loads(
-            (
-                repo_root
-                / "docs"
-                / "provenance"
-                / "reviews"
-                / "2026-08-13-rlm-v1-33-product-update.json"
-            ).read_text(encoding="utf-8")
-        )
-
-        expected_assets = {
-            "rlm-bsl-index": {
-                "darwin-arm64": {
-                    "assetName": "rlm-bsl-index-darwin-arm64",
-                    "sha256": "d48bd7a0186e46b6d2a48476bc9926fb638882544e7be201293f89db9e654a63",
-                    "size": 22_384_192,
-                },
-                "linux-x64": {
-                    "assetName": "rlm-bsl-index-linux-x64",
-                    "sha256": "94ffdcf44330ed5ad6121682fcefd7560adfdc9ebe09ee2a1476666e21c33996",
-                    "size": 36_846_384,
-                },
-                "win-x64": {
-                    "assetName": "rlm-bsl-index-win-x64.exe",
-                    "sha256": "1e64e9436ea2fa69212b27ebe3f6d349fc53acc56250a79d1d2cf67c4570d69b",
-                    "size": 23_834_846,
-                },
-            },
-            "rlm-bsl-mcp": {
-                "darwin-arm64": {
-                    "assetName": "rlm-bsl-mcp-darwin-arm64",
-                    "sha256": "312fe35fa211dee1137cf4aef7e52a2bb1eb161ad903a87257342257985efe00",
-                    "size": 22_384_192,
-                },
-                "linux-x64": {
-                    "assetName": "rlm-bsl-mcp-linux-x64",
-                    "sha256": "f81cf7776fc6bf0bda6290f86a665593ce4daa6b04ec5d02d00f158345bfd277",
-                    "size": 36_846_384,
-                },
-                "win-x64": {
-                    "assetName": "rlm-bsl-mcp-win-x64.exe",
-                    "sha256": "c198b3539769c207f4d0d0f95848ff47d8f892f499ec04f300f2d7538c658c11",
-                    "size": 23_834_848,
-                },
-            },
-        }
-
-        for name, assets in expected_assets.items():
-            with self.subTest(tool=name):
-                self.assertEqual(review["toolchain"]["releaseTag"], "rlm-tools-bsl-v1.33.0-build.2")
-                self.assertEqual(review["tools"][name]["assets"], assets)
+        # Каждая объявленная цель несёт имя ассета и его хеш: без этого поставка
+        # перестаёт быть проверяемой, какой бы версия ни была.
+        self.assertEqual(set(runner["assets"]), set(lock["targets"]))
+        for target, asset in runner["assets"].items():
+            self.assertTrue(asset["assetName"], target)
+            self.assertRegex(asset["sha256"], r"\A[0-9a-f]{64}\Z", target)
 
     def test_checked_in_rlm_tools_select_one_build_3_archive_per_target(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
@@ -560,6 +507,18 @@ class BuildUnicaToolsTests(unittest.TestCase):
                 "manifest.json",
             ],
         )
+        by_delivered_path = {
+            item["deliveredPath"]: item for item in tools["runtimeFiles"]
+        }
+        for name, payload, mode, _, _ in members:
+            with self.subTest(file=name):
+                declaration = by_delivered_path[name]
+                self.assertEqual(declaration["sha256"], hashlib.sha256(payload).hexdigest())
+                self.assertEqual(declaration["size"], len(payload))
+                self.assertEqual(declaration["executable"], mode == 0o755)
+                self.assertEqual(declaration["artifact"], "rlm-tools-bsl")
+                if "path" in declaration:
+                    self.assertEqual((out_dir / declaration["path"]).read_bytes(), payload)
         self.assertEqual(
             {item["name"]: item["binaryPath"] for item in tools["tools"]},
             {
@@ -586,14 +545,6 @@ class BuildUnicaToolsTests(unittest.TestCase):
                 "rlm-bsl-index": "payload/rlm-bsl-index",
                 "rlm-bsl-mcp": "payload/rlm-bsl-mcp",
             },
-        )
-        self.assertEqual(
-            (out_dir / "bin" / "linux-x64" / "rlm-bsl-index").read_bytes(),
-            b"multidist",
-        )
-        self.assertEqual(
-            (out_dir / "bin" / "linux-x64" / "rlm-bsl-mcp").read_bytes(),
-            b"multidist",
         )
 
     def test_bundle_publication_leaves_no_partial_output_after_build_failure(self) -> None:

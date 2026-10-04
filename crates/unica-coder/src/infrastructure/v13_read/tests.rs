@@ -1,17 +1,19 @@
 use super::{
     project_known_suffix, project_typed_payload, resolve_platform_xml_target,
-    review_set_after_canonical_role_read, review_set_before_owner_proof, LogicalViewReadAuthority,
-    MetadataAddress, SourceTarget, TargetKindPolicy, PLATFORM_XML_8_3_27_FORMAT_2_20,
+    review_set_before_owner_proof, LogicalViewReadAuthority, MetadataAddress, SourceTarget,
+    TargetKindPolicy, PLATFORM_XML_8_3_27_FORMAT_2_20,
 };
 use crate::application::result_store::ViewCursorStore;
 use crate::application::v13::find::{FindRequest, FindResult};
-use crate::application::v13::view::{ViewFilter, ViewReadAuthority, ViewRequest, ViewService};
+use crate::application::v13::view::{
+    ViewError, ViewFilter, ViewReadAuthority, ViewRequest, ViewService,
+};
 use crate::domain::address::QualifiedAddress;
 use crate::domain::cancellation::CancellationToken;
 use crate::domain::code_intelligence::ProviderDeadline;
 use crate::domain::platform_profile::PlatformProfile;
 use crate::domain::project_sources::SourceSetKind;
-use crate::domain::refusal::RefusalCode;
+use crate::domain::refusal::{RefusalCode, RefusalDetail};
 use crate::domain::workspace::WorkspaceContext;
 use crate::infrastructure::logical_tree::route_logical_address;
 use crate::infrastructure::platform::filesystem::{
@@ -25,8 +27,95 @@ use crate::infrastructure::v13_read_port::{
 use serde::Deserialize;
 use serde_json::json;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+#[test]
+fn borrowed_common_module_keeps_missing_privileged_unknown() {
+    let borrowed = fixture_text("platform_8_3_27/cfe_borrow/extension-common-module.xml");
+    let props = super::common_module_properties(borrowed.as_bytes(), SourceSetKind::Extension)
+        .expect("platform borrowed CommonModule omits Privileged");
+    let serialized = serde_json::to_value(props).unwrap();
+    assert_eq!(serialized["privileged"], serde_json::Value::Null);
+
+    let ordinary = fixture_text("platform_8_3_27/cfe_borrow/parent-common-module.xml");
+    let missing = ordinary.replace("<Privileged>false</Privileged>", "");
+    assert_eq!(
+        super::common_module_properties(missing.as_bytes(), SourceSetKind::Configuration)
+            .unwrap_err()
+            .code(),
+        RefusalCode::ProviderUnavailable,
+    );
+    assert_eq!(
+        super::common_module_properties(borrowed.as_bytes(), SourceSetKind::Configuration)
+            .unwrap_err()
+            .code(),
+        RefusalCode::ProviderUnavailable,
+    );
+    let own_extension = borrowed.replace(
+        "<ExtendedConfigurationObject>ac847dc9-e222-45cf-af4a-6fa863c919a8</ExtendedConfigurationObject>",
+        "",
+    );
+    assert!(
+        super::common_module_properties(own_extension.as_bytes(), SourceSetKind::Extension)
+            .is_err(),
+        "an extension's own CommonModule still requires Privileged",
+    );
+    for (raw, expected) in [("true", true), ("false", false)] {
+        let explicit = borrowed.replace(
+            "<ReturnValuesReuse>",
+            &format!("<Privileged>{raw}</Privileged><ReturnValuesReuse>"),
+        );
+        let props =
+            super::common_module_properties(explicit.as_bytes(), SourceSetKind::Extension).unwrap();
+        assert_eq!(props.privileged, Some(expected));
+    }
+    for raw in ["", "unknown"] {
+        let invalid = borrowed.replace(
+            "<ReturnValuesReuse>",
+            &format!("<Privileged>{raw}</Privileged><ReturnValuesReuse>"),
+        );
+        assert!(
+            super::common_module_properties(invalid.as_bytes(), SourceSetKind::Extension).is_err(),
+            "explicit invalid Privileged must not become null",
+        );
+    }
+}
+
+#[test]
+fn borrowed_common_module_view_serializes_unknown_privileged_without_losing_contexts() {
+    let fixture = RealReaderFixture::new();
+    let configuration = fs::read_to_string(fixture.source.join("Configuration.xml")).unwrap();
+    write(
+        &fixture.source.join("Configuration.xml"),
+        &configuration.replace(
+            "</ChildObjects>",
+            "<CommonModule>CorpusModule</CommonModule></ChildObjects>",
+        ),
+    );
+    write(
+        &fixture.source.join("CommonModules/CorpusModule.xml"),
+        &fixture_text("platform_8_3_27/cfe_borrow/extension-common-module.xml"),
+    );
+    write(
+        &fixture
+            .source
+            .join("CommonModules/CorpusModule/Ext/Module.bsl"),
+        "Процедура Проверка() Экспорт\nКонецПроцедуры\n",
+    );
+    let view = fixture
+        .extension_view_service()
+        .view(ViewRequest::new("main:CommonModule.CorpusModule").unwrap());
+    assert!(view.ok, "{:?}", view.diagnostics);
+    let data = view.data.unwrap();
+    assert_eq!(
+        data["props"]["commonModule"]["privileged"],
+        serde_json::Value::Null
+    );
+    assert!(data["props"]["commonModule"]["server"].is_boolean());
+    assert!(data["branches"].is_array());
+}
 
 fn configuration_payload(
     reader: &ProviderReadAuthority,
@@ -707,7 +796,7 @@ fn capability_bound_configuration_reader_preserves_complete_cf_info_semantics() 
         "ManagedApplication"
     );
     assert_eq!(payload["support"]["state"], "notSupported");
-    assert_eq!(payload["totalObjects"], 6);
+    assert_eq!(payload["totalObjects"], 17);
     assert_eq!(
         payload["childObjects"]
             .as_array()
@@ -715,9 +804,9 @@ fn capability_bound_configuration_reader_preserves_complete_cf_info_semantics() 
             .iter()
             .map(|entry| entry["count"].as_u64().unwrap())
             .sum::<u64>(),
-        6,
+        17,
     );
-    assert_eq!(payload["registeredObjects"].as_array().unwrap().len(), 6);
+    assert_eq!(payload["registeredObjects"].as_array().unwrap().len(), 17);
 }
 
 #[test]
@@ -740,14 +829,434 @@ fn metadata_kind_branch_lists_registered_objects_with_canonical_addresses() {
     let service = ViewService::new(authority, ViewCursorStore::default());
 
     let branch = service.view(ViewRequest::new("main:Catalog").unwrap());
-    assert!(branch.ok, "{} {:?}", branch.summary, branch.diagnostics);
+    assert!(branch.ok, "{:?}", refusal_codes(&branch));
     assert_eq!(
         branch.data.as_ref().unwrap()["items"],
+        json!([
+            {
+                "at": "main:Catalog.Items",
+                "kind": "Catalog",
+                "title": "Items"
+            },
+            {
+                "at": "main:Catalog.Владельцы",
+                "kind": "Catalog",
+                "title": "Владельцы"
+            }
+        ]),
+    );
+}
+
+#[test]
+fn metadata_node_props_carry_the_observed_object_properties() {
+    let fixture = RealReaderFixture::new();
+    let service = fixture.view_service();
+
+    let result = service.view(ViewRequest::new("main:Catalog.Items").unwrap());
+
+    assert!(result.ok, "{:?}", refusal_codes(&result));
+    let props = &result.data.as_ref().unwrap()["props"];
+    // Свойства объекта отвечают на узле объекта: раньше проекция искала шесть
+    // скаляров в `details`, где их нет ни у одного вида, и узел молчал.
+    assert_eq!(props["Hierarchical"], json!(true));
+    assert_eq!(props["CodeLength"], json!(11));
+    assert_eq!(props["kind"], json!("Catalog"));
+}
+
+/// Три роли дампа `PrintWebDAV`: заимствован с перекрытием, заимствован без
+/// перекрытия, собственный объект расширения.
+///
+/// Признак заимствования — `ExtendedConfigurationObject`, а не `Adopted`:
+/// корень `Configuration` самого расширения тоже `Adopted`, и читать его как
+/// заимствованный объект — дефект. `xr:PropertyState` несёт **список**
+/// перекрытых свойств, а не флаг: заимствованный объект без перекрытий его не
+/// несёт вовсе.
+#[test]
+fn borrowing_props_name_the_three_roles_of_an_extension_source_set() {
+    let fixture = RealReaderFixture::new();
+    fixture.borrow_catalog("Catalogs/Владельцы.xml", Some("Synonym"));
+    fixture.borrow_catalog("Documents/Order.xml", None);
+    let service = fixture.extension_view_service();
+
+    let overridden = service.view(ViewRequest::new("main:Catalog.Владельцы").unwrap());
+    assert!(overridden.ok, "{:?}", refusal_codes(&overridden));
+    let props = &overridden.data.as_ref().unwrap()["props"];
+    assert_eq!(props["belonging"], json!("borrowed"));
+    assert_eq!(
+        props["parentId"],
+        json!("11111111-1111-4111-8111-111111111111")
+    );
+    assert_eq!(props["overrides"], json!("Synonym"));
+    assert!(
+        props.get("extends").is_none(),
+        "UUID is not a readable parent address"
+    );
+    assert_eq!(props["parentStatus"], json!("unavailable"));
+
+    let plain = service.view(ViewRequest::new("main:Document.Order").unwrap());
+    assert!(plain.ok, "{:?}", refusal_codes(&plain));
+    let props = &plain.data.as_ref().unwrap()["props"];
+    assert_eq!(props["belonging"], json!("borrowed"));
+    assert_eq!(
+        props["parentId"],
+        json!("11111111-1111-4111-8111-111111111111")
+    );
+    assert!(
+        props.get("overrides").is_none(),
+        "заимствование без перекрытий ключа `overrides` не несёт: пустой список — это его отсутствие"
+    );
+
+    let own = service.view(ViewRequest::new("main:Catalog.Items").unwrap());
+    assert!(own.ok, "{:?}", refusal_codes(&own));
+    let props = &own.data.as_ref().unwrap()["props"];
+    assert_eq!(props["belonging"], json!("own"));
+    assert!(props.get("extends").is_none());
+    assert!(props.get("overrides").is_none());
+}
+
+/// Заимствование не стоит второго чтения дескриптора.
+///
+/// Свойства объекта и его заимствование разбираются из одних и тех же байтов.
+/// Второе чтение того же файла стоило бы лишнего доступа и, что хуже, могло бы
+/// застать файл изменившимся между чтениями — тогда два ответа об одном
+/// объекте описывали бы разные состояния источника.
+#[test]
+fn borrowing_costs_no_second_descriptor_read() {
+    let fixture = RealReaderFixture::new();
+    fixture.borrow_catalog("Catalogs/Владельцы.xml", Some("Synonym"));
+    let authority = fixture.extension_read_authority();
+
+    assert_reader_reaches(&authority, &["main:Catalog.Владельцы"]);
+
+    assert_eq!(
+        authority.metadata_descriptor_read_count("Catalog.Владельцы"),
+        2,
+        "заимствование читается тем же дескриптором, что и свойства объекта: \
+         доказательство владельца плюс типизированная проекция, и ни чтением больше",
+    );
+}
+
+/// В наборе вида `configuration` заимствования не бывает, и `belonging: own`
+/// у каждого объекта было бы шумом.
+#[test]
+fn a_configuration_source_set_carries_no_borrowing_props() {
+    let fixture = RealReaderFixture::new();
+    let service = fixture.view_service();
+
+    let result = service.view(ViewRequest::new("main:Catalog.Items").unwrap());
+
+    assert!(result.ok, "{:?}", refusal_codes(&result));
+    let props = &result.data.as_ref().unwrap()["props"];
+    for key in ["belonging", "extends", "overrides"] {
+        assert!(props.get(key).is_none(), "{key} в конфигурации не отвечает");
+    }
+}
+
+#[test]
+fn metadata_node_props_lay_out_the_per_kind_facts_by_role() {
+    let fixture = RealReaderFixture::new();
+    let service = fixture.view_service();
+
+    // Обработчик регламентного задания: два поля, две роли.
+    let job = service.view(ViewRequest::new("main:ScheduledJob.MonthClose").unwrap());
+    assert!(job.ok, "{:?}", refusal_codes(&job));
+    let props = &job.data.as_ref().unwrap()["props"];
+    assert_eq!(props["handlerModule"], json!("CommonModule.MonthClose"));
+    assert_eq!(props["handlerMethod"], json!("RunScheduled"));
+
+    // Расписание регистра расчёта: три поля, три роли.
+    let register = service.view(ViewRequest::new("main:CalculationRegister.Payroll").unwrap());
+    assert!(register.ok, "{:?}", refusal_codes(&register));
+    let props = &register.data.as_ref().unwrap()["props"];
+    assert_eq!(
+        props["scheduleRegister"],
+        json!("InformationRegister.WorkSchedules")
+    );
+    assert_eq!(
+        props["scheduleValueField"],
+        json!("InformationRegister.WorkSchedules.Resource.DayValue")
+    );
+    assert_eq!(
+        props["scheduleDateField"],
+        json!("InformationRegister.WorkSchedules.Dimension.Date")
+    );
+
+    // Тип константы: одно составное значение, компактной строкой — тем же
+    // механизмом, каким отвечает тип реквизита.
+    let constant = service.view(ViewRequest::new("main:Constant.MainCurrency").unwrap());
+    assert!(constant.ok, "{:?}", refusal_codes(&constant));
+    let rendered = constant.data.as_ref().unwrap()["props"]["type"]
+        .as_str()
+        .expect("constant type renders compactly");
+    assert!(rendered.contains("string"), "{rendered}");
+}
+
+#[test]
+fn declared_service_kinds_finally_get_their_subject() {
+    let fixture = RealReaderFixture::new();
+    let service = fixture.view_service();
+
+    // Виды `URLTemplate` и `Operation` были объявлены в грамматике и не
+    // подключены ни к чему; здесь у них появляется предмет.
+    let http = service.view(ViewRequest::new("main:HTTPService.ExternalAPI").unwrap());
+    assert!(http.ok, "{:?}", refusal_codes(&http));
+    let branches = http.data.as_ref().unwrap()["branches"].as_array().unwrap();
+    assert!(
+        branches.contains(&json!({
+            "at": "main:HTTPService.ExternalAPI.URLTemplate",
+            "count": 1
+        })),
+        "{branches:#?}"
+    );
+
+    let template =
+        service.view(ViewRequest::new("main:HTTPService.ExternalAPI.URLTemplate.Metrics").unwrap());
+    assert!(template.ok, "{:?}", refusal_codes(&template));
+    let template = template.data.as_ref().unwrap();
+    assert_eq!(template["props"]["template"], json!("/v1/kpi/"));
+    // Последовательность методов — ветвь, а не строка в `props`: коллекция
+    // обязана быть адресуемой.
+    assert_eq!(
+        template["branches"],
         json!([{
-            "at": "main:Catalog.Items",
-            "kind": "Catalog",
-            "title": "Items"
+            "at": "main:HTTPService.ExternalAPI.URLTemplate.Metrics.Method",
+            "count": 1
         }]),
+    );
+
+    let method = service.view(
+        ViewRequest::new("main:HTTPService.ExternalAPI.URLTemplate.Metrics.Method.Get").unwrap(),
+    );
+    assert!(method.ok, "{:?}", refusal_codes(&method));
+    let method = method.data.as_ref().unwrap();
+    assert_eq!(method["props"]["httpMethod"], json!("GET"));
+    assert_eq!(method["props"]["handler"], json!("MetricsGet"));
+
+    let operation =
+        service.view(ViewRequest::new("main:WebService.Exchange.Operation.Send").unwrap());
+    assert!(operation.ok, "{:?}", refusal_codes(&operation));
+    let operation = operation.data.as_ref().unwrap();
+    assert_eq!(operation["props"]["procedure"], json!("SendData"));
+    assert_eq!(operation["props"]["transactioned"], json!(true));
+    assert!(
+        operation["props"]["returnType"]
+            .as_str()
+            .is_some_and(|rendered| rendered.contains("boolean")),
+        "{operation:#}"
+    );
+    assert_eq!(
+        operation["branches"],
+        json!([{"at": "main:WebService.Exchange.Operation.Send.Parameter", "count": 1}]),
+    );
+
+    let parameter = service.view(
+        ViewRequest::new("main:WebService.Exchange.Operation.Send.Parameter.Payload").unwrap(),
+    );
+    assert!(parameter.ok, "{:?}", refusal_codes(&parameter));
+    assert_eq!(
+        parameter.data.as_ref().unwrap()["props"]["direction"],
+        json!("in")
+    );
+}
+
+#[test]
+fn every_reference_of_an_object_answers_in_one_relation_branch() {
+    let fixture = RealReaderFixture::new();
+    let service = fixture.view_service();
+
+    let document = service.view(ViewRequest::new("main:Document.Order").unwrap());
+    assert!(document.ok, "{:?}", refusal_codes(&document));
+    let branches = document.data.as_ref().unwrap()["branches"]
+        .as_array()
+        .unwrap();
+    // Платформа держит движение и основание в разных местах, но вопрос один:
+    // на что объект показывает. Одна ветвь, имя связи — поле элемента.
+    assert!(
+        branches.contains(&json!({"at": "main:Document.Order.Relation", "count": 2})),
+        "{branches:#?}"
+    );
+
+    let relations = service.view(ViewRequest::new("main:Document.Order.Relation").unwrap());
+    assert!(relations.ok, "{:?}", refusal_codes(&relations));
+    assert_eq!(
+        relations.data.as_ref().unwrap()["items"],
+        json!([
+            {
+                "relation": "registerRecord",
+                "at": "main:CalculationRegister.Payroll",
+                "kind": "CalculationRegister"
+            },
+            {
+                "relation": "basedOn",
+                "at": "main:Catalog.Items",
+                "kind": "Catalog"
+            }
+        ]),
+    );
+
+    // Правило обещает всякую ссылку, поэтому проверяются все её источники, а
+    // не те два, что лежали ближе. `relations` и пофактовая часть вида
+    // приходят из разных мест платформы и должны сойтись в одной ветви.
+    let sources = |at: &str| -> Vec<(String, String)> {
+        let node = service.view(ViewRequest::new(at).unwrap());
+        assert!(node.ok, "{at}: {:?}", refusal_codes(&node));
+        node.data.as_ref().unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                (
+                    item["relation"].as_str().unwrap().to_string(),
+                    item["at"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        sources("main:Catalog.Items.Relation"),
+        [
+            ("owner".to_string(), "main:Catalog.Владельцы".to_string()),
+            (
+                "inputByString".to_string(),
+                "main:Catalog.Items.Attribute.Code".to_string()
+            ),
+            (
+                "dataLockField".to_string(),
+                "main:Catalog.Items.Attribute.Code".to_string()
+            ),
+        ]
+    );
+    assert_eq!(
+        sources("main:DocumentJournal.Журнал.Relation"),
+        [(
+            "registeredDocument".to_string(),
+            "main:Document.Order".to_string()
+        )]
+    );
+    assert_eq!(
+        sources("main:ChartOfCalculationTypes.ВидыРасчета.Relation"),
+        [(
+            "baseCalculationType".to_string(),
+            "main:ChartOfCalculationTypes.ВидыРасчета".to_string()
+        )]
+    );
+    assert_eq!(
+        sources("main:EventSubscription.ПриЗаписи.Relation"),
+        [("source".to_string(), "main:Catalog.Items".to_string())]
+    );
+    // Пакет XDTO бывает ссылкой и бывает пространством имён; в ветвь попадает
+    // только адресуемый вариант, и это названная граница, а не потеря.
+    assert_eq!(
+        sources("main:WebService.Exchange.Relation"),
+        [(
+            "xdtoPackage".to_string(),
+            "main:XDTOPackage.Exchange".to_string()
+        )]
+    );
+
+    // Элемент ветви показывает наружу, поэтому спускаться в него нельзя:
+    // цель читается по своему адресу.
+    let inward = service.view(ViewRequest::new("main:Document.Order.Relation.Items").unwrap());
+    assert!(!inward.ok, "{:?}", refusal_codes(&inward));
+    assert_eq!(refusal_codes(&inward), ["not_found"]);
+}
+
+#[test]
+fn root_declarations_get_branches_and_only_the_named_one_is_addressable() {
+    let fixture = RealReaderFixture::new();
+    let service = fixture.view_service();
+
+    // Стандартная табличная часть носит имя, поэтому адресуется, а её
+    // собственная последовательность становится вложенной ветвью.
+    let section = service.view(
+        ViewRequest::new("main:ChartOfAccounts.Accounts.StandardTabularSection.ExtDimensionTypes")
+            .unwrap(),
+    );
+    assert!(section.ok, "{:?}", refusal_codes(&section));
+    let section = section.data.as_ref().unwrap();
+    assert_eq!(section["kind"], "StandardTabularSection");
+    assert_eq!(
+        section["branches"],
+        json!([{
+            "at": "main:ChartOfAccounts.Accounts.StandardTabularSection.ExtDimensionTypes.StandardAttribute",
+            "count": 1
+        }]),
+    );
+
+    let attribute = service.view(
+        ViewRequest::new(
+            "main:ChartOfAccounts.Accounts.StandardTabularSection.ExtDimensionTypes.StandardAttribute.ExtDimensionType",
+        )
+        .unwrap(),
+    );
+    assert!(attribute.ok, "{:?}", refusal_codes(&attribute));
+    assert_eq!(
+        attribute.data.as_ref().unwrap()["title"],
+        "ExtDimensionType"
+    );
+
+    // Характеристика имени не носит: ветвь адресуема, а её элементы —
+    // строки данных, и адреса у них нет.
+    let characteristics =
+        service.view(ViewRequest::new("main:Catalog.Items.Characteristic").unwrap());
+    assert!(characteristics.ok, "{:?}", refusal_codes(&characteristics));
+    let items = characteristics.data.as_ref().unwrap()["items"]
+        .as_array()
+        .unwrap();
+    assert_eq!(items.len(), 1);
+    assert!(items[0].get("at").is_none(), "{items:#?}");
+    assert_eq!(items[0]["values"]["source"], "Catalog.Items");
+
+    let named = service.view(ViewRequest::new("main:Catalog.Items.Characteristic.Any").unwrap());
+    assert!(!named.ok, "{:?}", refusal_codes(&named));
+    assert_eq!(refusal_codes(&named), ["not_found"]);
+}
+
+#[test]
+fn predefined_items_answer_by_address_with_the_count_from_the_reader() {
+    let fixture = RealReaderFixture::new();
+    let service = fixture.view_service();
+
+    let node = service.view(ViewRequest::new("main:Catalog.Items").unwrap());
+    assert!(node.ok, "{:?}", refusal_codes(&node));
+    let branches = node.data.as_ref().unwrap()["branches"].as_array().unwrap();
+    // Счёт пришёл из ответа читателя, а не из длины страницы.
+    assert!(
+        branches.contains(&json!({"at": "main:Catalog.Items.PredefinedItem", "count": 1})),
+        "{branches:#?}"
+    );
+
+    let page = service.view(ViewRequest::new("main:Catalog.Items.PredefinedItem").unwrap());
+    assert!(page.ok, "{:?}", refusal_codes(&page));
+    let items = page.data.as_ref().unwrap()["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["at"], "main:Catalog.Items.PredefinedItem.Основной");
+    assert_eq!(items[0]["kind"], "PredefinedItem");
+
+    let item =
+        service.view(ViewRequest::new("main:Catalog.Items.PredefinedItem.Основной").unwrap());
+    assert!(item.ok, "{:?}", refusal_codes(&item));
+    let item = item.data.as_ref().unwrap();
+    // Заголовок называет элемент его именем; представление — отдельный факт.
+    assert_eq!(item["title"], "Основной");
+    assert_eq!(item["props"]["description"], "Основной элемент");
+    assert_eq!(item["props"]["id"], "c7d2e6fc-3824-4b56-b4be-ae6be4944c0e");
+
+    // Вид без этой коллекции ветви не получает: неприменимое не отвечает
+    // пустотой, его просто нет.
+    let document = service.view(ViewRequest::new("main:Document.Order").unwrap());
+    assert!(document.ok, "{:?}", refusal_codes(&document));
+    let branch_addresses: Vec<&str> = document.data.as_ref().unwrap()["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|branch| branch["at"].as_str())
+        .collect();
+    assert!(
+        !branch_addresses
+            .iter()
+            .any(|at| at.ends_with(".PredefinedItem")),
+        "{branch_addresses:?}"
     );
 }
 
@@ -1762,6 +2271,216 @@ fn mxl_area_parameter_consumes_the_complete_suffix() {
     assert_eq!(data["title"], "Title");
 }
 
+/// Коды отказов из ответа. Сообщение провала несёт только их: разбор в панике
+/// затягивает в текст всю нагрузку вместе с идентификаторами фикстуры, и
+/// сканер справедливо не отличает такой текст от записи в журнал.
+fn refusal_codes(result: &crate::domain::invocation::DomainResult) -> Vec<&str> {
+    result
+        .diagnostics
+        .iter()
+        .filter_map(|diagnostic| diagnostic.get("code").and_then(serde_json::Value::as_str))
+        .collect()
+}
+
+/// Видимость команды в интерфейсе — это не одно значение. Замер на боевой
+/// конфигурации: 99 блоков видимости из 1050 несут переопределения по ролям,
+/// то есть каждая одиннадцатая команда. Отдать `visible` за всю правду
+/// значило бы читать девять процентов команд неверно.
+#[test]
+fn command_visibility_says_when_roles_override_it() {
+    let fixture = RealReaderFixture::new();
+    write(
+        &fixture
+            .source
+            .join("Subsystems/Sales/Ext/CommandInterface.xml"),
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<CommandInterface xmlns="http://v8.1c.ru/8.3/xcf/extrnprops" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" version="2.20">
+	<CommandsVisibility>
+		<Command name="Catalog.Items.Command.Refresh">
+			<Visibility>
+				<xr:Common>true</xr:Common>
+				<xr:Value name="Role.Кладовщик">false</xr:Value>
+				<xr:Value name="Role.ПолныеПрава">true</xr:Value>
+			</Visibility>
+		</Command>
+		<Command name="CommonCommand.ОткрытьНастройки">
+			<Visibility>
+				<xr:Common>false</xr:Common>
+			</Visibility>
+		</Command>
+	</CommandsVisibility>
+</CommandInterface>
+"#,
+    );
+    let service = fixture.view_service();
+
+    let commands =
+        service.view(ViewRequest::new("main:Subsystem.Sales.Interface.Command").unwrap());
+
+    assert!(commands.ok, "{:?}", refusal_codes(&commands));
+    let items = commands.data.as_ref().unwrap()["items"].as_array().unwrap();
+    let props = |title: &str| {
+        items
+            .iter()
+            .find(|item| item["title"] == title)
+            .unwrap_or_else(|| panic!("{title} among {items:?}"))["props"]
+            .clone()
+    };
+    let overridden = props("Catalog.Items.Command.Refresh");
+    assert_eq!(overridden["visible"], true);
+    assert_eq!(overridden["roleOverrides"], 2);
+    // Ноль говорит «переопределений нет», а не «не смотрели»: отсутствие поля
+    // читатель не отличил бы от несчитанного.
+    let plain = props("CommonCommand.ОткрытьНастройки");
+    assert_eq!(plain["visible"], false);
+    assert_eq!(plain["roleOverrides"], 0);
+}
+
+/// Порядок команд, групп и дочерних подсистем — три из пяти секций
+/// командного интерфейса. Две из них наружу не выходили вовсе, а писать то,
+/// чего инструмент не показывает, нельзя: предпросмотр правки нечем
+/// подтвердить, а забор ревизии по прочитанному над невидимым фактом
+/// несостоятелен.
+#[test]
+fn the_command_interface_shows_every_order_it_holds() {
+    let fixture = RealReaderFixture::new();
+    write(
+        &fixture
+            .source
+            .join("Subsystems/Sales/Ext/CommandInterface.xml"),
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<CommandInterface xmlns="http://v8.1c.ru/8.3/xcf/extrnprops" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" version="2.20">
+	<CommandsOrder>
+		<Command name="Catalog.Items.StandardCommand.Zeta">
+			<CommandGroup>NavigationPanelImportant</CommandGroup>
+		</Command>
+		<Command name="Catalog.Items.StandardCommand.OpenList">
+			<CommandGroup>NavigationPanelImportant</CommandGroup>
+		</Command>
+	</CommandsOrder>
+	<SubsystemsOrder>
+		<Subsystem>Subsystem.Zeta</Subsystem>
+		<Subsystem>Subsystem.Sales</Subsystem>
+	</SubsystemsOrder>
+	<GroupsOrder>
+		<Group>NavigationPanelSeeAlso</Group>
+		<Group>NavigationPanelImportant</Group>
+	</GroupsOrder>
+</CommandInterface>
+"#,
+    );
+    let service = fixture.view_service();
+    let at = "main:Subsystem.Sales.Interface";
+
+    let node = service.view(ViewRequest::new(at).unwrap());
+    assert!(node.ok, "{:?}", refusal_codes(&node));
+    let branches = node.data.as_ref().unwrap()["branches"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let branch = |kind: &str| {
+        branches
+            .iter()
+            .find(|branch| branch["at"] == format!("{at}.{kind}"))
+            .cloned()
+    };
+    assert_eq!(branch("Group").unwrap()["count"], 2, "{branches:?}");
+    assert_eq!(branch("Subsystem").unwrap()["count"], 2, "{branches:?}");
+
+    // Группы идут в объявленном порядке, и пустая группа остаётся видимой:
+    // порядок объявляется отдельно от наполнения.
+    let groups = service.view(ViewRequest::new(&format!("{at}.Group")).unwrap());
+    assert!(groups.ok, "{:?}", refusal_codes(&groups));
+    let items = groups.data.as_ref().unwrap()["items"].as_array().unwrap();
+    assert_eq!(items[0]["title"], "NavigationPanelSeeAlso");
+    assert_eq!(items[0]["commands"], 0);
+    assert_eq!(items[1]["title"], "NavigationPanelImportant");
+    assert_eq!(items[1]["commands"], 2);
+
+    // Внутри группы — её команды в порядке `CommandsOrder`.
+    let one =
+        service.view(ViewRequest::new(&format!("{at}.Group.NavigationPanelImportant")).unwrap());
+    assert!(one.ok, "{:?}", refusal_codes(&one));
+    let ordered = one.data.as_ref().unwrap()["items"].as_array().unwrap();
+    assert_eq!(
+        ordered,
+        &vec![
+            json!({"order": 1, "command": "Catalog.Items.StandardCommand.Zeta"}),
+            json!({"order": 2, "command": "Catalog.Items.StandardCommand.OpenList"}),
+        ]
+    );
+
+    // Ссылка платформы дополняется до адреса, по которому можно спуститься.
+    let children = service.view(ViewRequest::new(&format!("{at}.Subsystem")).unwrap());
+    assert!(children.ok, "{:?}", refusal_codes(&children));
+    assert_eq!(
+        children.data.as_ref().unwrap()["items"],
+        json!([
+            {"order": 1, "at": "main:Subsystem.Zeta"},
+            {"order": 2, "at": "main:Subsystem.Sales"},
+        ])
+    );
+
+    // Группы, которой в порядке нет, не существует и для чтения.
+    let missing = service.view(ViewRequest::new(&format!("{at}.Group.Нет")).unwrap());
+    assert!(!missing.ok);
+    assert_eq!(missing.diagnostics[0]["code"], "not_found");
+}
+
+#[test]
+fn template_area_cell_content_is_a_branch_read_only_when_its_address_is_asked() {
+    let fixture = RealReaderFixture::new();
+    let service = fixture.view_service();
+    let area = "main:Report.ParityReport.Template.Print.Area.Header";
+
+    let node = service.view(ViewRequest::new(area).unwrap());
+    assert!(node.ok, "{:?}", refusal_codes(&node));
+    let data = node.data.as_ref().unwrap();
+    // Структурное чтение области знает длину содержимого, но не несёт текста.
+    assert_eq!(data["props"]["contentCount"], 2);
+    assert_eq!(data.get("content"), None);
+    let branches = data["branches"].as_array().unwrap();
+    assert!(
+        branches
+            .iter()
+            .any(|branch| branch["at"] == format!("{area}.Body") && branch["count"] == 2),
+        "{branches:?}"
+    );
+
+    let body = service.view(ViewRequest::new(&format!("{area}.Body")).unwrap());
+    assert!(body.ok, "{:?}", refusal_codes(&body));
+    let items = body.data.as_ref().unwrap()["items"].as_array().unwrap();
+    assert_eq!(
+        items,
+        &vec![
+            json!({"index": 1, "template": false, "text": "Sales report"}),
+            json!({"index": 2, "template": true, "text": "Period: [Since]"}),
+        ],
+        "порядок ячеек — это и есть смысл печатной формы"
+    );
+}
+
+#[test]
+fn a_structural_template_read_never_serves_a_cached_payload_to_a_content_read() {
+    let fixture = RealReaderFixture::new();
+    let service = fixture.view_service();
+    let area = "main:Report.ParityReport.Template.Print.Area.Header";
+
+    // Один вызов сначала берёт структуру, потом текст: если признак
+    // содержимого не входит в ключ кэша, второе чтение получит первый разбор.
+    let structural = service.view(ViewRequest::new(area).unwrap());
+    assert!(structural.ok, "{:?}", refusal_codes(&structural));
+    let body = service.view(ViewRequest::new(&format!("{area}.Body")).unwrap());
+
+    assert!(body.ok, "{:?}", refusal_codes(&body));
+    assert_eq!(
+        body.data.as_ref().unwrap()["items"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+}
+
 #[test]
 fn unsupported_view_filter_is_a_typed_bad_value_instead_of_a_noop() {
     let fixture = RealReaderFixture::new();
@@ -1790,6 +2509,174 @@ fn module_body_context_filter_excludes_at_client_source_from_server_slice() {
 
     assert!(result.ok, "{} {:?}", result.summary, result.diagnostics);
     assert_eq!(result.data.as_ref().unwrap()["items"], json!([]));
+}
+
+#[test]
+#[ignore = "blocked by #1119: BSL Body still reads the complete module under an 8 MiB file cap"]
+fn ordinary_bsl_read_over_eight_mib_reassembles_every_body_line() {
+    let fixture = RealReaderFixture::new();
+    let module = fixture
+        .source
+        .join("Reports/ParityReport/Forms/MainForm/Ext/Form/Module.bsl");
+    let mut file = std::io::BufWriter::new(fs::File::create(module).unwrap());
+    writeln!(file, "Процедура ПрочитатьБольшойМодуль()").unwrap();
+    for _ in 0..9 {
+        writeln!(file, "//{}", "я".repeat(512 * 1024)).unwrap();
+    }
+    writeln!(file, "КонецПроцедуры").unwrap();
+    file.flush().unwrap();
+    drop(file);
+
+    let service = fixture.view_service();
+    let at = "main:Report.ParityReport.Form.MainForm.Module.Form.Body";
+    let mut cursor = None;
+    let mut observed_lines = Vec::new();
+    loop {
+        let mut request = ViewRequest::new(at).unwrap().with_limit(2).unwrap();
+        if let Some(previous) = cursor.take() {
+            request = request.with_cursor(previous);
+        }
+        let page = service.view(request);
+        assert!(page.ok, "large Body page failed");
+        for item in page.data.as_ref().unwrap()["items"].as_array().unwrap() {
+            let line = item["line"].as_u64().unwrap();
+            let text = item["text"].as_str().expect("Body line must carry text");
+            observed_lines.push(line);
+            if (2..=10).contains(&line) {
+                assert!(text.starts_with("//"));
+                assert_eq!(text.chars().count(), 2 + 512 * 1024);
+            }
+        }
+        cursor = page.cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(observed_lines, (1..=11).collect::<Vec<_>>());
+}
+
+#[test]
+fn ordinary_xml_read_over_eight_mib_keeps_complete_configuration_facts() {
+    let fixture = RealReaderFixture::new();
+    let path = fixture.source.join("Configuration.xml");
+    let baseline = fixture
+        .view_service()
+        .view(ViewRequest::new("main:Configuration").unwrap());
+    assert!(baseline.ok, "baseline Configuration view failed");
+    let xml = fs::read_to_string(&path).unwrap();
+    let inflated = xml.replace(
+        "</MetaDataObject>",
+        &format!("<!--{}--></MetaDataObject>", "x".repeat(8 * 1024 * 1024)),
+    );
+    fs::write(path, inflated).unwrap();
+
+    let result = fixture
+        .view_service()
+        .view(ViewRequest::new("main:Configuration").unwrap());
+    assert!(result.ok, "large Configuration view failed");
+    assert!(
+        result.data.as_ref().unwrap()["props"] == baseline.data.as_ref().unwrap()["props"],
+        "Configuration root properties changed"
+    );
+    assert!(
+        result.data.as_ref().unwrap()["branches"] == baseline.data.as_ref().unwrap()["branches"],
+        "Configuration root branches changed"
+    );
+}
+
+#[test]
+fn large_configuration_root_keeps_legacy_duplicate_and_namespace_semantics() {
+    let fixture = RealReaderFixture::new();
+    let path = fixture.source.join("Configuration.xml");
+    let xml = fs::read_to_string(&path).unwrap();
+    let xml = xml.replacen(
+        "</ChildObjects>",
+        "<CommonModule>РеактивныйСервер</CommonModule><alien:Catalog xmlns:alien=\"urn:other\">Ghost</alien:Catalog></ChildObjects>",
+        1,
+    );
+    fs::write(&path, &xml).unwrap();
+
+    let reader = fixture.read_authority();
+    let legacy_payload = reader
+        .read
+        .configuration_payload_with_checkpoint(&mut || Ok(()))
+        .unwrap();
+    let route = route_logical_address(
+        &QualifiedAddress::parse("main:Configuration").unwrap(),
+        PlatformProfile::v8_3_27(),
+    )
+    .unwrap();
+    let legacy = project_typed_payload(&route, legacy_payload).unwrap();
+    let module_branch = super::module_branch_for_parent(route.at(), PlatformProfile::v8_3_27())
+        .expect("Configuration has a profile module branch");
+    let expected = serde_json::to_value(legacy.with_branch(module_branch)).unwrap();
+
+    fs::write(
+        &path,
+        xml.replace(
+            "</MetaDataObject>",
+            &format!("<!--{}--></MetaDataObject>", "x".repeat(8 * 1024 * 1024)),
+        ),
+    )
+    .unwrap();
+    let actual = fixture
+        .view_service()
+        .view(ViewRequest::new("main:Configuration").unwrap());
+    assert!(actual.ok, "large Configuration view failed");
+    assert!(
+        actual.data.as_ref().unwrap() == &expected,
+        "streaming Configuration root differs from the bounded reader"
+    );
+}
+
+#[test]
+fn large_configuration_root_rejects_malformed_tail() {
+    let fixture = RealReaderFixture::new();
+    let path = fixture.source.join("Configuration.xml");
+    let xml = fs::read_to_string(&path).unwrap();
+    fs::write(
+        path,
+        xml.replace(
+            "</MetaDataObject>",
+            &format!(
+                "<!--{}--><Broken></MetaDataObject>",
+                "x".repeat(8 * 1024 * 1024)
+            ),
+        ),
+    )
+    .unwrap();
+    let result = fixture
+        .view_service()
+        .view(ViewRequest::new("main:Configuration").unwrap());
+    assert!(!result.ok, "malformed XML tail escaped");
+    assert_eq!(result.diagnostics[0]["code"], "provider_unavailable");
+    assert_eq!(result.diagnostics[0]["detailCode"], "source_unreadable");
+}
+
+#[test]
+fn large_configuration_root_rejects_revision_change_during_owner_proof() {
+    let fixture = RealReaderFixture::new();
+    let root_xml = fixture.source.join("Configuration.xml");
+    let xml = fs::read_to_string(&root_xml).unwrap();
+    fs::write(
+        root_xml,
+        xml.replace(
+            "</MetaDataObject>",
+            &format!("<!--{}--></MetaDataObject>", "x".repeat(8 * 1024 * 1024)),
+        ),
+    )
+    .unwrap();
+    let descriptor = fixture.source.join("Catalogs/Items.xml");
+    review_set_before_owner_proof(move || {
+        let mut text = fs::read_to_string(&descriptor).unwrap();
+        text.push('\n');
+        fs::write(&descriptor, text).unwrap();
+    });
+    let result = fixture
+        .view_service()
+        .view(ViewRequest::new("main:Configuration").unwrap());
+    assert!(!result.ok, "mixed-revision Configuration root escaped");
+    assert_eq!(result.diagnostics[0]["code"], "stale_cursor");
 }
 
 #[test]
@@ -2686,6 +3573,136 @@ pub(crate) fn typed_reads_parse_the_support_marker_once_per_actor_revision() {
 }
 
 #[test]
+fn large_support_marker_reads_late_rules_once_for_multiple_owners() {
+    use crate::domain::support_state::ObjectSupportState;
+    use crate::infrastructure::native_operations::common::support_root_uuid_from_bytes;
+
+    let fixture = RealReaderFixture::new();
+    let catalog_uuid =
+        support_root_uuid_from_bytes(&fs::read(fixture.source.join("Catalogs/Items.xml")).unwrap())
+            .unwrap();
+    let report_uuid = support_root_uuid_from_bytes(
+        &fs::read(fixture.source.join("Reports/ParityReport.xml")).unwrap(),
+    )
+    .unwrap();
+    assert_ne!(catalog_uuid, report_uuid);
+    let mut marker = format!("{{6,0,1,0,0,{catalog_uuid},").into_bytes();
+    // The final rule straddles a 64 KiB window after the former 8 MiB ceiling.
+    marker.resize(8 * 1024 * 1024 + 64 * 1024 - 13, b' ');
+    marker.extend_from_slice(format!("1,0,{report_uuid},}}").as_bytes());
+    fs::create_dir_all(fixture.source.join("Ext")).unwrap();
+    fs::write(fixture.source.join("Ext/ParentConfigurations.bin"), marker).unwrap();
+    let authority = fixture.read_authority();
+    for (path, expected) in [
+        ("Catalog.Items", ObjectSupportState::Locked),
+        (
+            "Report.ParityReport",
+            ObjectSupportState::EditableWithSupport,
+        ),
+        ("Catalog.Items", ObjectSupportState::Locked),
+    ] {
+        let target = MetadataAddress::parse(PLATFORM_XML_8_3_27_FORMAT_2_20, path).unwrap();
+        assert_eq!(
+            authority
+                .read
+                .object_support(&target, &mut || Ok(()))
+                .unwrap()
+                .state,
+            expected
+        );
+    }
+    let configuration = configuration_payload(&authority.read).unwrap();
+    assert_eq!(
+        configuration["support"]["objects"],
+        json!({"locked": 1, "editable": 1, "removed": 0})
+    );
+    assert_eq!(authority.support_state_read_count(), 1);
+}
+
+#[test]
+fn support_marker_stream_preserves_terminal_errors_and_never_memoizes_interruption() {
+    use crate::application::v13::view::ViewError;
+    let fixture = RealReaderFixture::new();
+    let marker_path = fixture.source.join("Ext/ParentConfigurations.bin");
+    fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+    let mut marker = b"{6,0,1,".to_vec();
+    marker.resize(64 * 1024 + 1, b' ');
+    fs::write(&marker_path, marker).unwrap();
+    let target = MetadataAddress::parse(PLATFORM_XML_8_3_27_FORMAT_2_20, "Catalog.Items").unwrap();
+    for code in [RefusalCode::Cancelled, RefusalCode::DeadlineExceeded] {
+        // Before opening, between chunks, after EOF, and immediately before memo publication.
+        for stop_at in [1, 3, 5, 6] {
+            let authority = fixture.read_authority();
+            let mut calls = 0;
+            let error = authority
+                .read
+                .object_support(&target, &mut || {
+                    calls += 1;
+                    if calls == stop_at {
+                        Err(ViewError::new(code, "original operation stopped"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+            assert_eq!(error.code(), code, "checkpoint {stop_at}");
+            assert_eq!(calls, stop_at);
+            let reads_before_retry = authority.support_state_read_count();
+            authority
+                .read
+                .object_support(&target, &mut || Ok(()))
+                .unwrap();
+            assert_eq!(
+                authority.support_state_read_count(),
+                reads_before_retry + 1,
+                "interrupted state was not published"
+            );
+            let mut calls = 0;
+            let error = authority
+                .read
+                .object_support(&target, &mut || {
+                    calls += 1;
+                    if calls == 2 {
+                        Err(ViewError::new(code, "cached read stopped"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+            assert_eq!(error.code(), code);
+            assert_eq!(calls, 2, "cached return keeps the caller checkpoint");
+            assert_eq!(authority.support_state_read_count(), reads_before_retry + 1);
+        }
+    }
+    fs::remove_file(marker_path).unwrap();
+    for code in [RefusalCode::Cancelled, RefusalCode::DeadlineExceeded] {
+        let authority = fixture.read_authority();
+        let mut calls = 0;
+        let error = authority
+            .read
+            .object_support(&target, &mut || {
+                calls += 1;
+                if calls == 2 {
+                    Err(ViewError::new(code, "absent marker read stopped"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), code);
+        authority
+            .read
+            .object_support(&target, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(
+            authority.support_state_read_count(),
+            2,
+            "absence is memoized only after a successful checkpoint"
+        );
+    }
+}
+
+#[test]
 fn ambiguous_short_role_alias_is_rejected_and_canonical_aliases_work() {
     let payload = json!({
         "name": "SalesReader",
@@ -2965,7 +3982,7 @@ impl RealReaderFixture {
                 source.join("Configuration.xml"),
                 replace_child_objects(
                     &config,
-                    "\n\t\t\t<Catalog>Items</Catalog>\n\t\t\t<Report>ParityReport</Report>\n\t\t\t<Role>SalesReader</Role>\n\t\t\t<Subsystem>Sales</Subsystem>\n\t\t\t<XDTOPackage>EnterpriseData_1_17_3</XDTOPackage>\n\t\t\t<CommonModule>РеактивныйСервер</CommonModule>\n\t\t",
+                    "\n\t\t\t<Constant>MainCurrency</Constant>\n\t\t\t<Catalog>Items</Catalog>\n\t\t\t<Document>Order</Document>\n\t\t\t<ChartOfAccounts>Accounts</ChartOfAccounts>\n\t\t\t<Catalog>Владельцы</Catalog>\n\t\t\t<DocumentJournal>Журнал</DocumentJournal>\n\t\t\t<ChartOfCalculationTypes>ВидыРасчета</ChartOfCalculationTypes>\n\t\t\t<EventSubscription>ПриЗаписи</EventSubscription>\n\t\t\t<CalculationRegister>Payroll</CalculationRegister>\n\t\t\t<Report>ParityReport</Report>\n\t\t\t<Role>SalesReader</Role>\n\t\t\t<Subsystem>Sales</Subsystem>\n\t\t\t<XDTOPackage>EnterpriseData_1_17_3</XDTOPackage>\n\t\t\t<CommonModule>РеактивныйСервер</CommonModule>\n\t\t\t<ScheduledJob>MonthClose</ScheduledJob>\n\t\t\t<HTTPService>ExternalAPI</HTTPService>\n\t\t\t<WebService>Exchange</WebService>\n\t\t",
                 ),
             )
             .unwrap();
@@ -2975,8 +3992,152 @@ impl RealReaderFixture {
         .replace(
             "<TabularSection><Properties><Name>Lines</Name></Properties><ChildObjects/></TabularSection>",
             "<TabularSection><Properties><Name>Lines</Name></Properties><ChildObjects><Attribute><Properties><Name>Quantity</Name><Type><v8:Type>xs:decimal</v8:Type></Type></Properties></Attribute></ChildObjects></TabularSection>",
+        )
+        // Свойства корня каталога: без них узел метаданных нечем проверить.
+        .replace(
+            "<Properties><Name>Items</Name></Properties>",
+            concat!(
+                "<Properties xmlns:xr=\"http://v8.1c.ru/8.3/xcf/readable\"",
+                " xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"",
+                " xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">",
+                "<Name>Items</Name><Hierarchical>true</Hierarchical>",
+                "<CodeLength>11</CodeLength>",
+                "<Owners><xr:Item xsi:type=\"xr:MDObjectRef\">Catalog.Владельцы</xr:Item></Owners>",
+                "<InputByString><xr:Field>Catalog.Items.Attribute.Code</xr:Field></InputByString>",
+                "<DataLockFields><xr:Field>Catalog.Items.Attribute.Code</xr:Field></DataLockFields>",
+                // Характеристика названа парой источников, а не именем.
+                "<Characteristics>",
+                "<xr:Characteristic>",
+                "<xr:CharacteristicTypes from=\"Catalog.Items.TabularSection.Lines.Attribute.Quantity\">",
+                "<xr:KeyField>Catalog.Items.Attribute.Code</xr:KeyField>",
+                "<xr:TypesFilterField>Catalog.Items.Attribute.Code</xr:TypesFilterField>",
+                "<xr:TypesFilterValue xsi:type=\"xs:string\">Catalog_Items</xr:TypesFilterValue>",
+                "<xr:DataPathField>-1</xr:DataPathField>",
+                "<xr:MultipleValuesUseField>-1</xr:MultipleValuesUseField>",
+                "</xr:CharacteristicTypes>",
+                "<xr:CharacteristicValues from=\"Catalog.Items\">",
+                "<xr:ObjectField>Catalog.Items.Attribute.Code</xr:ObjectField>",
+                "<xr:TypeField>Catalog.Items.Attribute.Code</xr:TypeField>",
+                "<xr:ValueField>Catalog.Items.Attribute.Code</xr:ValueField>",
+                "<xr:MultipleValuesKeyField>-1</xr:MultipleValuesKeyField>",
+                "<xr:MultipleValuesOrderField>-1</xr:MultipleValuesOrderField>",
+                "</xr:CharacteristicValues>",
+                "</xr:Characteristic></Characteristics></Properties>",
+            ),
         );
         write(&source.join("Catalogs/Items.xml"), &catalog);
+        // Остальные источники ссылок: владелец, журнал, базовые виды расчёта и
+        // источник события подписки. Правило обещает всякую ссылку, и проверить
+        // его можно только всеми её источниками.
+        for (relative, body) in [
+            (
+                "Catalogs/Владельцы.xml",
+                r#"<Catalog uuid="99999999-9999-4999-8999-999999999991"><Properties><Name>Владельцы</Name></Properties><ChildObjects/></Catalog>"#,
+            ),
+            (
+                "DocumentJournals/Журнал.xml",
+                r#"<DocumentJournal uuid="99999999-9999-4999-8999-999999999992"><Properties><Name>Журнал</Name><RegisteredDocuments><xr:Item xsi:type="xr:MDObjectRef">Document.Order</xr:Item></RegisteredDocuments></Properties><ChildObjects/></DocumentJournal>"#,
+            ),
+            (
+                "ChartsOfCalculationTypes/ВидыРасчета.xml",
+                r#"<ChartOfCalculationTypes uuid="99999999-9999-4999-8999-999999999993"><Properties><Name>ВидыРасчета</Name><BaseCalculationTypes><xr:Item xsi:type="xr:MDObjectRef">ChartOfCalculationTypes.ВидыРасчета</xr:Item></BaseCalculationTypes></Properties><ChildObjects/></ChartOfCalculationTypes>"#,
+            ),
+            (
+                "EventSubscriptions/ПриЗаписи.xml",
+                r#"<EventSubscription uuid="99999999-9999-4999-8999-999999999994"><Properties><Name>ПриЗаписи</Name><Source><v8:Type>cfg:CatalogObject.Items</v8:Type></Source><Event>BeforeWrite</Event><Handler>CommonModule.РеактивныйСервер.ПриЗаписи</Handler></Properties></EventSubscription>"#,
+            ),
+        ] {
+            write(
+                &source.join(relative),
+                &format!(
+                    concat!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+                        "<MetaDataObject xmlns=\"http://v8.1c.ru/8.3/MDClasses\"",
+                        " xmlns:v8=\"http://v8.1c.ru/8.1/data/core\"",
+                        " xmlns:cfg=\"http://v8.1c.ru/8.1/data/enterprise/current-config\"",
+                        " xmlns:xr=\"http://v8.1c.ru/8.3/xcf/readable\"",
+                        " xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"",
+                        " xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"",
+                        " version=\"2.20\">{}</MetaDataObject>"
+                    ),
+                    body
+                ),
+            );
+        }
+        // План счетов со стандартной табличной частью: у неё есть имя, и она
+        // адресуется, а внутри — своя последовательность.
+        write(
+            &source.join("ChartsOfAccounts/Accounts.xml"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" version="2.20">
+  <ChartOfAccounts uuid="77777777-7777-4777-8777-777777777778">
+    <Properties>
+      <Name>Accounts</Name>
+      <StandardTabularSections>
+        <xr:StandardTabularSection name="ExtDimensionTypes">
+          <xr:Synonym/><xr:Comment/><xr:ToolTip/>
+          <xr:FillChecking>DontCheck</xr:FillChecking>
+          <xr:StandardAttributes>
+            <xr:StandardAttribute name="ExtDimensionType"/>
+          </xr:StandardAttributes>
+        </xr:StandardTabularSection>
+      </StandardTabularSections>
+    </Properties>
+    <ChildObjects/>
+  </ChartOfAccounts>
+</MetaDataObject>"#,
+        );
+        // Предопределённые элементы справочника: писатель у них есть, и теперь
+        // есть читатель.
+        write(
+            &source.join("Catalogs/Items/Ext/Predefined.xml"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<PredefinedData xmlns="http://v8.1c.ru/8.3/xcf/predef" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CatalogPredefinedItems" version="2.20">
+  <Item id="c7d2e6fc-3824-4b56-b4be-ae6be4944c0e">
+    <Name>Основной</Name>
+    <Code/>
+    <Description>Основной элемент</Description>
+    <IsFolder>false</IsFolder>
+  </Item>
+</PredefinedData>"#,
+        );
+        // Документ со ссылками наружу: движение по регистру и основание.
+        write(
+            &source.join("Documents/Order.xml"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.20">
+  <Document uuid="88888888-8888-4888-8888-888888888888">
+    <Properties>
+      <Name>Order</Name>
+      <RegisterRecords>
+        <xr:Item xsi:type="xr:MDObjectRef">CalculationRegister.Payroll</xr:Item>
+      </RegisterRecords>
+      <BasedOn>
+        <xr:Item xsi:type="xr:MDObjectRef">Catalog.Items</xr:Item>
+      </BasedOn>
+    </Properties>
+    <ChildObjects/>
+  </Document>
+</MetaDataObject>"#,
+        );
+        // Три вида с собственными данными: обработчик, расписание и тип.
+        for (relative, fixture) in [
+            ("Constants/MainCurrency.xml", "constant-type.xml"),
+            (
+                "CalculationRegisters/Payroll.xml",
+                "calculation-register.xml",
+            ),
+            ("ScheduledJobs/MonthClose.xml", "scheduled-job.xml"),
+            ("HTTPServices/ExternalAPI.xml", "http-service.xml"),
+            ("WebServices/Exchange.xml", "web-service.xml"),
+        ] {
+            write(
+                &source.join(relative),
+                &with_root_version(&fixture_text(&format!(
+                    "platform_8_3_27/meta_info/edge/{fixture}"
+                ))),
+            );
+        }
         write(
             &source.join("Catalogs/Items/Forms/ItemForm.xml"),
             r#"<?xml version="1.0" encoding="UTF-8"?><MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Form uuid="10000000-0000-4000-8000-000000000031"><Properties><Name>ItemForm</Name><FormType>Managed</FormType></Properties></Form></MetaDataObject>"#,
@@ -3085,7 +4246,7 @@ impl RealReaderFixture {
             )
             .replace(
                 "\n\t\t\t<empty>true</empty>",
-                "\n\t\t\t<c><c><f>0</f><parameter>Title</parameter></c></c>",
+                "\n\t\t\t<c><c><f>0</f><parameter>Title</parameter></c></c><c><c><f>1</f><tl><content>Sales report</content></tl></c></c><c><c><f>2</f><tl><content>Period: [Since]</content></tl></c></c>",
             );
         write(
             &source.join("Reports/ParityReport/Templates/Print/Ext/Template.xml"),
@@ -3169,6 +4330,57 @@ impl RealReaderFixture {
 
     fn view_service(&self) -> ViewService<LogicalViewReadAuthority<'_>> {
         ViewService::new(self.read_authority(), ViewCursorStore::default())
+    }
+
+    /// Тот же набор, объявленный расширением: заимствование живёт только здесь.
+    fn extension_read_authority(&self) -> LogicalViewReadAuthority<'_> {
+        let source_root = Arc::new(RetainedDirectoryCapability::open(&self.source).unwrap());
+        let revisions = Arc::new(
+            SourceRevisionService::new_reconciling_for_test(&self.context, &self.source).unwrap(),
+        );
+        LogicalViewReadAuthority::new(
+            &self.cancellation,
+            "main",
+            "actor-fixture-extension-borrowing",
+            SourceSetKind::Extension,
+            revisions,
+            source_root,
+            PlatformProfile::v8_3_27(),
+        )
+    }
+
+    fn extension_view_service(&self) -> ViewService<LogicalViewReadAuthority<'_>> {
+        ViewService::new(self.extension_read_authority(), ViewCursorStore::default())
+    }
+
+    /// Платформенная форма заимствования: `Adopted` в свойствах,
+    /// `ExtendedConfigurationObject` с UUID родителя после имени и, когда
+    /// свойство перекрыто, запись `xr:PropertyState` в `InternalInfo`.
+    fn borrow_catalog(&self, relative: &str, overridden: Option<&str>) {
+        let path = self.source.join(relative);
+        let text = fs::read_to_string(&path).unwrap();
+        let properties = text.find("<Properties>").unwrap();
+        let after_open = properties + "<Properties>".len();
+        let mut patched = format!(
+            "{}<ObjectBelonging>Adopted</ObjectBelonging>{}",
+            &text[..after_open],
+            &text[after_open..]
+        );
+        let name_end = patched.find("</Name>").unwrap() + "</Name>".len();
+        patched = format!(
+            "{}<ExtendedConfigurationObject>11111111-1111-4111-8111-111111111111</ExtendedConfigurationObject>{}",
+            &patched[..name_end],
+            &patched[name_end..]
+        );
+        if let Some(property) = overridden {
+            let properties = patched.find("<Properties>").unwrap();
+            patched = format!(
+                "{}<InternalInfo><xr:PropertyState><xr:Property>{property}</xr:Property><xr:State>Extended</xr:State></xr:PropertyState></InternalInfo>{}",
+                &patched[..properties],
+                &patched[properties..]
+            );
+        }
+        write(&path, &patched);
     }
 
     fn install_main_form_sources(&self, form_xml: &str, module_bsl: &str) {
@@ -3453,7 +4665,7 @@ fn review_rejects_revision_change_during_post_fence_owner_proof() {
 }
 
 #[test]
-fn cursor_retry_rejects_revision_change_during_role_canonicalization() {
+fn cursor_retry_uses_saved_role_results_without_recanonicalizing() {
     let fixture = RealReaderFixture::new();
     let rights_path = fixture.source.join("Roles/SalesReader/Ext/Rights.xml");
     let rights = fs::read_to_string(&rights_path).unwrap().replacen(
@@ -3471,13 +4683,7 @@ fn cursor_retry_rejects_revision_change_during_role_canonicalization() {
     );
     assert!(first.ok, "{:?}", first.diagnostics);
     let cursor = first.cursor.expect("two role objects require a cursor");
-    let changed_path = rights_path.clone();
-    review_set_after_canonical_role_read(move || {
-        let mut changed = fs::read_to_string(&changed_path).unwrap();
-        changed.push('\n');
-        fs::write(&changed_path, changed).unwrap();
-    });
-
+    fs::write(&rights_path, b"changed source is no longer valid XML").unwrap();
     let replay = service.view(
         ViewRequest::new("main:Role.SalesReader.Right")
             .unwrap()
@@ -3486,11 +4692,7 @@ fn cursor_retry_rejects_revision_change_during_role_canonicalization() {
             .with_cursor(cursor),
     );
 
-    assert!(
-        !replay.ok,
-        "cursor page crossed a post-canonical read mutation"
-    );
-    assert_eq!(replay.diagnostics[0]["code"], "stale_cursor");
+    assert!(replay.ok, "saved cursor must remain usable: {replay:?}");
 }
 
 #[test]
@@ -3499,10 +4701,10 @@ pub(crate) fn configuration_level_rights_are_readable_role_objects() {
     let rights_path = fixture.source.join("Roles/SalesReader/Ext/Rights.xml");
     let rights = fs::read_to_string(&rights_path).unwrap().replacen(
         "</Rights>",
-        "<object><name>Configuration.CorpusConfiguration</name><right><name>Administration</name><value>true</value></right><right><name>ThinClient</name><value>true</value></right></object></Rights>",
+        "<object><name>Configuration.CorpusConfiguration</name><right><name>Administration</name><value>true</value></right><right><name>ThinClient</name><value>true</value></right><right><name>FutureConfigurationReadCapability</name><value>true</value></right><right><name>FutureConfigurationWriteCapability</name><value>false</value></right></object></Rights>",
         1,
     );
-    fs::write(&rights_path, rights).unwrap();
+    fs::write(&rights_path, &rights).unwrap();
     let service = fixture.view_service();
 
     let role = service.view(ViewRequest::new("main:Role.SalesReader").unwrap());
@@ -3514,7 +4716,9 @@ pub(crate) fn configuration_level_rights_are_readable_role_objects() {
     let data = right.data.as_ref().unwrap();
     assert_eq!(data["kind"], "Right");
     assert_eq!(data["props"]["objectKind"], "Configuration");
-    assert_eq!(data["props"]["allowedCount"], 2);
+    assert_eq!(data["props"]["allowedCount"], 3);
+    assert_eq!(data["props"]["deniedCount"], 1);
+    assert_eq!(fs::read_to_string(&rights_path).unwrap(), rights);
 
     let authority = fixture.read_authority();
     let index = ReaderReach::new(vec![("main", &authority)]);
@@ -3985,4 +5189,822 @@ fn review_production_read_port_has_no_nocancel_inventory_entrypoint() {
         !source.contains("configuration_payload_with_checkpoint(&mut || Ok(()))"),
         "production-compiled read port retains a no-op cancellation bypass"
     );
+}
+
+#[test]
+fn diagnostic_module_scope_preserves_exact_common_module_and_catalog_roles() {
+    let fixture = RealReaderFixture::new();
+    for (role, text) in [("Object", "// object\n"), ("Manager", "// manager\n")] {
+        write(
+            &fixture
+                .source
+                .join(format!("Catalogs/Items/Ext/{role}Module.bsl")),
+            text,
+        );
+    }
+    let authority = fixture.read_authority();
+    for (at, relative) in [
+        (
+            "main:CommonModule.РеактивныйСервер",
+            "CommonModules/РеактивныйСервер/Ext/Module.bsl",
+        ),
+        (
+            "main:CommonModule.РеактивныйСервер.Body",
+            "CommonModules/РеактивныйСервер/Ext/Module.bsl",
+        ),
+        (
+            "main:Catalog.Items.Module.Object",
+            "Catalogs/Items/Ext/ObjectModule.bsl",
+        ),
+        (
+            "main:Catalog.Items.Module.Manager",
+            "Catalogs/Items/Ext/ManagerModule.bsl",
+        ),
+    ] {
+        let expected = fixture.source.join(relative);
+        let before = fs::read(&expected).unwrap();
+        let scope = authority
+            .diagnostic_mapping(&QualifiedAddress::parse(at).unwrap(), &fixture.context)
+            .map(|mapping| mapping.module_scope())
+            .unwrap();
+        assert_eq!(scope.source_set, "main", "{at}");
+        assert_eq!(scope.source_root, fixture.source, "{at}");
+        assert_eq!(scope.module_path, expected, "{at}");
+        assert_eq!(fs::read(expected).unwrap(), before, "{at}");
+    }
+}
+
+#[test]
+fn diagnostic_module_scope_refuses_foreign_source_object_and_unregistered_module() {
+    let fixture = RealReaderFixture::new();
+    write(
+        &fixture.source.join("CommonModules/Orphan/Ext/Module.bsl"),
+        "// not registered\n",
+    );
+    let authority = fixture.read_authority();
+    for at in [
+        "other:CommonModule.РеактивныйСервер",
+        "main:Catalog.Items",
+        "main:CommonModule.Orphan",
+        "main:Catalog.Missing.Module.Manager",
+    ] {
+        assert!(
+            authority
+                .diagnostic_mapping(&QualifiedAddress::parse(at).unwrap(), &fixture.context)
+                .map(|mapping| mapping.module_scope())
+                .is_err(),
+            "invented module scope for {at}"
+        );
+    }
+}
+
+#[test]
+fn diagnostic_module_scope_keeps_admitted_source_after_project_remap() {
+    let fixture = RealReaderFixture::new();
+    let authority = fixture.read_authority();
+    let at = QualifiedAddress::parse("main:CommonModule.РеактивныйСервер.Body").unwrap();
+    let admitted = authority
+        .diagnostic_mapping(&at, &fixture.context)
+        .map(|mapping| mapping.module_scope())
+        .unwrap();
+    let replacement = fixture.root.path().join("replacement");
+    write(
+        &replacement.join("CommonModules/РеактивныйСервер/Ext/Module.bsl"),
+        "// replacement only\n",
+    );
+    fs::write(fixture.root.path().join("v8project.yaml"), "format: DESIGNER\nsource-set:\n  - name: main\n    type: CONFIGURATION\n    path: replacement\n").unwrap();
+    let retained = authority
+        .diagnostic_mapping(&at, &fixture.context)
+        .map(|mapping| mapping.module_scope())
+        .unwrap();
+    assert_eq!(retained.source_root, admitted.source_root);
+    assert_eq!(retained.module_path, admitted.module_path);
+    assert_ne!(retained.source_root, replacement);
+}
+
+#[test]
+fn diagnostic_module_scope_refuses_replaced_retained_root() {
+    if !supports_retained_root_replacement_test() {
+        return;
+    }
+    let fixture = RealReaderFixture::new();
+    let authority = fixture.operation_read_authority();
+    let at = QualifiedAddress::parse("main:CommonModule.РеактивныйСервер").unwrap();
+    assert!(authority
+        .diagnostic_mapping(&at, &fixture.context)
+        .map(|mapping| mapping.module_scope())
+        .is_ok());
+    fs::rename(&fixture.source, fixture.root.path().join("saved-source")).unwrap();
+    fs::create_dir(&fixture.source).unwrap();
+    assert!(authority
+        .diagnostic_mapping(&at, &fixture.context)
+        .map(|mapping| mapping.module_scope())
+        .is_err());
+}
+
+#[test]
+fn diagnostic_module_scope_refuses_module_replaced_by_foreign_symlink() {
+    use crate::infrastructure::platform::testing::{
+        create_file_link_fixture_for_test, FileLinkFixtureOutcome,
+    };
+    let fixture = RealReaderFixture::new();
+    let authority = fixture.read_authority();
+    let at = QualifiedAddress::parse("main:CommonModule.РеактивныйСервер").unwrap();
+    let module = authority
+        .diagnostic_mapping(&at, &fixture.context)
+        .map(|mapping| mapping.module_scope())
+        .unwrap()
+        .module_path;
+    let foreign = fixture.root.path().join("foreign.bsl");
+    fs::write(&foreign, "// foreign module\n").unwrap();
+    fs::remove_file(&module).unwrap();
+    let outcome = create_file_link_fixture_for_test(&foreign, &module)
+        .expect("unexpected file-link creation error must fail the fixture test");
+    if outcome != FileLinkFixtureOutcome::Created {
+        eprintln!("[SKIPPED FIXTURE] file-link fixture unavailable: {outcome:?}");
+        return;
+    }
+    assert!(authority
+        .diagnostic_mapping(&at, &fixture.context)
+        .map(|mapping| mapping.module_scope())
+        .is_err());
+    assert_eq!(fs::read_to_string(foreign).unwrap(), "// foreign module\n");
+}
+
+mod canonical_module_diagnostics {
+    use super::*;
+    use crate::application::diagnostics::{DiagnosticCoordinator, DiagnosticMapping};
+    use crate::domain::diagnostics::*;
+    use crate::domain::source_location::SourceLocation;
+    use crate::domain::source_target::TargetKind;
+    use crate::infrastructure::diagnostics::CanonicalModuleDiagnosticMapping;
+    use std::time::Duration;
+
+    fn request(mapping: &CanonicalModuleDiagnosticMapping) -> DiagnosticRequest {
+        DiagnosticRequest {
+            action: DiagnosticAction::Analyze,
+            source_set: mapping.target().source_set.clone(),
+            metadata_path: mapping.target().metadata_path.clone(),
+            filter: DiagnosticFilter::default(),
+            range: None,
+            limit: 200,
+            timeout: Some(Duration::from_secs(5)),
+        }
+    }
+
+    fn finding(path: &Path, code: &str) -> DiagnosticObservation {
+        DiagnosticObservation::Diagnostic {
+            provider: BSL_ANALYZER_PROVIDER,
+            location: DiagnosticObservationLocation::Resource {
+                handle: path.to_string_lossy().into_owned(),
+            },
+            focus: DiagnosticObservationFocus::Target,
+            code: code.into(),
+            severity: DiagnosticSeverity::Error,
+            message: "fixture finding".into(),
+            tags: Vec::new(),
+        }
+    }
+
+    fn assert_mapping(
+        authority: &LogicalViewReadAuthority<'_>,
+        workspace: &WorkspaceContext,
+        at: &str,
+        expected: &str,
+        physical: &Path,
+    ) {
+        let mapping = authority
+            .diagnostic_mapping(&QualifiedAddress::parse(at).unwrap(), workspace)
+            .unwrap_or_else(|error| panic!("{at}: {error:?}"));
+        let target = MetadataAddress::parse(PLATFORM_XML_8_3_27_FORMAT_2_20, expected).unwrap();
+        assert_eq!(mapping.target().metadata_path.as_ref(), Some(&target));
+        assert_eq!(mapping.target().target_kind, TargetKind::Module);
+        let cancellation = CancellationToken::new();
+        let context = mapping
+            .resolve_context(&request(&mapping), workspace, &cancellation)
+            .unwrap();
+        let item = mapping
+            .map_observation(finding(physical, "Requested"), &context, &cancellation)
+            .unwrap();
+        assert!(
+            matches!(item, DiagnosticItem::Diagnostic {
+            location: SourceLocation::Addressed { metadata_path: Some(path), target_kind: TargetKind::Module, .. }, ..
+        } if path == target),
+            "{at}: provider resource must map to proved module"
+        );
+    }
+
+    #[test]
+    fn external_object_form_and_body_use_proven_canonical_modules() {
+        let fixture = RealExternalReaderFixture::new();
+        for (set, kind, class, name, root) in [
+            (
+                "artifact_processor",
+                SourceSetKind::ExternalProcessor,
+                "ExternalDataProcessor",
+                "Import",
+                &fixture.processor,
+            ),
+            (
+                "artifact_report",
+                SourceSetKind::ExternalReport,
+                "ExternalReport",
+                "Sales",
+                &fixture.report,
+            ),
+        ] {
+            let form = root.join(format!("{name}/Forms/Main/Ext/Form/Module.bsl"));
+            write(&form, "Procedure OnOpen()\nEndProcedure\n");
+            let authority = fixture.operation_read_authority(set, kind);
+            for tail in ["", ".Body"] {
+                assert_mapping(
+                    &authority,
+                    &fixture.context,
+                    &format!("{set}:{class}.{name}.Module.Object{tail}"),
+                    &format!("{class}.{name}.ObjectModule"),
+                    &root.join(format!("{name}/Ext/ObjectModule.bsl")),
+                );
+                assert_mapping(
+                    &authority,
+                    &fixture.context,
+                    &format!("{set}:{class}.{name}.Form.Main.Module.Form{tail}"),
+                    &format!("{class}.{name}.Form.Main.FormModule"),
+                    &form,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn configuration_common_object_and_form_modules_keep_exact_diagnostic_targets() {
+        let fixture = RealReaderFixture::new();
+        write(
+            &fixture.source.join("Catalogs/Items/Ext/ObjectModule.bsl"),
+            "Procedure Run()\nEndProcedure\n",
+        );
+        write(
+            &fixture.source.join("Catalogs/Items/Ext/ManagerModule.bsl"),
+            "Procedure Manage()\nEndProcedure\n",
+        );
+        for authority in [
+            fixture.operation_read_authority(),
+            fixture.extension_read_authority(),
+        ] {
+            for (at, expected, relative) in [
+                (
+                    "CommonModule.РеактивныйСервер",
+                    "CommonModule.РеактивныйСервер.Module",
+                    "CommonModules/РеактивныйСервер/Ext/Module.bsl",
+                ),
+                (
+                    "Catalog.Items.Module.Object",
+                    "Catalog.Items.ObjectModule",
+                    "Catalogs/Items/Ext/ObjectModule.bsl",
+                ),
+                (
+                    "Catalog.Items.Module.Manager",
+                    "Catalog.Items.ManagerModule",
+                    "Catalogs/Items/Ext/ManagerModule.bsl",
+                ),
+                (
+                    "Report.ParityReport.Form.MainForm.Module.Form",
+                    "Report.ParityReport.Form.MainForm.FormModule",
+                    "Reports/ParityReport/Forms/MainForm/Ext/Form/Module.bsl",
+                ),
+            ] {
+                for tail in ["", ".Body"] {
+                    assert_mapping(
+                        &authority,
+                        &fixture.context,
+                        &format!("main:{at}{tail}"),
+                        expected,
+                        &fixture.source.join(relative),
+                    );
+                }
+            }
+        }
+    }
+
+    struct AnalysisFixture(DiagnosticProviderOutcome);
+
+    impl DiagnosticProvider for AnalysisFixture {
+        fn descriptor(&self) -> &'static DiagnosticProviderDescriptor {
+            static DESCRIPTOR: DiagnosticProviderDescriptor = DiagnosticProviderDescriptor {
+                id: BSL_ANALYZER_PROVIDER,
+                actions: &[DiagnosticAction::Analyze],
+                findings_target_kinds: &[TargetKind::Module],
+                emits_focus_kinds: &[DiagnosticFocusKind::Target],
+            };
+            &DESCRIPTOR
+        }
+        fn execute(
+            &self,
+            request: &DiagnosticProviderRequest,
+            context: &DiagnosticContext,
+            _deadline: ProviderDeadline,
+            _cancellation: &CancellationToken,
+        ) -> DiagnosticProviderOutcome {
+            assert_eq!(request.action, DiagnosticAction::Analyze);
+            assert_eq!(context.target.target_kind, TargetKind::Module);
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn analyze_filters_neighbors_after_mapping_but_keeps_outside_and_incomplete_failures() {
+        let fixture = RealExternalReaderFixture::new();
+        let authority = fixture
+            .operation_read_authority("artifact_processor", SourceSetKind::ExternalProcessor);
+        let mapping = authority
+            .diagnostic_mapping(
+                &QualifiedAddress::parse(
+                    "artifact_processor:ExternalDataProcessor.Import.Module.Object",
+                )
+                .unwrap(),
+                &fixture.context,
+            )
+            .unwrap();
+        let selected = fixture.processor.join("Import/Ext/ObjectModule.bsl");
+        let neighbor = fixture.processor.join("Импорт/Ext/ObjectModule.bsl");
+        for scenario in [
+            "neighbor",
+            "outside",
+            "incomplete",
+            "neighbor_only",
+            "incomplete_empty",
+        ] {
+            let mut observations = vec![
+                finding(&selected, "Selected"),
+                finding(&neighbor, "Neighbor"),
+            ];
+            if scenario == "neighbor_only" {
+                observations = vec![finding(&neighbor, "Neighbor")];
+            } else if scenario == "incomplete_empty" {
+                observations.clear();
+            }
+            let complete = !matches!(scenario, "incomplete" | "incomplete_empty");
+            if scenario == "outside" {
+                observations.push(finding(
+                    &fixture.report.join("Sales/Ext/ObjectModule.bsl"),
+                    "Outside",
+                ));
+            }
+            let outcome = DiagnosticProviderOutcome {
+                status: DiagnosticProviderStatus::Completed,
+                complete,
+                version: None,
+                observations,
+                rules: Vec::new(),
+                readiness: None,
+                error: None,
+            };
+            let registry =
+                DiagnosticProviderRegistry::new(vec![Arc::new(AnalysisFixture(outcome))]).unwrap();
+            let result = DiagnosticCoordinator::new(registry, &mapping)
+                .execute(&request(&mapping), &fixture.context, &fixture.cancellation)
+                .unwrap();
+            if scenario == "outside" {
+                assert!(!result.ok);
+                assert!(!result.complete);
+                assert_eq!(result.providers[0].status, DiagnosticProviderStatus::Failed);
+                assert!(
+                    result.items.is_empty(),
+                    "outside resource must poison the whole provider before filtering"
+                );
+            } else {
+                let has_selected = !matches!(scenario, "neighbor_only" | "incomplete_empty");
+                assert_eq!(
+                    result.items.len(),
+                    usize::from(has_selected),
+                    "{scenario}: only selected module findings may remain"
+                );
+                if has_selected {
+                    assert!(
+                        matches!(&result.items[0], DiagnosticItem::Diagnostic { code, .. } if code == "Selected")
+                    );
+                }
+                assert_eq!(result.complete, complete);
+                assert_eq!(
+                    result.state,
+                    if !complete {
+                        DiagnosticResultState::Partial
+                    } else {
+                        DiagnosticResultState::Completed
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_mapping_refuses_an_unregistered_form_even_with_a_module_file() {
+        let fixture = RealExternalReaderFixture::new();
+        write(
+            &fixture.processor.join("Import/Forms/Orphan.xml"),
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Form><Properties><Name>Orphan</Name></Properties></Form></MetaDataObject>"#,
+        );
+        write(
+            &fixture
+                .processor
+                .join("Import/Forms/Orphan/Ext/Form/Module.bsl"),
+            "Procedure Run()\nEndProcedure\n",
+        );
+        let authority = fixture
+            .operation_read_authority("artifact_processor", SourceSetKind::ExternalProcessor);
+        let error = authority
+            .diagnostic_mapping(
+                &QualifiedAddress::parse(
+                    "artifact_processor:ExternalDataProcessor.Import.Form.Orphan.Module.Form",
+                )
+                .unwrap(),
+                &fixture.context,
+            )
+            .err()
+            .expect("orphan form must not acquire diagnostic authority");
+        assert_eq!(error.code(), RefusalCode::NotFound);
+    }
+    #[test]
+    fn diagnostic_mapping_refuses_replacement_of_its_retained_source_root() {
+        if !supports_retained_root_replacement_test() {
+            return;
+        }
+        let fixture = RealReaderFixture::new();
+        let authority = fixture.operation_read_authority();
+        let saved = fixture.root.path().join("retained-a");
+        fs::rename(&fixture.source, &saved).unwrap();
+        fs::create_dir_all(&fixture.source).unwrap();
+        fs::copy(
+            saved.join("Configuration.xml"),
+            fixture.source.join("Configuration.xml"),
+        )
+        .unwrap();
+        let error = authority
+            .diagnostic_mapping(
+                &QualifiedAddress::parse("main:CommonModule.РеактивныйСервер").unwrap(),
+                &fixture.context,
+            )
+            .err()
+            .expect("changed named root must not acquire diagnostic authority");
+        assert_eq!(error.code(), RefusalCode::ProviderUnavailable);
+    }
+}
+
+#[test]
+fn dcs_validation_input_keeps_the_authority_cancellation_and_deadline() {
+    let fixture = RealReaderFixture::new();
+    let address = QualifiedAddress::parse("main:Report.ParityReport.Template.MainSchema").unwrap();
+    let mut authority = fixture.read_authority();
+    authority.deadline = ProviderDeadline::from_budget(std::time::Duration::ZERO);
+    assert_eq!(
+        authority
+            .dcs_validation_input(&address)
+            .err()
+            .unwrap()
+            .code(),
+        RefusalCode::DeadlineExceeded
+    );
+    let authority = fixture.read_authority();
+    fixture.cancellation.cancel();
+    assert_eq!(
+        authority
+            .dcs_validation_input(&address)
+            .err()
+            .unwrap()
+            .code(),
+        RefusalCode::Cancelled
+    );
+}
+
+#[test]
+fn canonical_dcs_validation_keeps_captured_format_evidence_after_replacement() {
+    let fixture = RealReaderFixture::new();
+    let address = QualifiedAddress::parse("main:Report.ParityReport.Template.MainSchema").unwrap();
+    let authority = fixture.read_authority();
+    let input = authority.dcs_validation_input(&address).unwrap();
+    let wrapper = fixture
+        .source
+        .join("Reports/ParityReport/Templates/MainSchema.xml");
+    let original = fs::read_to_string(&wrapper).unwrap();
+    fs::write(&wrapper, original.replace("2.20", "2.21")).unwrap();
+    fs::write(&input.artifact, "not XML: a later writer owns these bytes").unwrap();
+    let checked = crate::application::v13::check::normalize_native_outcome(
+        &address,
+        "Template",
+        crate::application::v13::check::CheckValidator::Dcs,
+        crate::infrastructure::native_operations::v13_analysis::validate_dcs_input(input),
+    )
+    .unwrap();
+    assert!(
+        checked.diagnostics().iter().all(|diagnostic| !matches!(
+            diagnostic.code(),
+            "formatVersionInvalid" | "platformVersionUnsupported"
+        )),
+        "format diagnostics must describe the captured input: {:?}",
+        checked.diagnostics()
+    );
+}
+
+#[test]
+fn canonical_dcs_validation_keeps_captured_owner_format_warnings() {
+    for relative in ["Configuration.xml"] {
+        for (version, expected) in [
+            ("2.21", "platformVersionUnsupported"),
+            ("2.19", "formatMigrationAvailable"),
+            ("2.&#50;0", "formatVersionInvalid"),
+        ] {
+            let fixture = RealReaderFixture::new();
+            let owner = fixture.source.join(relative);
+            let original = fs::read_to_string(&owner).unwrap();
+            fs::write(&owner, original.replace("2.20", version)).unwrap();
+            let address =
+                QualifiedAddress::parse("main:Report.ParityReport.Template.MainSchema").unwrap();
+            let captured = fixture.read_authority().dcs_validation_input(&address);
+            let input = captured.unwrap();
+            fs::write(&owner, original).unwrap();
+            let checked = crate::application::v13::check::normalize_native_outcome(
+                &address,
+                "Template",
+                crate::application::v13::check::CheckValidator::Dcs,
+                crate::infrastructure::native_operations::v13_analysis::validate_dcs_input(input),
+            )
+            .unwrap();
+            assert_eq!(
+                checked.diagnostics()[0].code(),
+                expected,
+                "{relative}: {version}"
+            );
+        }
+    }
+
+    let fixture = RealExternalReaderFixture::new();
+    let template_owner = fixture_text(
+        "unica_mcp_script_parity/template-remove/ParityReport/Templates/MainSchema.xml",
+    );
+    let dcs = fixture_text("unica_mcp_script_parity/dcs-validate/BadPrefix.xml").replace(
+        "xmlns:bad=\"http://example.com\">bad:CatalogRef.X",
+        ">xs:string",
+    );
+    for (source_set, kind, object_kind, name, source) in [
+        (
+            "artifact_report",
+            SourceSetKind::ExternalReport,
+            "ExternalReport",
+            "Sales",
+            &fixture.report,
+        ),
+        (
+            "artifact_processor",
+            SourceSetKind::ExternalProcessor,
+            "ExternalDataProcessor",
+            "Import",
+            &fixture.processor,
+        ),
+    ] {
+        let owner = source.join(format!("{name}.xml"));
+        let original = fs::read_to_string(&owner).unwrap().replace(
+            "</ChildObjects>",
+            "<Template>MainSchema</Template></ChildObjects>",
+        );
+        write(
+            &source.join(format!("{name}/Templates/MainSchema.xml")),
+            &template_owner,
+        );
+        write(
+            &source.join(format!("{name}/Templates/MainSchema/Ext/Template.xml")),
+            &dcs,
+        );
+        // Only the external root has the older format; its Template stays 2.20.
+        fs::write(
+            &owner,
+            original.replace("version=\"2.20\"", "version=\"2.19\""),
+        )
+        .unwrap();
+        let address = QualifiedAddress::parse(&format!(
+            "{source_set}:{object_kind}.{name}.Template.MainSchema"
+        ))
+        .unwrap();
+        let input = fixture
+            .read_authority(source_set, kind)
+            .dcs_validation_input(&address)
+            .unwrap();
+        fs::write(&owner, &original).unwrap();
+        let checked = crate::application::v13::check::normalize_native_outcome(
+            &address,
+            "Template",
+            crate::application::v13::check::CheckValidator::Dcs,
+            crate::infrastructure::native_operations::v13_analysis::validate_dcs_input(input),
+        )
+        .unwrap();
+        assert_eq!(
+            checked.diagnostics()[0].code(),
+            "formatMigrationAvailable",
+            "{source_set}: restored owner bytes must not replace captured format evidence"
+        );
+        assert_eq!(fs::read_to_string(&owner).unwrap(), original);
+    }
+}
+
+#[test]
+fn canonical_dcs_validation_does_not_follow_links_after_input_capture() {
+    use crate::infrastructure::platform::testing::{
+        create_file_link_fixture_for_test, FileLinkFixtureOutcome,
+    };
+
+    let fixture = RealReaderFixture::new();
+    let address = QualifiedAddress::parse("main:Report.ParityReport.Template.MainSchema").unwrap();
+    let input = fixture
+        .read_authority()
+        .dcs_validation_input(&address)
+        .unwrap();
+    let outside = fixture.root.path().join("foreign.xml");
+    fs::write(&outside, "not XML: foreign input must never participate").unwrap();
+    for path in [
+        input.artifact.clone(),
+        fixture.source.join("Configuration.xml"),
+        fixture
+            .source
+            .join("Reports/ParityReport/Templates/MainSchema.xml"),
+    ] {
+        fs::remove_file(&path).unwrap();
+        let outcome = create_file_link_fixture_for_test(&outside, &path)
+            .expect("unexpected file-link creation error must fail the fixture test");
+        if outcome != FileLinkFixtureOutcome::Created {
+            eprintln!("[SKIPPED FIXTURE] file-link fixture unavailable: {outcome:?}");
+            return;
+        }
+    }
+    let checked = crate::application::v13::check::normalize_native_outcome(
+        &address,
+        "Template",
+        crate::application::v13::check::CheckValidator::Dcs,
+        crate::infrastructure::native_operations::v13_analysis::validate_dcs_input(input),
+    )
+    .unwrap();
+    assert!(checked
+        .diagnostics()
+        .iter()
+        .all(|diagnostic| diagnostic.code() != "formatVersionInvalid"));
+    assert_eq!(
+        fs::read_to_string(outside).unwrap(),
+        "not XML: foreign input must never participate"
+    );
+}
+
+#[test]
+fn canonical_dcs_validation_refuses_linked_format_owners_before_capture() {
+    use crate::infrastructure::platform::testing::{
+        create_file_link_fixture_for_test, FileLinkFixtureOutcome,
+    };
+
+    for relative in [
+        "Configuration.xml",
+        "Reports/ParityReport/Templates/MainSchema.xml",
+    ] {
+        let fixture = RealReaderFixture::new();
+        let owner = fixture.source.join(relative);
+        let outside = fixture.root.path().join("foreign.xml");
+        fs::rename(&owner, &outside).unwrap();
+        let outcome = create_file_link_fixture_for_test(&outside, &owner)
+            .expect("unexpected file-link creation error must fail the fixture test");
+        if outcome != FileLinkFixtureOutcome::Created {
+            eprintln!("[SKIPPED FIXTURE] file-link fixture unavailable: {outcome:?}");
+            return;
+        }
+        let address =
+            QualifiedAddress::parse("main:Report.ParityReport.Template.MainSchema").unwrap();
+        assert!(
+            fixture
+                .read_authority()
+                .dcs_validation_input(&address)
+                .is_err(),
+            "{relative}"
+        );
+    }
+}
+
+#[test]
+fn canonical_dcs_validation_keeps_large_configuration_owner_format_warning() {
+    let fixture = RealReaderFixture::new();
+    let path = fixture.source.join("Configuration.xml");
+    let xml = fs::read_to_string(&path).unwrap().replace("2.20", "2.21");
+    fs::write(
+        &path,
+        xml.replace(
+            "</MetaDataObject>",
+            &format!("<!--{}--></MetaDataObject>", "x".repeat(8 * 1024 * 1024)),
+        ),
+    )
+    .unwrap();
+    let address = QualifiedAddress::parse("main:Report.ParityReport.Template.MainSchema").unwrap();
+    let input = fixture
+        .read_authority()
+        .dcs_validation_input(&address)
+        .unwrap();
+    let checked = crate::application::v13::check::normalize_native_outcome(
+        &address,
+        "Template",
+        crate::application::v13::check::CheckValidator::Dcs,
+        crate::infrastructure::native_operations::v13_analysis::validate_dcs_input(input),
+    )
+    .unwrap();
+    assert_eq!(
+        checked.diagnostics()[0].code(),
+        "platformVersionUnsupported"
+    );
+}
+
+#[test]
+fn canonical_dcs_validation_keeps_exact_versionless_dcs_root_guard() {
+    let fixture = RealReaderFixture::new();
+    let artifact = fixture
+        .source
+        .join("Reports/ParityReport/Templates/MainSchema/Ext/Template.xml");
+    fs::write(&artifact, r#"<DataCompositionSchema xmlns="http://v8.1c.ru/8.1/data-composition-system/schema" version="2.20"/>"#).unwrap();
+    let address = QualifiedAddress::parse("main:Report.ParityReport.Template.MainSchema").unwrap();
+    let input = fixture
+        .read_authority()
+        .dcs_validation_input(&address)
+        .unwrap();
+    let checked = crate::application::v13::check::normalize_native_outcome(
+        &address,
+        "Template",
+        crate::application::v13::check::CheckValidator::Dcs,
+        crate::infrastructure::native_operations::v13_analysis::validate_dcs_input(input),
+    )
+    .unwrap();
+    assert!(
+        checked
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "formatVersionInvalid"),
+        "versionless DCS publication policy must survive the retained-input bridge"
+    );
+}
+
+#[test]
+fn canonical_dcs_validation_preserves_typed_template_profile_refusal() {
+    for version in ["2.19", "2.21"] {
+        let fixture = RealReaderFixture::new();
+        let owner = fixture
+            .source
+            .join("Reports/ParityReport/Templates/MainSchema.xml");
+        let original = fs::read_to_string(&owner).unwrap();
+        fs::write(&owner, original.replace("2.20", version)).unwrap();
+        let address =
+            QualifiedAddress::parse("main:Report.ParityReport.Template.MainSchema").unwrap();
+        let error = fixture
+            .read_authority()
+            .dcs_validation_input(&address)
+            .err()
+            .unwrap();
+        assert_eq!(error.detail(), Some(RefusalDetail::SourceUnreadable));
+    }
+}
+
+#[test]
+fn canonical_dcs_format_owner_read_stops_at_typed_midstream_checkpoint() {
+    for code in [RefusalCode::Cancelled, RefusalCode::DeadlineExceeded] {
+        let fixture = RealReaderFixture::new();
+        let owner = fixture.source.join("Configuration.xml");
+        let original = fs::read_to_string(&owner).unwrap();
+        fs::write(
+            &owner,
+            original.replace(
+                "</MetaDataObject>",
+                &format!("<!--{}--></MetaDataObject>", "x".repeat(256 * 1024)),
+            ),
+        )
+        .unwrap();
+        let authority = fixture.read_authority();
+        let target = crate::domain::source_target::MetadataAddress::parse(
+            crate::domain::source_target::PLATFORM_XML_8_3_27_FORMAT_2_20,
+            "Report.ParityReport.Template.MainSchema",
+        )
+        .unwrap();
+        let mut checkpoints = 0;
+        let error = authority
+            .read
+            .dcs_validation_input(&target, &mut || {
+                checkpoints += 1;
+                if checkpoints == 2 {
+                    Err(ViewError::new(
+                        code,
+                        "interrupted after the first owner chunk",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), code);
+        assert_eq!(checkpoints, 2, "read must stop at the rejecting checkpoint");
+        assert!(
+            authority
+                .read
+                .dcs_validation_input(&target, &mut || Ok(()))
+                .is_ok(),
+            "partial capture must not be published or cached"
+        );
+    }
 }

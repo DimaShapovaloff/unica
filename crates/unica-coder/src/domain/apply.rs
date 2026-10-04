@@ -86,6 +86,25 @@ impl ApplyRequest {
                     "operation target must be the same logical node or its descendant in the top-level source set",
                 ));
             }
+            if name == "object.borrow" {
+                let location = format!("{args_location}.from");
+                let raw = args.get("from").and_then(Value::as_str).ok_or_else(|| {
+                    ApplyValidationError::bad_value(
+                        &location,
+                        "from must be an explicitly qualified parent object address",
+                    )
+                })?;
+                let parent = QualifiedAddress::parse(raw).map_err(|error| {
+                    ApplyValidationError::bad_value(&location, error.to_string())
+                })?;
+                if !available_source_sets.contains(&parent.source_set())
+                    || parent.source_set() == at.source_set()
+                    || parent.segments().len() != 1
+                    || parent.segments()[0].name().is_none()
+                {
+                    return Err(ApplyValidationError::bad_value(&location, "from must name a top-level object in a distinct admitted parent source set"));
+                }
+            }
             args.insert("at".to_string(), Value::String(operation_at.to_string()));
             operations.push(ApplyOp {
                 name,
@@ -114,6 +133,19 @@ impl ApplyRequest {
                 ))
             }
         };
+        // Забор ревизии обязателен при применении.
+        //
+        // Без него два плана, построенных на одной ревизии, публикуются оба, и
+        // второй молча уничтожает правку первого: замер показал потерю записи
+        // без единой диагностики. Предпросмотр при этом забора не требует —
+        // ему нечего защищать, — и словарь `run` держит ровно это правило с
+        // самого начала; у `apply` оно было только в прозе скиллов.
+        if !dry_run && if_rev.is_none() {
+            return Err(ApplyValidationError::bad_value(
+                "ifRev",
+                "apply requires ifRev from a prior dryRun preview",
+            ));
+        }
         Ok(Self {
             at,
             ops: NonEmptyVec::new(operations)
@@ -229,6 +261,9 @@ pub(crate) enum OperationFamily {
     Mxl,
     Xdto,
     Subsystem,
+    /// Командный интерфейс: видимость, размещение и порядок. Предмет не сам
+    /// объект, а место, которое подсистема ему отводит.
+    Interface,
     Support,
     Code,
     Event,
@@ -236,6 +271,7 @@ pub(crate) enum OperationFamily {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OperationApplicability {
+    Configuration,
     Metadata,
     MetadataOrSubsystem,
     MetadataAttributes,
@@ -256,6 +292,8 @@ enum OperationApplicability {
     Mxl,
     Xdto,
     Subsystem,
+    Interface,
+    InterfaceOrRoot,
     Support,
     Code,
     Event,
@@ -265,6 +303,7 @@ impl OperationApplicability {
     fn matches(self, kind: NodeKind) -> bool {
         let metadata = kind.is_metadata_kind() || kind == NodeKind::Configuration;
         match self {
+            Self::Configuration => kind == NodeKind::Configuration,
             Self::Metadata => metadata,
             Self::MetadataOrSubsystem => metadata || kind == NodeKind::Subsystem,
             Self::MetadataAttributes => {
@@ -309,6 +348,11 @@ impl OperationApplicability {
                 NodeKind::XdtoPackage | NodeKind::Namespace | NodeKind::Type | NodeKind::Property
             ),
             Self::Subsystem => matches!(kind, NodeKind::Configuration | NodeKind::Subsystem),
+            Self::Interface => kind == NodeKind::Interface,
+            // Порядок подсистем верхнего уровня живёт в корневом документе, а
+            // маршрута `main:Interface` намеренно нет: корень описывается
+            // свойством, а не узлом.
+            Self::InterfaceOrRoot => matches!(kind, NodeKind::Interface | NodeKind::Configuration),
             Self::Support => metadata || kind == NodeKind::Subsystem,
             // A common module is its own module terminal: the read projection
             // already shows it as kind `Module`, and the code planner writes it
@@ -354,6 +398,7 @@ pub(crate) struct OperationDescriptor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OperationSkeleton {
+    From,
     Items,
     Values,
     Text,
@@ -365,6 +410,7 @@ impl OperationSkeleton {
     /// `can` dictionary and refusal texts both speak this name.
     pub(crate) const fn key(self) -> &'static str {
         match self {
+            Self::From => "from",
             Self::Items => "items",
             Self::Values => "values",
             Self::Text => "text",
@@ -374,6 +420,7 @@ impl OperationSkeleton {
 
     fn args(self) -> Map<String, Value> {
         let value = match self {
+            Self::From => Value::String(String::new()),
             Self::Items => Value::Array(Vec::new()),
             Self::Values => Value::Object(Map::new()),
             Self::Text => Value::String(String::new()),
@@ -387,6 +434,12 @@ impl OperationSkeleton {
 /// The `can` dictionary prints this as `implemented`, mirroring the honesty
 /// rule of the Run dictionary: a name in the registry is not support.
 pub(crate) const IMPLEMENTED_APPLY_OPERATIONS: &[&str] = &[
+    "object.borrow",
+    "commandVisibility.set",
+    "commandPlacement.set",
+    "commandOrder.set",
+    "groupOrder.set",
+    "subsystemOrder.set",
     "mxl.set",
     "event.implement",
     "form.add",
@@ -529,6 +582,7 @@ macro_rules! operation_descriptors {
 }
 
 operation_descriptors!(
+    ("object.borrow", Metadata, Configuration, From),
     ("object.create", Metadata, Metadata, Values),
     ("object.remove", Metadata, Metadata, Target),
     ("props.set", Properties, MetadataOrSubsystem, Values),
@@ -652,6 +706,11 @@ operation_descriptors!(
     ("childSubsystem.remove", Subsystem, Subsystem, Target),
     ("supportCapability.set", Support, Support, Values),
     ("supportRule.set", Support, Support, Values),
+    ("commandVisibility.set", Interface, Interface, Items),
+    ("commandPlacement.set", Interface, Interface, Items),
+    ("commandOrder.set", Interface, Interface, Values),
+    ("groupOrder.set", Interface, Interface, Values),
+    ("subsystemOrder.set", Interface, InterfaceOrRoot, Values),
     ("code.insert", Code, Code, Text),
     ("code.replace", Code, Code, Text),
     ("event.implement", Event, Event, Target),
@@ -720,6 +779,19 @@ mod tests {
             value.as_object().expect("apply fixture must be an object"),
             &["main", "extension"],
         )
+    }
+
+    #[test]
+    fn object_borrow_is_available_only_at_the_configuration_root() {
+        let descriptor = OperationRegistry::closed()
+            .lookup("object.borrow")
+            .expect("canonical top-level borrowing must be registered");
+        assert!(descriptor.applies_to_operation_target(
+            &crate::domain::address::QualifiedAddress::parse("extension:Configuration").unwrap()
+        ));
+        assert!(!descriptor.applies_to_operation_target(
+            &crate::domain::address::QualifiedAddress::parse("extension:Catalog.Products").unwrap()
+        ));
     }
 
     #[test]
@@ -808,6 +880,7 @@ mod tests {
     #[test]
     fn operation_registry_is_exact_closed_unique_and_drives_skeletons_and_dispatch() {
         let expected = [
+            "object.borrow",
             "object.create",
             "object.remove",
             "props.set",
@@ -901,12 +974,17 @@ mod tests {
             "childSubsystem.remove",
             "supportCapability.set",
             "supportRule.set",
+            "commandVisibility.set",
+            "commandPlacement.set",
+            "commandOrder.set",
+            "groupOrder.set",
+            "subsystemOrder.set",
             "code.insert",
             "code.replace",
             "event.implement",
         ];
         let registry = OperationRegistry::closed();
-        assert_eq!(expected.len(), 96);
+        assert_eq!(expected.len(), 102);
         assert_eq!(registry.names(), expected);
         let mut unique = registry.names().to_vec();
         unique.sort_unstable();

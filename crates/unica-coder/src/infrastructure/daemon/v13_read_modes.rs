@@ -1,3 +1,4 @@
+use super::v13_call_graph::CALL_GRAPH_SECTION;
 use crate::domain::address::{NodeKind, QualifiedAddress};
 use crate::domain::apply::{OperationRegistry, IMPLEMENTED_APPLY_OPERATIONS};
 use crate::domain::refusal::RefusalCode;
@@ -62,23 +63,36 @@ pub(crate) enum SearchMatcher {
 }
 
 impl SearchMatcher {
-    pub(super) fn match_starts(&self, line: &str) -> Vec<usize> {
+    pub(super) fn match_starts<'a>(
+        &'a self,
+        line: &'a str,
+    ) -> Box<dyn Iterator<Item = usize> + 'a> {
         match self {
-            Self::Literal(needle) => line
-                .match_indices(needle.as_str())
-                .map(|(start, _)| start)
-                .collect(),
-            Self::Regex(pattern) => pattern
-                .find_iter(line)
-                .filter(|found| !found.is_empty())
-                .map(|found| found.start())
-                .collect(),
+            Self::Literal(needle) => {
+                Box::new(line.match_indices(needle.as_str()).map(|(start, _)| start))
+            }
+            Self::Regex(pattern) => Box::new(
+                pattern
+                    .find_iter(line)
+                    .filter(|found| !found.is_empty())
+                    .map(|found| found.start()),
+            ),
         }
     }
 }
 
 const VIEW_IDENTITY_SLOTS: &[&str] = &["at", "kind", "title"];
-const VIEW_SECTION_SLOTS: &[&str] = &["props", "branches", "can", "limits", "items"];
+const VIEW_SECTION_SLOTS: &[&str] = &[
+    "props",
+    "branches",
+    "can",
+    "limits",
+    "items",
+    // `callGraph` — не слот узла, а выключатель вычисления: слотов у узла семь,
+    // и восьмого не будет. Сводка графа ложится в `props`, направления — в
+    // `branches`, поэтому запрос этой секции удерживает оба слота.
+    "callGraph",
+];
 
 /// The operation dictionary of a node, computed from the one closed registry
 /// that also validates `apply` calls: registry × applicability to the node
@@ -131,6 +145,14 @@ pub(super) fn project_view_sections(
                 "unsupported view section `{section}`"
             )));
         }
+        if section == CALL_GRAPH_SECTION {
+            for implied in ["props", "branches"] {
+                if !selected.contains(&implied) {
+                    selected.push(implied);
+                }
+            }
+            continue;
+        }
         if !selected.contains(&section) {
             selected.push(section);
         }
@@ -167,6 +189,37 @@ pub(super) fn project_view_sections(
         }
     }
     Ok(Value::Object(projected))
+}
+
+#[cfg(test)]
+mod call_graph_section_tests {
+    use super::{project_view_sections, VIEW_SECTION_SLOTS};
+    use serde_json::json;
+
+    /// `callGraph` — выключатель вычисления, а не восьмой слот узла.
+    ///
+    /// У узла ровно семь слотов, и запрос этой секции удерживает те два, в
+    /// которые сводка легла: `props` и `branches`.
+    #[test]
+    fn the_call_graph_section_keeps_the_two_slots_it_fills() {
+        assert!(VIEW_SECTION_SLOTS.contains(&"callGraph"));
+        let data = json!({
+            "at": "main:CommonModule.Общий.Method.Утилита",
+            "kind": "Method",
+            "title": "Утилита",
+            "props": {"callGraph": "ready", "callers": 2},
+            "branches": [{"at": "main:CommonModule.Общий.Method.Утилита.Caller", "count": 2}],
+            "items": ["не просили"]
+        });
+        let projected =
+            project_view_sections(&data, &json!(["callGraph"])).expect("секция принимается");
+        assert_eq!(projected["props"]["callers"], 2);
+        assert_eq!(projected["branches"][0]["count"], 2);
+        // Слот, которого не просили, не приходит: секция удерживает ровно два.
+        assert!(projected.get("items").is_none());
+        // Личность узла остаётся всегда.
+        assert_eq!(projected["kind"], "Method");
+    }
 }
 
 pub(super) fn search_scope_prefix(

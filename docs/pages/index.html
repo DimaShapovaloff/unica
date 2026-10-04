@@ -10,9 +10,11 @@
 <meta property="og:title" content="Unica — разработка на 1С с AI-агентом">
 <meta property="og:description" content="Плагин для Codex и Claude Code: агент находит нужный код, изменяет объекты 1С и проверяет результат. Сначала план, потом запись.">
 <meta property="og:url" content="https://ingvarconsulting.github.io/unica/">
-<meta property="og:image" content="https://ingvarconsulting.github.io/unica/assets/unica-social-card.png">
+<meta property="og:image" content="https://ingvarconsulting.github.io/unica/assets/og-index.png">
+<meta property="og:image:type" content="image/png">
 <meta property="og:image:width" content="1200">
-<meta property="og:image:height" content="628">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Заголовок «Разработка на 1С с AI‑агентом» на тёмной обложке со знаком Unica">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="theme-color" content="#F8FAFC">
 <link rel="icon" href="assets/unica-mark-blue.svg">
@@ -47,7 +49,6 @@
       <a href="#install">Установка</a>
       <a href="scenarios.html">Что умеет</a>
       <a href="architecture.html">Архитектура</a>
-      <a href="pipeline.html">Конвейер</a>
       <a class="chip" href="https://github.com/IngvarConsulting/unica" target="_blank" rel="noopener noreferrer" aria-label="GitHub">
         <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
         <span class="count" data-stars>{{github_stars}}</span></a>
@@ -86,41 +87,39 @@
       </p>
     </div>
 
-    <!-- Версия и пререлиз — карточки в одной сетке с плитками прогонов.
-         Пререлиз появляется только пока он впереди публичной версии, плитки
-         прогонов — только у линий с отчётом: пустая плитка «нет прогонов» на
-         первом экране читалась как «проект не живёт». -->
+    <!-- Стабильная версия и кандидат — карточки в одной сетке с плитками
+         прогонов. Кандидат появляется только пока канал next раздаёт выпуск
+         новее стабильного, плитки прогонов — только у линий с
+         отчётом: пустая плитка «нет прогонов» на первом экране читалась как
+         «проект не живёт». Действие у каждой карточки — последняя строка. -->
     <div class="cards" id="state">
       <div class="card card-version">
-        <h3>Публичная версия</h3>
-        <div class="metric-row">
-          <a class="metric" href="{{version_url}}" target="_blank" rel="noopener noreferrer">{{version}}</a>
-          <span class="card-action"><a href="{{version_url}}" target="_blank" rel="noopener noreferrer">Заметки о выпуске →</a></span>
-        </div>
+        <h3>Стабильная версия</h3>
+        <span class="metric">{{version}}</span>
         <div class="sub">опубликована {{version_date}}</div>
+        <div class="card-foot"><a href="{{version_url}}" target="_blank" rel="noopener noreferrer">Заметки о выпуске <span class="vh">{{version}}</span> <span aria-hidden="true">→</span></a></div>
       </div>
-      <!-- repeat: prereleases -->
+      <!-- repeat: candidates -->
       <div class="card card-version">
-        <h3>Пререлиз</h3>
-        <div class="metric-row">
-          <a class="metric" href="{{prerelease_url}}" target="_blank" rel="noopener noreferrer">{{prerelease}}</a>
-          <span class="card-action"><a href="{{prerelease_url}}" target="_blank" rel="noopener noreferrer">Заметки о выпуске →</a></span>
+        <div class="card-head"><h3>Кандидат выпуска</h3><span class="status status-plan">канал next</span></div>
+        <span class="metric">{{candidate_tag}}</span>
+        <div class="sub">опубликован {{candidate_date}}</div>
+        <div class="card-foot">
+          <a href="next.html">Как поставить <span class="vh">{{candidate_tag}}</span> <span aria-hidden="true">→</span></a>
+          <a class="quiet" href="{{candidate_url}}" target="_blank" rel="noopener noreferrer">Заметки о выпуске <span class="vh">{{candidate_tag}}</span></a>
         </div>
-        <div class="sub">опубликован {{prerelease_date}}</div>
       </div>
       <!-- /repeat -->
       <!-- repeat: tested_lines -->
       <div class="card card-line">
         <h3 class="ident line-head"><svg class="branch-icon" viewBox="0 0 14 14" aria-hidden="true"><circle cx="4" cy="3" r="1.7"/><circle cx="4" cy="11" r="1.7"/><circle cx="10.5" cy="3" r="1.7"/><path d="M4 4.7v4.6M10.5 4.7v1.2c0 1.7-1.4 3.1-3.1 3.1H4"/></svg>{{line}}<span class="line-run"><a href="{{build_url}}" target="_blank" rel="noopener noreferrer">{{build_sha}}</a> от {{build_date}}</span></h3>
-        <div class="metric-row">
-          <a class="metric" href="{{report_url}}" target="_blank" rel="noopener noreferrer">{{tests_total}} <small>теста</small></a>
-          <span class="card-action"><a href="{{report_url}}" target="_blank" rel="noopener noreferrer">Отчёт Allure →</a></span>
+        <span class="metric">{{tests_total}} <small>{{tests_total_word}}</small></span>
+        <div class="sub stats">
+          <span class="stat"><span class="dot dot-ok"></span>{{tests_passed}} {{tests_passed_word}}</span>
+          <span class="stat"><span class="dot dot-bad"></span>{{tests_failed}} {{tests_failed_word}}</span>
+          <span class="stat"><span class="dot dot-skip"></span>{{tests_skipped}} {{tests_skipped_word}}</span>
         </div>
-        <div class="sub">
-          <span class="stat"><span class="dot dot-ok"></span>{{tests_passed}} прошли</span> ·
-          <span class="stat"><span class="dot dot-bad"></span>{{tests_failed}} упали</span> ·
-          <span class="stat"><span class="dot dot-skip"></span>{{tests_skipped}} пропущены</span>
-        </div>
+        <div class="card-foot"><a href="{{report_url}}" target="_blank" rel="noopener noreferrer">Отчёт Allure <span class="vh">{{line}}</span> <span aria-hidden="true">→</span></a></div>
       </div>
       <!-- /repeat -->
     </div>
@@ -142,13 +141,15 @@
         </li>
         <li>
           <h3>Поставить плагин</h3>
-          <p>Codex и Claude Code ставятся из одного маркетплейса.</p>
+          <p>Codex и Claude Code ставятся из одного маркетплейса. Нативная поддержка ZCode готовится; её статус — на вкладке ZCode.</p>
       <div class="tabs">
-        <input type="radio" id="host-codex" name="host" checked>
-        <input type="radio" id="host-claude" name="host">
+        <input type="radio" id="host-codex" name="host" data-host="codex" checked>
+        <input type="radio" id="host-claude" name="host" data-host="claude">
+        <input type="radio" id="host-zcode" name="host" data-host="zcode">
         <div class="tabbar">
           <label for="host-codex">Codex</label>
           <label for="host-claude">Claude Code</label>
+          <label for="host-zcode">ZCode</label>
         </div>
         <div class="panel panel-codex">
           <pre><code id="cmd-codex">codex plugin marketplace add IngvarConsulting/unica-marketplace --ref main
@@ -160,8 +161,15 @@ codex plugin add unica@unica</code></pre>
 claude plugin install unica@unica</code></pre>
           <button class="copy" type="button" data-target="cmd-claude" aria-label="Скопировать" title="Скопировать"><svg class="i-copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M15 5.5V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h.5"/></svg><svg class="i-done" viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 12.5 9.5 17.5 19.5 6.5"/></svg></button>
         </div>
+        <div class="panel panel-zcode">
+          <p><strong>Нативная поддержка готовится в <a href="https://github.com/IngvarConsulting/unica/pull/1097">PR #1097</a>.</strong> Выпуски 0.12.3 и 0.13.0-rc.3 её ещё не содержат. Перед установкой дождитесь выпуска, в примечаниях к которому указана поддержка ZCode.</p>
+          <p>Для ZCode будет использоваться тот же <a href="https://github.com/IngvarConsulting/unica-marketplace">каталог Unica</a>. Отдельный маркетплейс добавлять не понадобится.</p>
+          <p>После выхода такого выпуска откройте <b>Plugin Marketplace → Add → Add Plugin Marketplace</b> и добавьте <code>https://github.com/IngvarConsulting/unica-marketplace.git</code>. В разделе <b>Personal</b> найдите Unica и установите плагин. Оставьте включённой одну установку Unica и начните новую задачу.</p>
+          <p>Кандидаты выходят в <a href="next.html#zcode">канале next</a>. Его версия может отличаться от стабильной.</p>
+        </div>
       </div>
-          <p style="margin-top:14px">После установки начните новую сессию агента или выполните в нём <code>/reload-plugins</code>.</p>
+          <p style="margin-top:14px">После установки в Codex откройте новую задачу. В Claude Code начните новую сессию или выполните <code>/reload-plugins</code>.</p>
+          <p>Следующую версию можно поставить до выхода: кандидатов раздаёт отдельный <a href="next.html">канал next</a>.</p>
         </li>
         <li>
           <h3>Первый запрос</h3>

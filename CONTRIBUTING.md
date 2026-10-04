@@ -1,9 +1,10 @@
 # Разработка Unica
 
-Спасибо за интерес к проекту. Перед изменениями прочитайте [правила для
-агентов](AGENTS.md) и относящиеся к задаче записи из [архитектурного
-реестра](arch/index.md). Этот документ описывает рекомендуемое локальное
-окружение; команды сборки и проверки приведены в разделе
+Этот документ описывает окружение и инструменты разработки. Рабочий вход
+для агента — [AGENTS.md](AGENTS.md); порядок выбора и написания проверок —
+[unica-testing](.agents/skills/unica-testing/SKILL.md).
+Открывайте нужный раздел при настройке, изменении окружения или сбое.
+Команды сборки и проверки приведены в разделе
 [«Разработка»](README.md#разработка) и в [README плагина](plugins/unica/README.md#verification).
 
 ## Рекомендуемое окружение
@@ -48,6 +49,17 @@ cargo clippy --version
 rust-analyzer --version
 ```
 
+### Claude Code в worktree
+
+Если в worktree нет собственного `.claude/skills`, Claude Code с версии 2.1.277
+загружает скиллы из `.claude/skills` основного checkout; `.claude/agents` и
+`.claude/commands` подгружаются так же
+([Anthropic — worktrees](https://code.claude.com/docs/en/worktrees#what-worktrees-share-with-the-main-checkout)).
+В Unica `.claude/` не отслеживается, поэтому в сессию попадает содержимое
+`.claude/` основного checkout. Держите его на актуальном `main` и не храните там
+скиллы разработки: старая ветка или неотслеживаемый файл добавят устаревший
+скилл во все сессии worktree.
+
 ## `rust-analyzer` для кодового агента
 
 Установите [`rust-analyzer`](https://rust-analyzer.github.io/book/rust_analyzer_binary.html)
@@ -81,23 +93,76 @@ rust-analyzer --version
 `Executable not found in $PATH`. Плагин настраивает LSP-подключение, но не
 поставляет сам бинарник `rust-analyzer`.
 
+### Проверка локального плагина в Claude Code
+
+Для проверки исходного дерева запустите `claude --plugin-dir ./plugins/unica`
+из корня репозитория. Установка из маркетплейса для этого не нужна.
+Один каталог плагина обслуживает три хоста: Claude читает
+`plugins/unica/.claude-plugin/plugin.json`, Codex —
+`plugins/unica/.codex-plugin/plugin.json`, ZCode —
+`plugins/unica/.zcode-plugin/plugin.json`.
+
+Продуктовые скиллы вызываются с префиксом плагина, например `/unica:meta-info`.
+Канонические имена MCP-инструментов в тексте — `unica.*`; в Claude имя имеет
+вид `mcp__plugin_unica_unica__<tool>`, где символы вне `A-Za-z0-9_-` заменены
+на `_`. Например, `unica.check` становится
+`mcp__plugin_unica_unica__unica_check`. Реальный каталог берите из подключённой
+сборки и профиля; успешный вызов установленного плагина не проверяет checkout.
+
+### Проверка локального плагина в ZCode
+
+Упакуйте собранные для текущей машины инструменты через
+`scripts/ci/package-unica-plugin.py` с `--local-debug-host zcode`,
+`--local-debug-target <цель>` и отдельным `--marketplace-name unica-zcode-dev`.
+Остальные параметры локальной сборки описаны в [README плагина](plugins/unica/README.md#local-development).
+Упаковщик создаёт `marketplace/marketplace.json`, указывающий на `./plugins/unica`;
+MCP запускает бинарник этого пакета по абсолютному пути после подстановки корня
+хостом. Не подменяйте этим сценарием проверку тонкого релизного пакета.
+
+Добавьте абсолютный путь `marketplace/` в **Plugin Marketplace → Add → Add Plugin
+Marketplace**, затем установите `unica` из этого marketplace в **Personal**.
+Отключите прежнюю установку Юники через **Settings → Plugins**, не удаляя её
+кеши. Обновление состоит из refresh существующего marketplace и update плагина;
+прямая правка установленного каталога не используется.
+
+В новой задаче с той же моделью и провайдером проверьте:
+
+1. Доступны актуальные `unica.view`, `unica.run` и остальные канонические
+   инструменты, а не сохранённый каталог `unica.runtime.execute` версии 0.12.
+2. `unica.run {}` возвращает словарь операций без запуска 1С, не требуя
+   заполнить `op`, `args`, `ifRev` и другие необязательные поля.
+3. Корневой `unica.view {}` относится к выбранному тестовому проекту, не к
+   каталогу плагина. Набор навыков и сервер `unica` не дублируются.
+4. Предпросмотр одной поддержанной операции из полученного словаря возвращает
+   план без изменений базы; нерелевантный аргумент даёт предметный отказ.
+
+Сохраните версии ZCode, плагина, модель/провайдера и ответы без учётных данных.
+Прямой stdio-тест проверяет серверный контракт, а эта проверка — путь через
+ZCode к модели. Не объявляйте [#1032](https://github.com/IngvarConsulting/unica/issues/1032)
+исправленным только по упаковке или `tools/list`. Результаты разных хостов,
+ОС и протокольных профилей не заменяют друг друга.
+
 ## Навыки MCP Server Dev
 
-До проектирования или реализации MCP-сервера установите все три навыка из
-официального комплекта Anthropic
-[`mcp-server-dev`](https://github.com/anthropics/claude-plugins-official/tree/main/plugins/mcp-server-dev):
+Подключайте нужный навык официального комплекта Anthropic
+[`mcp-server-dev`](https://github.com/anthropics/claude-plugins-official/tree/main/plugins/mcp-server-dev)
+по задаче:
 
-- `build-mcp-server`;
-- `build-mcp-app`;
-- `build-mcpb`.
+- `build-mcp-server` — выбор MCP-контракта или модели доставки;
+- `build-mcp-app` — MCP Apps и интерактивные виджеты;
+- `build-mcpb` — упаковка и поставка MCPB.
+
+Обычная правка Unica не требует всего комплекта. Основной проектный навык —
+[unica-development](.agents/skills/unica-development/SKILL.md).
 
 ### Codex
 
-Сначала проверьте, какие навыки уже установлены. Ожидаемый путь каждого навыка —
+Если для задачи нужен отсутствующий навык, проверьте его доступность в хосте.
+Ожидаемый путь локально установленного навыка —
 `$CODEX_HOME/skills/<имя>/SKILL.md`; если `CODEX_HOME` не задан —
 `~/.codex/skills/<имя>/SKILL.md`. Вызовите `$skill-installer` и попросите
 установить из repository `anthropics/claude-plugins-official`, ref `main`, только
-отсутствующие пути из списка:
+нужные отсутствующие пути из списка:
 
 ```text
 plugins/mcp-server-dev/skills/build-mcp-server
@@ -106,18 +171,16 @@ plugins/mcp-server-dev/skills/build-mcpb
 ```
 
 Не передавайте установщику путь уже установленного навыка: существующий каталог
-он не перезаписывает. Если все три навыка установлены, повторно запускать
+он не перезаписывает. Если нужный навык уже доступен, повторно запускать
 установщик не нужно.
 
-После установки завершите текущий ход. На следующем ходе проверьте, что доступны
-все три навыка для явного вызова и каждый `SKILL.md` читается. Если навык не
-появился, перезапустите Codex и повторите проверку. Если хотя бы один обязательный
-навык отсутствует, MCP-разработку не начинайте.
+После установки проверьте в новой сессии, что нужный навык доступен и его
+`SKILL.md` читается. Наличие файла на диске не доказывает регистрацию в хосте.
 
 ### Claude Code
 
-Официальный marketplace обычно уже доступен в Claude Code. Установите из него
-плагин и перезагрузите плагины:
+Если нужен навык из комплекта, установите плагин из официального marketplace
+и перезагрузите плагины:
 
 ```text
 /plugin install mcp-server-dev@claude-plugins-official
@@ -129,10 +192,8 @@ plugins/mcp-server-dev/skills/build-mcpb
 подключён — добавьте его командой
 `/plugin marketplace add anthropics/claude-plugins-official`.
 
-Основная точка входа — `build-mcp-server`. `build-mcp-app` используется для
-MCP Apps и интерактивных виджетов, `build-mcpb` — для локальной упаковки и
-поставки. Если нужны оба контура, применяйте навыки в порядке
-`build-mcp-server` → `build-mcp-app` → `build-mcpb`.
+Установка плагина не означает, что для каждой задачи нужно читать все его
+навыки. Выбирайте применимый по описанию и загружайте нужные ему материалы.
 
 ## Навыки контекстной инженерии
 
@@ -193,9 +254,218 @@ repository `muratcankoylan/Agent-Skills-for-Context-Engineering`, ref `main`,
 или добавьте сценарий в корпус по инструкции из реестра и обновите документ
 командой `python scripts/ci/render-acceptance-registry.py --write`.
 
+## Отчёт Allure локально
+
+Конвейер публикует отчёт линии на [сайте
+проекта](https://ingvarconsulting.github.io/unica/), и собирают его те же
+скрипты, что лежат в репозитории: прогон пишет каталог `allure-results`,
+Allure CLI превращает его в HTML. Локальный отчёт отвечает на то, о чём
+текстовый вывод молчит: какие тесты отключены и почему, что прошло со второй
+попытки, куда ушло время набора.
+
+### Allure CLI
+
+Нужны Allure CLI и JRE (проверено на Java 17). На macOS:
+
+```sh
+brew install allure
+allure --version
+```
+
+Версия сайта закреплена по sha256 в
+[`.github/workflows/unica-pages.yml`](.github/workflows/unica-pages.yml):
+контракт истории у разных версий Allure разный, и меняться под опубликованным
+отчётом он не должен. Сейчас там **2.46.1** — та же, что ставит Homebrew, так
+что локальный отчёт и отчёт сайта собирает одна версия. Если версии
+разойдутся, всё про историю и тренды сайта проверяйте версией сайта: скачайте
+архив релиза по ссылке и хешу из workflow и зовите `allure` из распакованного
+каталога. Разница не косметическая: 2.35.1 ключевала историю нашим
+`historyId`, 2.46.1 считает ключ сама, и переклейку старых ключей делает
+сборщик сайта — `migrate_history_keys` в
+[`scripts/ci/build-site.py`](scripts/ci/build-site.py).
+
+### Прогон с результатами
+
+Точка входа одна у конвейера и у разработчика:
+
+```sh
+python3.12 scripts/ci/run-tests.py --profile all --results .build/allure-results
+allure generate --clean --output .build/allure-report .build/allure-results
+allure open .build/allure-report
+```
+
+`allure serve .build/allure-results` собирает и открывает отчёт одной командой,
+не оставляя каталога.
+
+Про сам прогон стоит знать вот что:
+
+- `--profile all` — локальное «гони всё». Профили `pr`, `queue`, `main`,
+  `release` и `large` повторяют ворота конвейера тем же отбором, что и там:
+  берите их, когда PR покраснел на конкретных воротах.
+- `--ecosystem rust|python|all` и `--suite tests/dev` сужают прогон, а
+  `--dry-run` печатает команды, ничего не запуская.
+- `--runner` по умолчанию `local`. История теста ведётся на раннер, так что
+  локальные прогоны не смешиваются с историей конвейера.
+- Интерпретатор обязан быть 3.12: скрипт читает `.config/nextest.toml` через
+  `tomllib`, и на 3.9 падает на импорте. Набору `tests/ci` нужны зависимости из
+  [`tests/ci/requirements.txt`](tests/ci/requirements.txt).
+
+Дерево отчёта строится по меткам: `parentSuite` — экосистема (`rust` или
+`python`), `suite` — двоичный файл или модуль, рядом `size`, `profile` и
+`host`; раннер идёт ещё и параметром теста. Отключённые тесты приходят
+`skipped` с причиной из `#[ignore = "..."]` — молча вынести тест из гейта
+нельзя. Неудачные попытки видны на графике повторов: nextest делает один
+повтор, и зелёный итог не прячет перемежающийся тест.
+
+### Часть тестов
+
+Фильтра у `run-tests.py` нет — он описывает ворота целиком. Когда нужен один
+модуль, отбирайте его самим nextest, а JUnit переводите тем же швом, каким
+это делает прогон:
+
+```sh
+cargo nextest run -p unica-coder --lib -E 'test(/^infrastructure::source_roots::/)' --profile default
+```
+
+```sh
+python3.12 - <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "scripts/ci")
+import allure_results as ar
+
+out = Path(".build/allure-results")
+ar.write_run(out, profile="all", runner="local", ecosystem="rust")
+for entry in ar.junit_records(
+    Path("target/nextest/default/junit.xml"),
+    runner="local",
+    profile="all",
+    reasons=ar.ignore_reasons(Path(".")),
+):
+    ar.write(out, entry)
+PY
+```
+
+### Тренды
+
+У одиночного отчёта истории нет. Чтобы увидеть тренд и метку `flaky`,
+перенесите историю прошлого отчёта в свежие результаты перед сборкой:
+
+```sh
+cp -r .build/allure-report/history .build/allure-results/history
+```
+
+Сайт делает ровно это, только историю берёт с опубликованной страницы линии
+(`carry_history` в [`scripts/ci/build-site.py`](scripts/ci/build-site.py)).
+План прогона (`--plan-only`) и досбор недошедших тестов
+(`scripts/ci/collect-results.py`) локально не нужны: они восстанавливают
+исходы упавших джоб по списку задач прогона GitHub Actions.
+
+## MCP Inspector локально
+
+[MCP Inspector](https://github.com/modelcontextprotocol/inspector) показывает
+Unica такой, какой её видит хост: весь `tools/list` со схемами, вызов
+инструмента с произвольными аргументами и сырой JSON ответа. Ни один хост
+этого не показывает, а расхождение описания и провода видно только здесь.
+
+Нужен Node (проверено на 22) и собранный бинарь:
+
+```sh
+cargo build --bin unica
+```
+
+Собирайте заранее: инспектор запускает готовый файл, а `cargo run` из
+[`plugins/unica/.mcp.json`](plugins/unica/.mcp.json) на холодной сборке молчит
+в stdio дольше, чем клиент ждёт рукопожатия.
+
+### Рабочий каталог решает всё
+
+Рабочую область `unica` берёт из текущего каталога процесса и ниоткуда больше
+(`std::env::current_dir()` в
+[`crates/unica-coder/src/interfaces/mcp.rs`](crates/unica-coder/src/interfaces/mcp.rs));
+переменной окружения для неё нет. Сервер наследует каталог инспектора,
+поэтому запускайте инспектор **из каталога 1С-проекта**, а путь к бинарю
+указывайте абсолютный. Из чужого каталога `unica.view` честно ответит
+`workspace is uninitialized`, а инструменты, которым нужна рабочая область, —
+отказом `workspace actor admission failed`.
+
+Своего проекта под рукой может не быть — тогда берите приёмочную рабочую
+область `tests/fixtures/acceptance/workspace`: на ней стоит корпус
+приёмочных сценариев, и любой из них воспроизводится вручную.
+
+### Один вызов из терминала
+
+Режим `--cli` не поднимает браузер: одна команда — один сеанс MCP, ответ
+печатается в stdout. Путь к бинарю и свой каталог состояния демона удобно
+запомнить до перехода в проект:
+
+```sh
+UNICA="$PWD/target/debug/unica"
+STATE="$PWD/.build/unica-state"
+cd tests/fixtures/acceptance/workspace
+
+npx @modelcontextprotocol/inspector --cli "$UNICA" -e UNICA_PROVIDER_STATE_DIR="$STATE" \
+  --method tools/list
+npx @modelcontextprotocol/inspector --cli "$UNICA" -e UNICA_PROVIDER_STATE_DIR="$STATE" \
+  --method tools/call --tool-name unica.run
+npx @modelcontextprotocol/inspector --cli "$UNICA" -e UNICA_PROVIDER_STATE_DIR="$STATE" \
+  --method tools/call --tool-name unica.docs \
+  --tool-arg query="права доступа к регистру сведений" --tool-arg source=platform-help
+```
+
+Аргументы инструмента идут по одному `--tool-arg имя=значение`. Переменные
+окружения — только флагом `-e ИМЯ=значение`: окружение оболочки инспектор
+серверу целиком не передаёт, `export` до вызова ничего не даст. Зачем здесь
+`UNICA_PROVIDER_STATE_DIR` — ниже, в «Демон переживает пересборку»; каталог
+`.build/` git не отслеживает. Ответ с `isError: true` инспектор дублирует
+строкой ошибки и ненулевым кодом возврата, так что режим годится и для
+скриптов.
+
+### Веб-интерфейс
+
+```sh
+npx @modelcontextprotocol/inspector -e UNICA_PROVIDER_STATE_DIR="$STATE" "$UNICA"
+```
+
+Команда печатает адрес вида
+`http://127.0.0.1:6274?MCP_INSPECTOR_API_TOKEN=…` и открывает браузер;
+`MCP_AUTO_OPEN_ENABLED=false` открытие отключает. Токен обязателен —
+`DANGEROUSLY_OMIT_AUTH` не используйте: инспектор запускает произвольные
+команды, и открытый порт отдаёт эту возможность кому угодно.
+
+### Чего ожидать
+
+- Поверхность — только инструменты (сегодня одиннадцать `unica.*`);
+  `resources/list` и `prompts/list` отвечают пустыми списками, и это не
+  поломка.
+- Долгая операция возвращает `taskId` и `status: "working"`, а ответ забирают
+  `unica.task.result`. Задачи держит фоновый демон (`unica --daemon
+  --state-root ~/.unica/provider-state`), поэтому `taskId` переживает выход
+  процесса CLI.
+
+### Демон переживает пересборку
+
+Демон опознаётся по ABI ядра и версии протокола, а не по файлу бинаря: живой
+демон под `~/.unica/provider-state` переиспользует любой пришедший туда
+`unica`, и после последнего вызова он ждёт ещё четверть часа. То есть сразу
+после `cargo build` вызов обслужит прежняя сборка, и проверка «починилось ли»
+покажет вчерашний ответ. Поэтому в примерах выше стоит свой каталог состояния:
+он поднимает отдельного демона от названного бинаря. Добавьте
+`-e UNICA_DAEMON_IDLE_GRACE_MS=5000`, чтобы он уходил через пять секунд после
+последнего вызова, а не держал каталог четверть часа.
+
+Путь состояния должен быть настоящим: `mktemp -d` на macOS отдаёт путь через
+симлинк `/var`, и демон отвергает его с `Not a directory`. Грубая замена
+разведению — `pkill -f "unica --daemon"`, но она снимает и демонов, которыми
+пользуются запущенные хосты. В веб-интерфейсе сервер поднимается один раз на
+сеанс, поэтому после пересборки перезапускайте инспектор, а не только
+переподключайтесь.
+
 ## Самопроверка
 
-Перед началом работы проверьте Python командой для своей оболочки:
+При настройке, изменении окружения или сбое запуска проверьте Python командой
+для своей оболочки:
 
 ```sh
 # macOS или Linux
@@ -208,7 +478,7 @@ py -3.12 --version
 python --version
 ```
 
-Затем агент должен получить успешный результат общих команд Rust:
+Для проверки доступности Rust-инструментов выполните:
 
 ```sh
 rustc --version

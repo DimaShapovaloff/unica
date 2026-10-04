@@ -5,23 +5,47 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+/// Discovers the workspace selected by an optional caller-provided directory.
 pub(crate) fn discover_workspace(
     requested_cwd: Option<PathBuf>,
 ) -> Result<WorkspaceContext, String> {
-    let cwd = requested_cwd.unwrap_or(
-        env::current_dir().map_err(|err| format!("failed to read current directory: {err}"))?,
-    );
-    let cwd = if cwd.is_absolute() {
-        cwd
-    } else {
-        env::current_dir()
-            .map_err(|err| format!("failed to read current directory: {err}"))?
-            .join(cwd)
+    discover_workspace_with_cache_override(
+        requested_cwd,
+        env::var("UNICA_CACHE_DIR").map(PathBuf::from).ok(),
+    )
+}
+
+fn discover_workspace_with_cache_override(
+    requested_cwd: Option<PathBuf>,
+    cache_override: Option<PathBuf>,
+) -> Result<WorkspaceContext, String> {
+    discover_workspace_with_current_dir(requested_cwd, cache_override, env::current_dir)
+}
+
+/// Resolves the requested directory while deferring process-cwd access until needed.
+fn discover_workspace_with_current_dir(
+    requested_cwd: Option<PathBuf>,
+    cache_override: Option<PathBuf>,
+    current_dir: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<WorkspaceContext, String> {
+    let cwd = match requested_cwd {
+        Some(cwd) if cwd.is_absolute() => cwd,
+        Some(cwd) => current_dir()
+            .map_err(|err| {
+                format!(
+                    "failed to resolve relative requested workspace `{}`: launch current directory is unavailable: {err}",
+                    cwd.display()
+                )
+            })?
+            .join(cwd),
+        None => current_dir().map_err(|err| {
+            format!(
+                "failed to resolve requested workspace: no `cwd` was provided and launch current directory is unavailable: {err}"
+            )
+        })?,
     };
     let workspace_root = find_workspace_root(&cwd).unwrap_or_else(|| cwd.clone());
-    let cache_root = env::var("UNICA_CACHE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| workspace_root.join(".build").join("unica"));
+    let cache_root = cache_override.unwrap_or_else(|| workspace_root.join(".build").join("unica"));
     let workspace_epoch = workspace_fingerprint(&workspace_root);
     Ok(WorkspaceContext {
         cwd,
@@ -116,7 +140,11 @@ fn hash_path(hasher: &mut DefaultHasher, root: &Path, rel: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::discover_workspace;
+    use super::{
+        discover_workspace, discover_workspace_with_cache_override,
+        discover_workspace_with_current_dir,
+    };
+    use std::io;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -133,6 +161,81 @@ mod tests {
         assert_eq!(context.workspace_root, nested);
         assert_ne!(context.workspace_root, root);
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Verifies that an absolute caller path never depends on the launch directory.
+    #[test]
+    fn absolute_requested_cwd_does_not_read_process_cwd() {
+        let root = temp_root("unica-workspace-absolute-cwd");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(root.is_absolute());
+
+        let context = discover_workspace_with_current_dir(Some(root.clone()), None, || {
+            panic!("absolute requested cwd must not read the process cwd")
+        })
+        .unwrap();
+
+        assert_eq!(context.cwd, root);
+        let _ = std::fs::remove_dir_all(context.cwd);
+    }
+
+    /// Verifies the classified failure when a relative path cannot be anchored.
+    #[test]
+    fn relative_requested_cwd_reports_launch_directory_failure() {
+        let error = discover_workspace_with_current_dir(
+            Some(PathBuf::from("relative-workspace")),
+            None,
+            || {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "launch cwd missing",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error.starts_with(
+                "failed to resolve relative requested workspace `relative-workspace`: launch current directory is unavailable:"
+            ),
+            "{error}"
+        );
+    }
+
+    /// Verifies the classified failure when neither caller nor process provides a path.
+    #[test]
+    fn missing_requested_cwd_reports_launch_directory_failure() {
+        let error = discover_workspace_with_current_dir(None, None, || {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "launch cwd missing",
+            ))
+        })
+        .unwrap_err();
+
+        assert!(
+            error.starts_with(
+                "failed to resolve requested workspace: no `cwd` was provided and launch current directory is unavailable:"
+            ),
+            "{error}"
+        );
+    }
+
+    /// Verifies that relative caller paths are anchored to the launch directory.
+    #[test]
+    fn relative_requested_cwd_resolves_from_launch_directory() {
+        let root = temp_root("unica-workspace-relative-cwd");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let context =
+            discover_workspace_with_current_dir(Some(PathBuf::from("workspace")), None, || {
+                Ok(root.clone())
+            })
+            .unwrap();
+
+        assert_eq!(context.cwd, workspace);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -179,7 +282,7 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(workspace.join("v8project.yaml"), "format: DESIGNER\n").unwrap();
 
-        let context = discover_workspace(Some(nested)).unwrap();
+        let context = discover_workspace_with_cache_override(Some(nested), None).unwrap();
 
         assert_eq!(context.workspace_root, workspace);
         assert_eq!(

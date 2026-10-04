@@ -74,6 +74,10 @@ pub(crate) enum NodeKind {
     Calculation,
     Setting,
     Area,
+    /// Группа командного интерфейса: место, куда платформа кладёт команду.
+    /// Не путать с `CommandGroup` — тот объект метаданных, а это ссылка на
+    /// группу панели, стандартную либо заведённую таким объектом.
+    Group,
     Module,
     Method,
     Body,
@@ -87,6 +91,23 @@ pub(crate) enum NodeKind {
     Namespace,
     Type,
     Property,
+    /// Ссылка объекта метаданных наружу: владелец, движение, основание,
+    /// источник события. Элемент этой ветви адресует чужой объект, а не
+    /// потомка.
+    Relation,
+    /// Характеристика плана видов характеристик: пара источников типов и
+    /// значений. Прикладного имени у неё нет, поэтому элементы этой ветви
+    /// остаются строками данных.
+    Characteristic,
+    StandardTabularSection,
+    /// Метод, который зовёт этот метод. Элемент этой ветви адресует чужой
+    /// метод, а не потомка: граф вызовов показывает наружу.
+    Caller,
+    /// Метод, которого зовёт этот метод.
+    Callee,
+    /// Предопределённый элемент объекта: носит имя и идентификатор, поэтому
+    /// адресуется — в отличие от характеристики, названной парой источников.
+    PredefinedItem,
 }
 
 const LEGACY_METADATA_KINDS: &[NodeKind] = &[
@@ -177,6 +198,7 @@ const V13_KIND_SPELLINGS: &[V13KindSpelling] = &[
     spelling(NodeKind::Body, &["Тело"]),
     spelling(NodeKind::Region, &["ОбластьКода"]),
     spelling(NodeKind::Interface, &["Интерфейс"]),
+    spelling(NodeKind::Group, &["Группа"]),
     spelling(NodeKind::Event, &["Событие"]),
     spelling(NodeKind::Compilation, &["Компиляция"]),
     spelling(NodeKind::UrlTemplate, &["ШаблонURL"]),
@@ -185,6 +207,15 @@ const V13_KIND_SPELLINGS: &[V13KindSpelling] = &[
     spelling(NodeKind::Namespace, &["ПространствоИмен"]),
     spelling(NodeKind::Type, &["Тип"]),
     spelling(NodeKind::Property, &["Свойство"]),
+    spelling(NodeKind::Relation, &["Связь"]),
+    spelling(NodeKind::Characteristic, &["Характеристика"]),
+    spelling(
+        NodeKind::StandardTabularSection,
+        &["СтандартнаяТабличнаяЧасть"],
+    ),
+    spelling(NodeKind::Caller, &["Вызывающий"]),
+    spelling(NodeKind::Callee, &["Вызываемый"]),
+    spelling(NodeKind::PredefinedItem, &["ПредопределённыйЭлемент"]),
 ];
 
 const fn spelling(kind: NodeKind, aliases: &'static [&'static str]) -> V13KindSpelling {
@@ -202,7 +233,7 @@ impl NodeKind {
     /// Безымянный вид единственен у своего владельца, поэтому имени у него нет
     /// и занимать под него сегмент нельзя: следующий сегмент — это уже вид.
     /// Терминальный вид без имени — другое: это адрес ветки, и он допустим у
-    /// любого вида. См. `DEC.2026-09-07.NAMELESS-KINDS-IN-ADDRESS`.
+    /// любого вида. См. `arch/rules/mcp/qualified-logical-address.md`.
     pub(crate) const fn takes_name(self) -> bool {
         !matches!(self, Self::Configuration | Self::Interface)
     }
@@ -302,6 +333,7 @@ impl NodeKind {
             Self::Calculation => "Calculation",
             Self::Setting => "Setting",
             Self::Area => "Area",
+            Self::Group => "Group",
             Self::Module => "Module",
             Self::Method => "Method",
             Self::Body => "Body",
@@ -315,6 +347,12 @@ impl NodeKind {
             Self::Namespace => "Namespace",
             Self::Type => "Type",
             Self::Property => "Property",
+            Self::Relation => "Relation",
+            Self::Characteristic => "Characteristic",
+            Self::StandardTabularSection => "StandardTabularSection",
+            Self::Caller => "Caller",
+            Self::Callee => "Callee",
+            Self::PredefinedItem => "PredefinedItem",
         }
     }
 

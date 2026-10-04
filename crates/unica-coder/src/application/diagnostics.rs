@@ -150,6 +150,19 @@ impl<'a, M: DiagnosticMapping + ?Sized> DiagnosticCoordinator<'a, M> {
         workspace: &WorkspaceContext,
         cancellation: &CancellationToken,
     ) -> Result<DiagnosticResult, DiagnosticRequestError> {
+        self.execute_scoped(request, workspace, cancellation, None)
+    }
+
+    pub(crate) fn execute_scoped(
+        &self,
+        request: &DiagnosticRequest,
+        workspace: &WorkspaceContext,
+        cancellation: &CancellationToken,
+        scope: Option<(
+            crate::domain::diagnostics::DiagnosticModuleScope,
+            crate::domain::code_intelligence::ProviderDeadline,
+        )>,
+    ) -> Result<DiagnosticResult, DiagnosticRequestError> {
         if cancellation.is_cancelled() {
             return Err(cancelled_request_error(
                 "diagnostics stopped before providers started",
@@ -158,6 +171,20 @@ impl<'a, M: DiagnosticMapping + ?Sized> DiagnosticCoordinator<'a, M> {
         let context = self
             .mapping
             .resolve_context(request, workspace, cancellation)?;
+        if let Some((scope, _)) = &scope {
+            if request.action != DiagnosticAction::Analyze
+                || scope.source_set != request.source_set
+                || scope.source_set != context.source_set.name
+                || scope.source_root != context.source_root.path
+                || !scope.module_path.starts_with(&scope.source_root)
+            {
+                return Err(request_error(
+                    "target_kind_mismatch",
+                    Some("sourceSet"),
+                    "diagnostic execution scope does not match the admitted source set",
+                ));
+            }
+        }
         if request.range.is_some() && context.target.target_kind != TargetKind::Module {
             return Err(request_error(
                 "target_kind_mismatch",
@@ -173,6 +200,7 @@ impl<'a, M: DiagnosticMapping + ?Sized> DiagnosticCoordinator<'a, M> {
             .map(|(index, selected)| (selected.descriptor.id.as_str(), index))
             .collect::<HashMap<_, _>>();
         let provider_request = DiagnosticProviderRequest {
+            module_scope: scope.as_ref().map(|(module, _)| module.clone()),
             action: request.action,
             source_set: request.source_set.clone(),
             metadata_path: request.metadata_path.clone(),
@@ -180,11 +208,23 @@ impl<'a, M: DiagnosticMapping + ?Sized> DiagnosticCoordinator<'a, M> {
             filter: request.filter.clone(),
             range: request.range,
         };
+        let configured_budget = request.timeout.unwrap_or(DIAGNOSTIC_BUDGET_WITHOUT_CONFIG);
+        let configured_deadline = ProviderDeadline::from_budget(configured_budget);
+        let deadline = scope.as_ref().map_or(configured_deadline, |(_, deadline)| {
+            deadline.earlier(configured_deadline)
+        });
+        if deadline.remaining().is_zero() {
+            return Err(request_error(
+                "provider_timeout",
+                None,
+                "diagnostic execution deadline elapsed",
+            ));
+        }
         let executions = execute_selected_providers(
             &selected,
             &provider_request,
             &context,
-            request.timeout.unwrap_or(DIAGNOSTIC_BUDGET_WITHOUT_CONFIG),
+            deadline,
             cancellation,
         )?;
         let mut sections = Vec::with_capacity(selected.len());
@@ -196,9 +236,9 @@ impl<'a, M: DiagnosticMapping + ?Sized> DiagnosticCoordinator<'a, M> {
                     .map_observations(outcome.observations, &context, cancellation);
             // Two different failures hide behind one `Err`. A handle outside
             // the permitted scope is an adapter contract breach and costs the
-            // whole section (ADR-0064 §12); a resource the mapper simply could
+            // whole section; a resource the mapper simply could
             // not prove belongs to itself and must not withdraw the findings
-            // proven around it (ADR-0064 §10).
+            // proven around it.
             let mut out_of_scope = None;
             let mut unproven = None;
             let mut provider_items = Vec::with_capacity(mapped.len());
@@ -339,10 +379,9 @@ fn execute_selected_providers(
     selected: &[SelectedProvider],
     request: &DiagnosticProviderRequest,
     context: &DiagnosticContext,
-    total_budget: Duration,
+    deadline: ProviderDeadline,
     cancellation: &CancellationToken,
 ) -> Result<Vec<DiagnosticProviderOutcome>, DiagnosticRequestError> {
-    let started_at = Instant::now();
     let (sender, receiver) = mpsc::channel();
     let mut slots = (0..selected.len())
         .map(|_| None)
@@ -374,12 +413,7 @@ fn execute_selected_providers(
             .spawn(move || {
                 let _permit = permit;
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
-                    provider.execute(
-                        &request,
-                        &context,
-                        ProviderDeadline::from_started_at(started_at, total_budget),
-                        &worker_cancellation,
-                    )
+                    provider.execute(&request, &context, deadline, &worker_cancellation)
                 }))
                 .map(|outcome| normalize_provider_outcome(provider_id, request.action, outcome))
                 .unwrap_or_else(|panic| provider_panic_outcome(provider_id, panic));
@@ -405,9 +439,7 @@ fn execute_selected_providers(
                 "diagnostics stopped while providers were running",
             ));
         }
-        let remaining = total_budget
-            .checked_sub(started_at.elapsed())
-            .unwrap_or(Duration::ZERO);
+        let remaining = deadline.remaining();
         if remaining.is_zero() {
             for (index, slot) in slots.iter_mut().enumerate() {
                 if slot.is_none() {
@@ -653,6 +685,14 @@ fn sanitize_provider_outcome(outcome: &mut DiagnosticProviderOutcome, context: &
 }
 
 fn sanitize_public_diagnostic_error(error: &mut DiagnosticError) {
+    if error.code == "diagnostics_invalid" {
+        if let Some(message) =
+            crate::domain::diagnostics::stream_error::canonical_stream_error(&error.message)
+        {
+            error.message = message;
+            return;
+        }
+    }
     error.message = match error.code.as_str() {
         "source_analysis_failed" => "diagnostic provider could not analyze the selected resource",
         "source_decode_failed" => "source is not valid in the detected encoding",
@@ -1023,7 +1063,9 @@ fn item_matches_request(
             return false;
         }
     }
-    if request.action == DiagnosticAction::Findings
+    if (request.action == DiagnosticAction::Findings
+        || (request.action == DiagnosticAction::Analyze
+            && context.target.target_kind == TargetKind::Module))
         && !item_location(item)
             .is_some_and(|location| location_within_findings_target(location, &context.target))
     {
@@ -1444,6 +1486,7 @@ mod tests {
                     kind: SourceSetKind::Configuration,
                     path: "src".to_string(),
                     source_format: SourceFormat::PlatformXml,
+                    source_state: crate::domain::project_sources::SourceSetState::Supported,
                     format_evidence: Vec::new(),
                     format_probe_error: None,
                 },
@@ -1623,6 +1666,94 @@ mod tests {
             cache_root: PathBuf::from("workspace/.build/unica"),
             workspace_epoch: 1,
         }
+    }
+
+    #[test]
+    fn scoped_diagnostics_bind_context_and_keep_the_remaining_deadline() {
+        struct Capture(Arc<Mutex<Vec<(DiagnosticProviderRequest, ProviderDeadline)>>>);
+        impl DiagnosticProvider for Capture {
+            fn descriptor(&self) -> &'static DiagnosticProviderDescriptor {
+                &ANALYZER_DESCRIPTOR
+            }
+            fn execute(
+                &self,
+                request: &DiagnosticProviderRequest,
+                _: &DiagnosticContext,
+                deadline: ProviderDeadline,
+                _: &CancellationToken,
+            ) -> DiagnosticProviderOutcome {
+                self.0.lock().unwrap().push((request.clone(), deadline));
+                successful(Vec::new())
+            }
+        }
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let registry =
+            DiagnosticProviderRegistry::new(vec![Arc::new(Capture(Arc::clone(&observed)))])
+                .unwrap();
+        let coordinator = DiagnosticCoordinator::new(registry, &FAKE_MAPPING);
+        let workspace = workspace();
+        let mut request = findings_request();
+        request.action = DiagnosticAction::Analyze;
+        request.timeout = Some(Duration::from_secs(120));
+        let scope = DiagnosticModuleScope {
+            source_set: "main".into(),
+            source_root: workspace.workspace_root.join("src"),
+            module_path: workspace
+                .workspace_root
+                .join("src/CommonModules/Selected/Ext/Module.bsl"),
+        };
+        let deadline = ProviderDeadline::from_budget(Duration::from_secs(5));
+        coordinator
+            .execute_scoped(
+                &request,
+                &workspace,
+                &CancellationToken::new(),
+                Some((scope.clone(), deadline)),
+            )
+            .unwrap();
+        let calls = observed.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0.module_scope.as_ref(), Some(&scope));
+        assert_eq!(
+            calls[0].1, deadline,
+            "provider deadline must not be recreated"
+        );
+        drop(calls);
+        for mut wrong in [scope.clone(), scope.clone(), scope.clone()]
+            .into_iter()
+            .enumerate()
+        {
+            match wrong.0 {
+                0 => wrong.1.source_set = "other".into(),
+                1 => wrong.1.source_root = workspace.workspace_root.join("other"),
+                _ => wrong.1.module_path = workspace.workspace_root.join("outside/Module.bsl"),
+            }
+            assert!(coordinator
+                .execute_scoped(
+                    &request,
+                    &workspace,
+                    &CancellationToken::new(),
+                    Some((
+                        wrong.1,
+                        ProviderDeadline::from_budget(Duration::from_secs(5))
+                    ))
+                )
+                .is_err());
+        }
+        let error = coordinator
+            .execute_scoped(
+                &request,
+                &workspace,
+                &CancellationToken::new(),
+                Some((scope, ProviderDeadline::from_budget(Duration::ZERO))),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "provider_timeout");
+        assert_eq!(
+            observed.lock().unwrap().len(),
+            1,
+            "invalid or expired scope must not invoke a provider"
+        );
     }
 
     fn run_with_logical_mapping(
@@ -2244,11 +2375,22 @@ mod tests {
         ]);
         let result = run(registry, &findings_request()).unwrap();
         assert_eq!(result.state, DiagnosticResultState::Partial);
-        assert_eq!(result.items.len(), 1);
+        assert!(matches!(
+            result.items.as_slice(),
+            [DiagnosticItem::Diagnostic { provider, code, message, .. }]
+                if *provider == LANGUAGE_SERVER.as_str()
+                    && code == "LS001"
+                    && message == "message LS001"
+        ));
         assert_eq!(result.providers[0].status, DiagnosticProviderStatus::Failed);
         assert_eq!(
             result.providers[0].error.as_ref().unwrap().code,
             "provider_panicked"
+        );
+        assert_eq!(result.providers[1].id, LANGUAGE_SERVER.as_str());
+        assert_eq!(
+            result.providers[1].status,
+            DiagnosticProviderStatus::Completed
         );
     }
 
@@ -2542,6 +2684,101 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_public_result_preserves_safe_jsonl_failure_location_and_reason() {
+        let mut outcome = failed("diagnostics_invalid");
+        outcome.error = Some(DiagnosticError {
+            code: "diagnostics_invalid".to_string(),
+            message: "line 2: unknown diagnostic severity. Check compatibility between Unica and its bundled analyzer; if the problem persists, report this reason and line number.".to_string(),
+            retryable: false,
+        });
+
+        let result = run_with_logical_mapping(
+            &ANALYZER_DESCRIPTOR,
+            outcome,
+            &findings_request(),
+            &workspace(),
+        );
+        assert!(result.items.is_empty());
+        let serialized = serde_json::to_value(result).unwrap();
+        assert_eq!(serialized["ok"], false);
+        assert_eq!(serialized["state"], "failed");
+        assert_eq!(serialized["complete"], false);
+        assert_eq!(serialized["providers"][0]["status"], "failed");
+        assert_eq!(serialized["providers"][0]["complete"], false);
+        assert_eq!(
+            serialized["providers"][0]["error"]["code"],
+            "diagnostics_invalid"
+        );
+        assert_eq!(serialized["providers"][0]["error"]["retryable"], false);
+        assert_no_physical_transport(&serialized, "workspace");
+        assert_eq!(
+            serialized["providers"][0]["error"]["message"],
+            "line 2: unknown diagnostic severity. Check compatibility between Unica and its bundled analyzer; if the problem persists, report this reason and line number."
+        );
+    }
+
+    #[test]
+    fn diagnostics_public_result_reports_empty_stream_without_a_line_number() {
+        let mut outcome = failed("diagnostics_invalid");
+        outcome.error = Some(DiagnosticError {
+            code: "diagnostics_invalid".to_string(),
+            message: "stream is missing start event. Check compatibility between Unica and its bundled analyzer; if the problem persists, report this reason.".to_string(),
+            retryable: false,
+        });
+        let result = run_with_logical_mapping(
+            &ANALYZER_DESCRIPTOR,
+            outcome,
+            &findings_request(),
+            &workspace(),
+        );
+        assert!(result.items.is_empty());
+        let serialized = serde_json::to_value(result).unwrap();
+        assert_eq!(serialized["state"], "failed");
+        assert_eq!(
+            serialized["providers"][0]["error"]["code"],
+            "diagnostics_invalid"
+        );
+        assert_eq!(
+            serialized["providers"][0]["error"]["message"],
+            "stream is missing start event. Check compatibility between Unica and its bundled analyzer; if the problem persists, report this reason."
+        );
+    }
+
+    #[test]
+    fn diagnostics_public_result_rejects_noncanonical_stream_error_messages() {
+        let canonical = "line 2: unknown diagnostic severity. Check compatibility between Unica and its bundled analyzer; if the problem persists, report this reason and line number.";
+        for message in [
+            format!("{canonical} secret=/private/Secret.bsl"),
+            format!("secret {canonical}"),
+            canonical.replace("line 2:", "line 02:"),
+            canonical.replace("line 2:", "line +2:"),
+            canonical.replace("line 2:", "line 0:"),
+            canonical.replace("line 2:", "line 184467440737095516160:"),
+            canonical.replace(
+                "unknown diagnostic severity",
+                "unknown diagnostic severity `secret`",
+            ),
+            format!("{canonical}\n"),
+            "line 2: unknown diagnostic severity".to_string(),
+            "stream is missing start event. Check compatibility between Unica and its bundled analyzer; if the problem persists, report this reason. private-token".to_string(),
+        ] {
+            let mut outcome = failed("diagnostics_invalid");
+            outcome.error.as_mut().unwrap().message = message;
+            let result = run_with_logical_mapping(
+                &ANALYZER_DESCRIPTOR,
+                outcome,
+                &findings_request(),
+                &workspace(),
+            );
+            let serialized = serde_json::to_value(result).unwrap();
+            assert_eq!(
+                serialized["providers"][0]["error"]["message"],
+                "diagnostic provider returned an invalid diagnostics stream"
+            );
+        }
+    }
+
+    #[test]
     fn diagnostics_metadata_object_scope_excludes_separately_addressable_children() {
         let outcome = successful(vec![
             diagnostic(
@@ -2766,7 +3003,7 @@ mod tests {
 
     #[test]
     fn diagnostics_out_of_scope_handle_still_costs_the_whole_provider_section() {
-        // ADR-0064 §12: a handle outside the permitted scope is an adapter
+        // A handle outside the permitted scope is an adapter
         // contract breach, not one unprovable resource, so its siblings are
         // not trustworthy either.
         let breaching = successful(vec![

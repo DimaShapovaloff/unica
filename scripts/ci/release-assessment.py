@@ -31,7 +31,7 @@ SOURCE_DIR = "src/cf"
 EXPECTED_PUBLIC_TOOLS = {
     "unica.view",
     "unica.apply",
-    "unica.find",
+    "unica.resolve",
     "unica.search",
     "unica.check",
     "unica.diff",
@@ -51,13 +51,6 @@ P0_LIFECYCLE_SCENARIOS = (
     "restart",
     "rollback",
 )
-SAFE_V13_AT_LEAST_ONCE_REPLAY_TOOLS = frozenset(
-    {"unica.check", "unica.view", "unica.find", "unica.search", "unica.diff"}
-)
-LOST_DAEMON_SUBMIT_RESPONSE_CODE = -32000
-LOST_DAEMON_SUBMIT_RESPONSE_MESSAGE = (
-    "daemon deadline expired during invocation submit response"
-)
 
 
 def utc_now() -> str:
@@ -65,7 +58,15 @@ def utc_now() -> str:
 
 
 def dry_lifecycle_outcomes() -> dict[str, dict[str, Any]]:
-    """Name lifecycle evidence that is intentionally deferred outside RC joins."""
+    """Name lifecycle evidence that is intentionally deferred outside RC joins.
+
+    This is the only producer of ``lifecycle`` in the repository, and it is
+    unconditional on purpose: the assessment runs before publication, and fresh
+    install, upgrade, offline prefetch, restart and rollback can only be proven
+    on published bytes. That proof is step R-3 of IngvarConsulting/unica#871 and
+    needs its own post-publication producer; until it exists every scenario is
+    ``deferred`` (#697).
+    """
     return {
         name: {
             "status": "deferred",
@@ -252,7 +253,10 @@ def unica_version(run_unica: Path) -> str:
             if isinstance(tool, dict) and tool.get("name") == "unica"
         ]
         if len(candidates) != 1:
-            raise SystemExit("candidate runtime manifest must contain exactly one unica tool")
+            raise SystemExit(
+                f"{tool_manifest_path} must contain exactly one tool named unica, "
+                f"got {len(candidates)}; a packaged candidate lists its core there"
+            )
         version = candidates[0].get("version")
         if not isinstance(version, str) or not version:
             raise SystemExit("candidate runtime manifest unica version is missing")
@@ -524,7 +528,10 @@ def search_progress_snapshots(stdout: str, progress_token: str) -> list[dict[str
 def parse_tool_payload(response: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
     if "error" in response:
         error = response["error"]
-        return None, [str(error.get("message", error))]
+        if isinstance(error, dict) and "code" in error:
+            # Код рядом с текстом: закрытый отказ провода читается по коду.
+            return None, [f"{error['code']}: {error.get('message', '')}"]
+        return None, [str(error.get("message", error) if isinstance(error, dict) else error)]
     result = response.get("result")
     if isinstance(result, dict) and "structuredContent" in result:
         payload = result.get("structuredContent")
@@ -554,7 +561,7 @@ def response_output_size(stdout: str, stderr: str, payload: dict[str, Any] | Non
 def project_source_sets(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Read the source sets from the typed result.
 
-    ADR-0023 moved the map out of `stdout`, where it used to be a JSON string
+    The typed result contract moved the map out of `stdout`, where it used to be a JSON string
     inside the JSON envelope; `data` is the only place it lives now.
     """
 
@@ -749,7 +756,9 @@ def run_tool_scenario(
 def pending_v13_task(payload: dict[str, Any] | None) -> tuple[str, int] | None:
     data = payload.get("data") if isinstance(payload, dict) else None
     task = data.get("task") if isinstance(data, dict) else None
-    if not isinstance(task, dict) or task.get("status") not in {"submitted", "working"}:
+    # Незавершённые статусы снимка задачи — словарь `project_task_snapshot`
+    # в crates/unica-coder/src/application/v13/task_tools.rs.
+    if not isinstance(task, dict) or task.get("status") not in {"queued", "working"}:
         return None
     task_id = task.get("taskId")
     poll_interval_ms = task.get("pollIntervalMs", 250)
@@ -778,7 +787,6 @@ def run_v13_tool_scenario(
     total_duration_ms = 0
     total_output_bytes = 0
     task_polls = 0
-    submit_retries = 0
     next_tool = tool
     next_arguments = dict(arguments)
 
@@ -795,25 +803,11 @@ def run_v13_tool_scenario(
             timeout_seconds=remaining,
         )
         total_duration_ms += duration_ms
-        if (
-            submit_retries == 0
-            and next_tool == tool
-            and tool in SAFE_V13_AT_LEAST_ONCE_REPLAY_TOOLS
-            and returncode == 0
-            and len(responses) == 1
-            and responses[0].get("error")
-            == {
-                "code": LOST_DAEMON_SUBMIT_RESPONSE_CODE,
-                "message": LOST_DAEMON_SUBMIT_RESPONSE_MESSAGE,
-            }
-        ):
-            # The daemon may have accepted this read before its bounded submit
-            # response was lost. V3 has no stable recovery identity, so replay
-            # is explicitly at-least-once and may execute the read twice. Keep
-            # it to read-only tools, one replay and the original scenario budget.
-            total_output_bytes += response_output_size(stdout, stderr, None)
-            submit_retries += 1
-            continue
+        # Потерянный submit-response демон v5 восстанавливает сам, по точному
+        # ключу квитанции и в своём окне после cutoff; до провода `-32000`
+        # доходит только когда не уложились и в него. Здесь это отказ сценария,
+        # как любой другой: повтора нет, чтобы сигнал не исчезал в метрике,
+        # которую никто не читает (#698).
         if returncode != 0:
             errors.append(f"unica exited with {returncode}: {stderr.strip()}")
         if len(responses) != 1:
@@ -841,8 +835,6 @@ def run_v13_tool_scenario(
     metrics: dict[str, Any] = {
         "outputBytes": total_output_bytes,
         "taskPolls": task_polls,
-        "submitRetries": submit_retries,
-        "submitReplaySemantics": "at-least-once" if submit_retries else "none",
         "warningsCount": len(payload.get("warnings", [])) if payload else 0,
         "errorsCount": len(errors),
     }
@@ -875,23 +867,44 @@ def validate_v13_scenario(
         fail_v13_scenario(scenario, "canonical v0.13 result does not contain object data")
         return
     scenario_id = scenario["id"]
-    if scenario_id == "workspace-check":
-        sources = data.get("sources")
-        if data.get("status") != "admitted" or not isinstance(sources, list) or "main" not in sources:
-            fail_v13_scenario(scenario, "check did not admit the BSP main source set")
+    if scenario_id == "workspace-facts":
+        sets = data.get("sourceSets")
+        if not isinstance(sets, list) or not any(
+            isinstance(entry, dict) and entry.get("name") == "main" for entry in sets
+        ):
+            fail_v13_scenario(scenario, "view did not discover the BSP main source set")
+    elif scenario_id == "workspace-check":
+        # Вердикт говорит словарём вердикта и не несёт перечня наборов:
+        # это факт, и он остаётся в `unica.view {}`
+        # (DEC.2026-09-08.ROOT-VERDICT-IN-CHECK).
+        if data.get("status") not in {"passed", "failed"}:
+            fail_v13_scenario(scenario, "check did not answer the workspace verdict")
+        elif not isinstance(data.get("ready"), bool):
+            fail_v13_scenario(scenario, "workspace verdict carries no readiness")
+        elif "sources" in data:
+            fail_v13_scenario(scenario, "workspace verdict still carries the source-set list")
     elif scenario_id == "configuration-view":
         if data.get("kind") != "Configuration" or not isinstance(data.get("branches"), list):
             fail_v13_scenario(scenario, "view did not return the BSP Configuration projection")
     elif scenario_id == "logical-find":
-        candidates = data.get("candidates")
-        if not isinstance(candidates, list) or not candidates:
-            fail_v13_scenario(scenario, "find did not return a BSP logical address")
+        matches = data.get("matches")
+        if not isinstance(matches, list) or not matches:
+            fail_v13_scenario(scenario, "name search did not return a BSP logical address")
         elif any(
-            not isinstance(candidate, dict)
-            or not str(candidate.get("at", "")).startswith("main:")
-            for candidate in candidates
+            not isinstance(match, dict) or not str(match.get("at", "")).startswith("main:")
+            for match in matches
         ):
-            fail_v13_scenario(scenario, "find returned a non-logical BSP candidate")
+            fail_v13_scenario(scenario, "name search returned a non-logical BSP hit")
+    elif scenario_id == "layout-resolve":
+        # Мост обязан отвечать путём — и обязан честно называть, есть ли у
+        # предмета строки: отсутствие поля читатель принял бы за «не
+        # посчиталось».
+        if not isinstance(data.get("path"), str) or not data["path"]:
+            fail_v13_scenario(scenario, "resolve did not answer a source path")
+        elif not str(data.get("at", "")).startswith("main:"):
+            fail_v13_scenario(scenario, "resolve did not answer a logical address")
+        elif not isinstance(data.get("lines"), dict) or "state" not in data["lines"]:
+            fail_v13_scenario(scenario, "resolve did not name whether the source has lines")
     elif scenario_id == "literal-search":
         matches = data.get("matches")
         if data.get("mode") != "literal" or not isinstance(matches, list) or not matches:
@@ -1358,8 +1371,15 @@ def build_assessment_report(
     scenarios.append(run_tools_list_scenario(run_unica, bsp_root, cache_dir, timeout_seconds))
     v13_scenarios = [
         (
+            "workspace-facts",
+            "Discover the BSP workspace",
+            "unica.view",
+            {},
+            True,
+        ),
+        (
             "workspace-check",
-            "Admit the BSP workspace",
+            "Judge the BSP workspace",
             "unica.check",
             {},
             True,
@@ -1373,9 +1393,16 @@ def build_assessment_report(
         ),
         (
             "logical-find",
-            "Resolve a BSP common module by logical identity",
-            "unica.find",
-            {"query": "ОбщегоНазначения", "kind": "CommonModule", "limit": 10},
+            "Find a BSP common module by name",
+            "unica.search",
+            {"corpus": "names", "query": "ОбщегоНазначения", "kind": "CommonModule", "limit": 10},
+            False,
+        ),
+        (
+            "layout-resolve",
+            "Bridge a BSP logical address to its source file",
+            "unica.resolve",
+            {"at": "main:Configuration"},
             False,
         ),
         (

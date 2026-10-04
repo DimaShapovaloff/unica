@@ -7,7 +7,6 @@ use crate::domain::invocation::{
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
-#[cfg(feature = "receipt-ledger-test-support")]
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroU64;
@@ -236,7 +235,6 @@ impl fmt::Display for ReceiptLedgerError {
 
 impl std::error::Error for ReceiptLedgerError {}
 
-#[cfg(feature = "receipt-ledger-test-support")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReceiptLedgerCatalogSnapshot {
     generation: u64,
@@ -250,7 +248,6 @@ pub(crate) struct ReceiptLedgerCatalogSnapshot {
     tombstone_bytes: u64,
 }
 
-#[cfg(feature = "receipt-ledger-test-support")]
 impl ReceiptLedgerCatalogSnapshot {
     pub(crate) const fn generation(&self) -> u64 {
         self.generation
@@ -294,12 +291,10 @@ impl ReceiptLedgerCatalogSnapshot {
 /// Only the application actor can mint the authority. The concrete store may
 /// consume it after observing its complete catalog under the retained writer
 /// fence, while callers receive only the validated, read-only snapshot.
-#[cfg(feature = "receipt-ledger-test-support")]
 pub(crate) struct ReceiptLedgerCatalogSnapshotAuthority {
     _private: (),
 }
 
-#[cfg(feature = "receipt-ledger-test-support")]
 pub(crate) struct ReceiptLedgerCatalogSnapshotParts {
     generation: u64,
     keys: Vec<ReceiptKey>,
@@ -312,7 +307,6 @@ pub(crate) struct ReceiptLedgerCatalogSnapshotParts {
     tombstone_bytes: u64,
 }
 
-#[cfg(feature = "receipt-ledger-test-support")]
 impl ReceiptLedgerCatalogSnapshotParts {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -340,7 +334,6 @@ impl ReceiptLedgerCatalogSnapshotParts {
     }
 }
 
-#[cfg(feature = "receipt-ledger-test-support")]
 impl ReceiptLedgerCatalogSnapshotAuthority {
     pub(super) const fn new() -> Self {
         Self { _private: () }
@@ -450,7 +443,6 @@ impl ReceiptLedgerCatalogSnapshotAuthority {
     }
 }
 
-#[cfg(feature = "receipt-ledger-test-support")]
 fn same_exact_receipt_key_set(
     expected: &HashMap<ReceiptKeyDigest, &ReceiptKey>,
     observed: &[ReceiptKey],
@@ -468,7 +460,6 @@ fn same_exact_receipt_key_set(
 /// The port deliberately requires only `Send`: the actor moves one concrete
 /// writer to its worker thread and never shares it behind a mutex.
 pub(crate) trait ReceiptLedgerPort: Send + 'static {
-    #[cfg(feature = "receipt-ledger-test-support")]
     fn snapshot_catalog(
         &mut self,
         _authority: ReceiptLedgerCatalogSnapshotAuthority,
@@ -481,7 +472,6 @@ pub(crate) trait ReceiptLedgerPort: Send + 'static {
         Err(ReceiptLedgerError::StoreUnavailable)
     }
 
-    #[cfg(feature = "receipt-ledger-test-support")]
     fn rotate_generation_for_test(
         &mut self,
         _deadline: Instant,
@@ -747,8 +737,8 @@ pub(crate) enum V5ToolIdentity {
     View,
     #[serde(rename = "unica.apply")]
     Apply,
-    #[serde(rename = "unica.find")]
-    Find,
+    #[serde(rename = "unica.resolve")]
+    Resolve,
     #[serde(rename = "unica.search")]
     Search,
     #[serde(rename = "unica.check")]
@@ -765,7 +755,7 @@ impl V5ToolIdentity {
     pub(crate) const ALL: [Self; 8] = [
         Self::View,
         Self::Apply,
-        Self::Find,
+        Self::Resolve,
         Self::Search,
         Self::Check,
         Self::Diff,
@@ -777,7 +767,7 @@ impl V5ToolIdentity {
         match self {
             Self::View => "unica.view",
             Self::Apply => "unica.apply",
-            Self::Find => "unica.find",
+            Self::Resolve => "unica.resolve",
             Self::Search => "unica.search",
             Self::Check => "unica.check",
             Self::Diff => "unica.diff",
@@ -3470,7 +3460,7 @@ mod tests {
                 baseline.reserved_task_id(),
                 RequestIdentity::new(
                     baseline.core_identity_digest().clone(),
-                    V5ToolIdentity::Find,
+                    V5ToolIdentity::Resolve,
                     baseline.normalized_arguments_hash().clone(),
                     baseline.request_scope_hash().clone(),
                 ),
@@ -4079,6 +4069,25 @@ mod tests {
             terminal.digest().as_str(),
             "f2d0423d2613a0d09397b750542e4542f7653d78ebd5e0448f1326d09145d9ae"
         );
+    }
+
+    #[test]
+    fn completed_terminal_with_provider_score_survives_receipt_reopen() {
+        // A v8std search page can contain this exact score. Parsing it to the
+        // adjacent f64 changes the receipt digest and makes a completed docs
+        // call fail with store_failed when the ledger reopens its own record.
+        let mut result = DomainResult::success("docs page");
+        result.data = Some(json!({"hits": [{"providerScore": 916.6563720703125}]}));
+        let committed = canonical_v5_terminal(&ReceiptTerminalOutcome::Completed {
+            result: Box::new(result),
+        })
+        .expect("canonical docs terminal");
+        let reopened: ReceiptTerminalOutcome =
+            serde_json::from_slice(committed.payload()).expect("reopen terminal");
+        let restored = canonical_v5_terminal(&reopened).expect("restore terminal");
+
+        assert_eq!(restored.digest(), committed.digest());
+        assert_eq!(restored.payload(), committed.payload());
     }
 
     #[test]

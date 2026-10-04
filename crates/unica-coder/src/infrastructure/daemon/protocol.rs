@@ -59,10 +59,21 @@ impl InvocationRequest {
         &self.arguments
     }
 
+    /// Check's nullable options have the same meaning as omitted options.
+    /// Normalize before root routing and cursor identity are established.
+    pub(super) fn normalize_check_options(&mut self) {
+        if self.tool == ToolIdentity::Check {
+            self.arguments.retain(|name, value| {
+                !matches!(name.as_str(), "at" | "limit" | "cursor") || !value.is_null()
+            });
+        }
+    }
+
     pub(crate) fn workspace_hint(&self) -> &str {
         &self.workspace_hint
     }
 
+    #[cfg(test)]
     pub(crate) fn response_budget_ms(&self) -> u64 {
         self.response_budget_ms
     }

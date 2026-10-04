@@ -1,4 +1,5 @@
 use super::super::protocol::InvocationRequest;
+use super::super::v13_workspace_bootstrap::project_config_present;
 use crate::application::invocation::InvocationResponseDeadline;
 use crate::application::operation_descriptors::ExecutionClass;
 use crate::application::shared_work::{
@@ -10,25 +11,94 @@ use crate::domain::apply::ApplyRequest;
 use crate::domain::cancellation::CancellationToken;
 use crate::domain::code_intelligence::ProviderDeadline;
 use crate::domain::invocation::{DomainResult, InvocationFailure, SafeIdentityHash};
-use crate::domain::project_sources::{SourceFormat, SourceProfile, SourceSetKind};
+use crate::domain::project_sources::{
+    ProjectSourceSet, SourceFormat, SourceProfile, SourceSetKind,
+};
 use crate::domain::refusal::RefusalCode;
 use crate::infrastructure::platform::filesystem::RetainedDirectoryCapability;
 use crate::infrastructure::runtime_jobs::{RuntimeJobService, RuntimeResourceOwner};
 use crate::infrastructure::source_selection_evidence::discover_project_source_admission;
+use crate::infrastructure::source_selection_evidence::SourceSelectionEvidenceErrorKind;
+use crate::infrastructure::v13_large_configuration::RegistrationCache;
 use crate::infrastructure::workspace::discover_workspace;
+#[cfg(test)]
+use crate::infrastructure::workspace_actor::WorkspaceRevisionFence;
 use crate::infrastructure::workspace_actor::{
     ApplyAdmission, ApplyAdmissionError, IndexWorkIdentity, ProviderRootBinding, WorkspaceActor,
-    WorkspaceActorRegistry, WorkspaceActorRegistryError, WorkspaceLogicalReadFence,
-    WorkspaceRevisionFence, WorkspaceSourceSetInput,
+    WorkspaceActorRegistry, WorkspaceActorRegistryError, WorkspaceSourceSetInput,
 };
+use std::io::BufRead;
 use std::sync::Arc;
 use std::time::Duration;
 
 const ACTOR_OPERATION_BUDGET: Duration = Duration::from_secs(7);
 const CANONICAL_SEARCH_MAX_ENTRIES: usize = 16_384;
-const CANONICAL_SEARCH_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
-const CANONICAL_SEARCH_MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+// Regex anchors and Unicode columns require a complete line. Keep that
+// indivisible unit bounded; neither file nor corpus size is a memory budget.
+const CANONICAL_SEARCH_MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 const CANONICAL_SEARCH_MAX_DEPTH: usize = 32;
+const CANONICAL_SEARCH_MAX_UNCOVERED_DETAILS: usize = 32;
+
+#[derive(Default)]
+pub(in crate::infrastructure::daemon) struct LiteralSearchScan {
+    pub(in crate::infrastructure::daemon) matches: Vec<serde_json::Value>,
+    pub(in crate::infrastructure::daemon) uncovered: usize,
+    pub(in crate::infrastructure::daemon) details: Vec<serde_json::Value>,
+    pub(in crate::infrastructure::daemon) scan_complete: bool,
+}
+
+impl LiteralSearchScan {
+    fn complete() -> Self {
+        Self {
+            scan_complete: true,
+            ..Self::default()
+        }
+    }
+
+    fn mark_uncovered(&mut self, source_set: &str, file_ordinal: usize, reason: &str) {
+        self.uncovered += 1;
+        if self.details.len() < CANONICAL_SEARCH_MAX_UNCOVERED_DETAILS {
+            let mut detail = serde_json::Map::new();
+            detail.insert("sourceSet".to_owned(), source_set.into());
+            // The ordinal identifies this file within the current live scan
+            // without revealing its retained-relative path.
+            detail.insert("fileId".to_owned(), format!("bsl-{file_ordinal}").into());
+            detail.insert("reason".to_owned(), reason.into());
+            self.details.push(serde_json::Value::Object(detail));
+        }
+    }
+}
+
+fn read_search_line_bounded(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+    max_bytes: usize,
+    mut checkpoint: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    line.clear();
+    loop {
+        checkpoint()?;
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(!line.is_empty());
+        }
+        let count = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if count > max_bytes.saturating_sub(line.len()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!("source line exceeds the {max_bytes}-byte search limit"),
+            ));
+        }
+        line.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        if line.last() == Some(&b'\n') {
+            return Ok(true);
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct ActorBoundInvocation {
@@ -39,6 +109,9 @@ pub(crate) struct ActorBoundInvocation {
     provider_root: ProviderRootBinding,
     #[allow(dead_code)] // consumed only by the injected Task 14 service before Task 22
     read_sources: Arc<[ActorReadSourceBinding]>,
+    parent_source_names: Vec<String>,
+    parent_source_selection:
+        Arc<crate::infrastructure::source_selection_evidence::RetainedSourceSelectionEvidence>,
     workspace_identity_hash: SafeIdentityHash,
     deliveries: Arc<crate::infrastructure::engine_delivery::DeliveryDesk>,
     provider_hosts: Arc<ProviderHostOwner>,
@@ -56,8 +129,9 @@ struct ActorReadSourceBinding {
 pub(in crate::infrastructure::daemon) struct ActorReadSourceCapability {
     binding: ProviderRootBinding,
     identity: String,
-    fence: WorkspaceLogicalReadFence,
+    read_identity: String,
     deadline: ProviderDeadline,
+    registration_cache: Arc<RegistrationCache>,
 }
 
 #[allow(dead_code)]
@@ -66,7 +140,7 @@ impl ActorReadSourceCapability {
         self.binding.source_set_name()
     }
 
-    const fn source_kind(&self) -> SourceSetKind {
+    pub(in crate::infrastructure::daemon) const fn source_kind(&self) -> SourceSetKind {
         self.binding.source_kind()
     }
 
@@ -90,36 +164,43 @@ impl ActorReadSourceCapability {
         let platform_profile = source_profile.platform_profile().ok_or_else(|| {
             "actor-bound logical source has no supported platform profile".to_string()
         })?;
-        let read =
-            crate::infrastructure::v13_read_port::ProviderReadAuthority::new_with_revision_lease(
-                self.binding.source_set_name(),
-                self.identity.clone(),
-                self.binding.source_kind(),
-                self.binding.retained_root(),
-                self.fence.revision(),
-            );
+        let read = crate::infrastructure::v13_read_port::ProviderReadAuthority::new_local_snapshot(
+            self.binding.source_set_name(),
+            self.identity.clone(),
+            self.binding.source_kind(),
+            self.binding.retained_root(),
+            self.read_identity.clone(),
+        );
         Ok(
-            crate::infrastructure::v13_read::LogicalViewReadAuthority::with_read_authority(
+            crate::infrastructure::v13_read::LogicalViewReadAuthority::with_read_authority_and_registration_cache(
                 cancellation,
                 read,
                 platform_profile,
                 self.deadline,
+                Arc::clone(&self.registration_cache),
             ),
         )
     }
 
+    pub(in crate::infrastructure::daemon) fn retained_root(
+        &self,
+    ) -> Arc<RetainedDirectoryCapability> {
+        self.binding.retained_root()
+    }
+
     pub(in crate::infrastructure::daemon) fn revision_identity(&self) -> String {
-        self.fence.revision().revision_identity()
+        self.read_identity.clone()
     }
 
     pub(in crate::infrastructure::daemon) fn search_bsl_literal(
         &self,
         matcher: &super::super::v13_read_modes::SearchMatcher,
+        skip: &mut usize,
         limit: usize,
         scope_prefix: Option<&str>,
         scope_at: &QualifiedAddress,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<serde_json::Value>, String> {
+    ) -> Result<LiteralSearchScan, String> {
         use crate::infrastructure::platform::filesystem::RetainedChildCapability;
 
         // A raw OS error carries no recovery signal for the caller; every
@@ -145,7 +226,7 @@ impl ActorReadSourceCapability {
                         .retain_immediate_child_nofollow(std::ffi::OsStr::new(component))
                     {
                         Ok(child) => child,
-                        Err(error) if vanished(&error) => return Ok(Vec::new()),
+                        Err(error) if vanished(&error) => return Ok(LiteralSearchScan::complete()),
                         Err(error) => {
                             return Err(context("could not open the scope subtree", error))
                         }
@@ -158,7 +239,9 @@ impl ActorReadSourceCapability {
                             )
                         }
                         RetainedChildCapability::RegularFile(_)
-                        | RetainedChildCapability::Unsupported => return Ok(Vec::new()),
+                        | RetainedChildCapability::Unsupported => {
+                            return Ok(LiteralSearchScan::complete())
+                        }
                     }
                 }
                 (relative, directory)
@@ -166,8 +249,8 @@ impl ActorReadSourceCapability {
         };
         let mut stack = vec![(start_relative, start_directory, 0_usize)];
         let mut visited_entries = 0_usize;
-        let mut read_bytes = 0_usize;
-        let mut matches = Vec::new();
+        let mut scan = LiteralSearchScan::complete();
+        let mut file_ordinal = 0_usize;
         while let Some((relative_directory, directory, depth)) = stack.pop() {
             if cancellation.is_cancelled() {
                 return Err("canonical search was cancelled".to_string());
@@ -207,10 +290,7 @@ impl ActorReadSourceCapability {
                 if visited_entries > CANONICAL_SEARCH_MAX_ENTRIES {
                     return Err("canonical search exceeded its retained entry limit".to_string());
                 }
-                let Some(name_text) = name.to_str() else {
-                    continue;
-                };
-                let relative = relative_directory.join(name_text);
+                let relative = relative_directory.join(&name);
                 let child = match directory.retain_immediate_child_nofollow(&name) {
                     Ok(child) => child,
                     Err(error) if vanished(&error) => continue,
@@ -224,37 +304,103 @@ impl ActorReadSourceCapability {
                     {
                         stack.push((relative, child_directory, depth + 1));
                     }
+                    RetainedChildCapability::Directory(_) => {
+                        return Err("canonical search exceeded its retained depth limit".to_string())
+                    }
                     RetainedChildCapability::RegularFile(file)
                         if relative
                             .extension()
                             .and_then(std::ffi::OsStr::to_str)
                             .is_some_and(|extension| extension.eq_ignore_ascii_case("bsl")) =>
                     {
-                        match file.validate_named_identity() {
-                            Ok(()) => {}
+                        file_ordinal += 1;
+                        let opened = match file.open_named_identity_for_read() {
+                            Ok(opened) => opened,
                             Err(error) if vanished(&error) => continue,
                             Err(error) => {
                                 return Err(context("lost a retained source file", error))
                             }
-                        }
-                        let bytes = match file.read_bounded(CANONICAL_SEARCH_MAX_FILE_BYTES) {
-                            Ok(bytes) => bytes,
-                            Err(error) if vanished(&error) => continue,
-                            Err(error) => {
-                                return Err(context("could not read a source file", error))
-                            }
                         };
-                        read_bytes = read_bytes.saturating_add(bytes.len());
-                        if read_bytes > CANONICAL_SEARCH_MAX_TOTAL_BYTES {
-                            return Err(
-                                "canonical search exceeded its retained byte limit".to_string()
+                        let mut reader = std::io::BufReader::new(opened);
+                        let mut raw_line = Vec::new();
+                        let mut line_index = 0_usize;
+                        loop {
+                            let has_line = read_search_line_bounded(
+                                &mut reader,
+                                &mut raw_line,
+                                CANONICAL_SEARCH_MAX_LINE_BYTES,
+                                || {
+                                    if cancellation.is_cancelled() {
+                                        Err(std::io::Error::new(
+                                            std::io::ErrorKind::Interrupted,
+                                            "canonical search was cancelled",
+                                        ))
+                                    } else if self.deadline.remaining().is_zero() {
+                                        Err(std::io::Error::new(
+                                            std::io::ErrorKind::TimedOut,
+                                            "canonical search operation deadline elapsed",
+                                        ))
+                                    } else {
+                                        Ok(())
+                                    }
+                                },
                             );
-                        }
-                        let Ok(text) = std::str::from_utf8(&bytes) else {
-                            continue;
-                        };
-                        for (line_index, line) in text.lines().enumerate() {
+                            let has_line = match has_line {
+                                Ok(has_line) => has_line,
+                                Err(error) if error.kind() == std::io::ErrorKind::FileTooLarge => {
+                                    scan.mark_uncovered(
+                                        self.binding.source_set_name(),
+                                        file_ordinal,
+                                        "line_too_long",
+                                    );
+                                    break;
+                                }
+                                Err(error)
+                                    if matches!(
+                                        error.kind(),
+                                        std::io::ErrorKind::Interrupted
+                                            | std::io::ErrorKind::TimedOut
+                                    ) =>
+                                {
+                                    return Err(error.to_string())
+                                }
+                                Err(error) => {
+                                    return Err(context("could not read a source file", error))
+                                }
+                            };
+                            if !has_line {
+                                break;
+                            }
+                            line_index += 1;
+                            let Ok(text) = std::str::from_utf8(&raw_line) else {
+                                scan.mark_uncovered(
+                                    self.binding.source_set_name(),
+                                    file_ordinal,
+                                    "invalid_utf8",
+                                );
+                                break;
+                            };
+                            let line = text.strip_suffix('\n').map_or(text, |without_lf| {
+                                without_lf.strip_suffix('\r').unwrap_or(without_lf)
+                            });
+                            let mut previous_byte = 0;
+                            let mut column = 1;
+                            let mut snippet = None::<String>;
                             for byte_column in matcher.match_starts(line) {
+                                if cancellation.is_cancelled() {
+                                    return Err("canonical search was cancelled".to_string());
+                                }
+                                if self.deadline.remaining().is_zero() {
+                                    return Err(
+                                        "canonical search operation deadline elapsed".to_string()
+                                    );
+                                }
+                                column += line[previous_byte..byte_column].chars().count();
+                                previous_byte = byte_column;
+                                if *skip > 0 {
+                                    *skip -= 1;
+                                    continue;
+                                }
                                 let mut item = serde_json::Map::new();
                                 item.insert(
                                     "scope".to_string(),
@@ -262,35 +408,34 @@ impl ActorReadSourceCapability {
                                 );
                                 item.insert(
                                     "line".to_string(),
-                                    serde_json::Value::from(line_index + 1),
+                                    serde_json::Value::from(line_index),
                                 );
-                                item.insert(
-                                    "column".to_string(),
-                                    serde_json::Value::from(
-                                        line[..byte_column].chars().count() + 1,
-                                    ),
-                                );
+                                item.insert("column".to_string(), serde_json::Value::from(column));
                                 item.insert(
                                     "snippet".to_string(),
                                     serde_json::Value::String(
-                                        line.chars().take(512).collect::<String>(),
+                                        snippet
+                                            .get_or_insert_with(|| {
+                                                line.chars().take(512).collect::<String>()
+                                            })
+                                            .clone(),
                                     ),
                                 );
-                                matches.push(serde_json::Value::Object(item));
-                                if matches.len() == limit {
-                                    return Ok(matches);
+                                scan.matches.push(serde_json::Value::Object(item));
+                                if scan.matches.len() == limit {
+                                    scan.scan_complete = false;
+                                    return Ok(scan);
                                 }
                             }
                         }
                     }
-                    RetainedChildCapability::Directory(_)
-                    | RetainedChildCapability::RegularFile(_)
+                    RetainedChildCapability::RegularFile(_)
                     | RetainedChildCapability::ReparsePoint
                     | RetainedChildCapability::Unsupported => {}
                 }
             }
         }
-        Ok(matches)
+        Ok(scan)
     }
 }
 
@@ -298,14 +443,15 @@ impl ActorReadSourceCapability {
 pub(super) fn actor_read_source_capability_for_test(
     binding: ProviderRootBinding,
     identity: String,
-    fence: WorkspaceLogicalReadFence,
+    fence: crate::infrastructure::workspace_actor::WorkspaceLogicalReadFence,
     deadline: ProviderDeadline,
 ) -> ActorReadSourceCapability {
     ActorReadSourceCapability {
         binding,
         identity,
-        fence,
+        read_identity: fence.revision().revision_identity(),
         deadline,
+        registration_cache: Arc::new(RegistrationCache::default()),
     }
 }
 
@@ -322,12 +468,14 @@ pub(super) fn actor_read_source_metadata_for_test(
 
 struct ActorLogicalReadSourceLease {
     binding: ProviderRootBinding,
-    fence: WorkspaceLogicalReadFence,
+    read_identity: String,
+    registration_cache: Arc<RegistrationCache>,
 }
 
 struct ActorLogicalReadLease {
     deadline: ProviderDeadline,
     sources: Vec<ActorLogicalReadSourceLease>,
+    parent_sources: std::sync::Mutex<Vec<ActorLogicalReadSourceLease>>,
     route: ActorLogicalReadRoute,
 }
 
@@ -428,11 +576,25 @@ impl ActorBoundInvocation {
         cancellation: &CancellationToken,
         logical_deadline: ProviderDeadline,
     ) -> Result<ActorBoundExecution, String> {
+        if cancellation.is_cancelled() {
+            return Err("source operation was cancelled before admission".into());
+        }
         let revision = match self.tool {
             crate::application::invocation_store::ToolIdentity::Apply => {
                 ActorExecutionRevision::UnpublishedApply(std::sync::atomic::AtomicBool::new(false))
             }
-            crate::application::invocation_store::ToolIdentity::Find => {
+            // Поиск по именам ходит в тот же справочник адресов и путей, что
+            // и разрешение локатора, и потому просит тот же допуск: раскладку
+            // без аренды ревизии. Свод выбирает режим, потому что режимы у
+            // сводов разные по природе: текст читается из текущих файлов,
+            // справочник имён использует раскладку, и ни один не собирает ревизию.
+            crate::application::invocation_store::ToolIdentity::Search
+                if self
+                    .arguments
+                    .get("corpus")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("names") =>
+            {
                 ActorExecutionRevision::LayoutRead(ActorLayoutReadLease {
                     deadline: logical_deadline,
                     bindings: self
@@ -442,13 +604,34 @@ impl ActorBoundInvocation {
                         .collect(),
                 })
             }
+            // Мост в раскладку двусторонний, и стороны просят разного
+            // допуска. Путь пришёл снаружи — искать его надо по всем наборам,
+            // и хватает справочника раскладки. Адрес известен — предмет один,
+            // а диапазон строк у него берётся чтением исходника, значит нужен
+            // тот же допуск, что у `view`.
+            crate::application::invocation_store::ToolIdentity::Resolve
+                if !self.arguments.contains_key("at") =>
+            {
+                ActorExecutionRevision::LayoutRead(ActorLayoutReadLease {
+                    deadline: logical_deadline,
+                    bindings: self
+                        .read_sources
+                        .iter()
+                        .map(|source| source.binding.clone())
+                        .collect(),
+                })
+            }
+            // `Docs` в этом перечне нет: справка отвечает до допуска и
+            // аренды исходников не просит — свод, который читал бы рабочее
+            // пространство, до actor-owned читателя отвечает отказом.
             crate::application::invocation_store::ToolIdentity::View
+            | crate::application::invocation_store::ToolIdentity::Resolve
             | crate::application::invocation_store::ToolIdentity::Search
             | crate::application::invocation_store::ToolIdentity::Check
-            | crate::application::invocation_store::ToolIdentity::Diff
-            | crate::application::invocation_store::ToolIdentity::Docs => {
+            | crate::application::invocation_store::ToolIdentity::Diff => {
                 let (selected, route) = match self.tool {
-                    crate::application::invocation_store::ToolIdentity::View => {
+                    crate::application::invocation_store::ToolIdentity::View
+                    | crate::application::invocation_store::ToolIdentity::Resolve => {
                         match self.arguments.get("at").and_then(serde_json::Value::as_str) {
                             Some(at) => match QualifiedAddress::parse(at) {
                                 Ok(address) => match self
@@ -499,35 +682,43 @@ impl ActorBoundInvocation {
                         "logical read admission selected no actor-owned source sets".to_string()
                     );
                 }
-                let mut sources = Vec::with_capacity(selected.len());
-                for source in selected {
-                    let fence = self.actor.capture_logical_read_revision(
-                        &source.binding,
-                        logical_deadline,
-                        cancellation,
-                    )?;
-                    sources.push(ActorLogicalReadSourceLease {
+                let sources = selected
+                    .into_iter()
+                    .map(|source| ActorLogicalReadSourceLease {
                         binding: source.binding.clone(),
-                        fence,
-                    });
-                }
+                        read_identity: uuid::Uuid::new_v4().to_string(),
+                        registration_cache: Arc::new(RegistrationCache::default()),
+                    })
+                    .collect();
                 ActorExecutionRevision::LogicalRead(ActorLogicalReadLease {
                     deadline: logical_deadline,
                     sources,
+                    parent_sources: std::sync::Mutex::new(Vec::new()),
                     route,
                 })
             }
-            _ => ActorExecutionRevision::Legacy(self.actor.capture_revision(
-                &self.provider_root,
-                ProviderDeadline::from_budget(ACTOR_OPERATION_BUDGET),
-                cancellation,
-            )?),
+            _ => ActorExecutionRevision::LayoutRead(ActorLayoutReadLease {
+                deadline: logical_deadline,
+                bindings: self
+                    .read_sources
+                    .iter()
+                    .map(|source| source.binding.clone())
+                    .collect(),
+            }),
         };
         Ok(ActorBoundExecution {
             invocation: self,
             revision,
         })
     }
+}
+
+fn logical_read_deadline_result() -> DomainResult {
+    DomainResult::canonical_rejection(
+        None,
+        RefusalCode::DeadlineExceeded,
+        "Logical source read exceeded its operation deadline; retry the call.",
+    )
 }
 
 fn invalid_view_address_result(at: &str, detail: impl std::fmt::Display) -> DomainResult {
@@ -565,6 +756,8 @@ pub(crate) struct ActorBoundExecution {
 }
 
 enum ActorExecutionRevision {
+    #[cfg(test)]
+    #[allow(dead_code)]
     Legacy(WorkspaceRevisionFence),
     LogicalRead(ActorLogicalReadLease),
     /// `find` reads the physical layout of the admitted roots and answers a
@@ -630,8 +823,36 @@ impl ActorBoundExecution {
                 )
             })?;
         self.invocation.actor.validate_binding(&binding)?;
-        let admission = self.invocation.actor.admit_apply(
+        let dependencies = request
+            .ops()
+            .iter()
+            .filter(|operation| operation.name() == "object.borrow")
+            .map(|operation| {
+                let from = operation
+                    .args()
+                    .get("from")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        ApplyAdmissionError::Other("borrow parent address is missing".to_string())
+                    })?;
+                let parent = crate::domain::address::QualifiedAddress::parse(from)
+                    .map_err(|error| ApplyAdmissionError::Other(error.to_string()))?;
+                self.invocation
+                    .read_sources
+                    .iter()
+                    .find(|source| source.binding.source_set_name() == parent.source_set())
+                    .map(|source| source.binding.clone())
+                    .ok_or_else(|| {
+                        ApplyAdmissionError::Other(
+                            "borrow parent source was not admitted by the workspace actor"
+                                .to_string(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, ApplyAdmissionError>>()?;
+        let admission = self.invocation.actor.admit_apply_with_dependencies(
             &binding,
+            &dependencies,
             request.if_rev(),
             request.dry_run(),
             ProviderDeadline::from_budget(ACTOR_OPERATION_BUDGET),
@@ -640,6 +861,59 @@ impl ActorBoundExecution {
         Ok((binding, admission))
     }
 
+    pub(in crate::infrastructure::daemon) fn preview_prepared_apply(
+        &self,
+        prepared: &crate::infrastructure::workspace_actor::PreparedApplyBatch,
+    ) -> Result<
+        crate::infrastructure::workspace_actor::ApplyPublicationResult,
+        crate::infrastructure::workspace_actor::ApplyPublicationError,
+    > {
+        let result = self.invocation.actor.preview_prepared_apply(prepared)?;
+        if let ActorExecutionRevision::UnpublishedApply(confirmed) = &self.revision {
+            confirmed.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(result)
+    }
+
+    pub(in crate::infrastructure::daemon) fn save_prepared_apply(
+        &self,
+        prepared: crate::infrastructure::workspace_actor::PreparedApplyBatch,
+        preview: DomainResult,
+    ) -> Result<String, crate::infrastructure::workspace_actor::SavedApplyPlanError> {
+        self.invocation.actor.save_prepared_apply(prepared, preview)
+    }
+
+    pub(in crate::infrastructure::daemon) fn execute_saved_apply(
+        &self,
+        token: &str,
+        cancellation: &CancellationToken,
+        finish: impl FnOnce(
+            DomainResult,
+            Result<
+                crate::infrastructure::workspace_actor::ApplyPublicationResult,
+                crate::infrastructure::workspace_actor::ApplyPublicationError,
+            >,
+        ) -> DomainResult,
+    ) -> Result<DomainResult, crate::infrastructure::workspace_actor::SavedApplyExecutionError>
+    {
+        let ActorExecutionRevision::UnpublishedApply(confirmed) = &self.revision else {
+            return Err(
+                crate::infrastructure::workspace_actor::SavedApplyExecutionError::StateUnavailable(
+                    "saved apply execution belongs to a non-apply invocation",
+                ),
+            );
+        };
+        let result = self.invocation.actor.execute_saved_apply(
+            token,
+            ProviderDeadline::from_budget(ACTOR_OPERATION_BUDGET),
+            cancellation,
+            finish,
+        )?;
+        confirmed.store(true, std::sync::atomic::Ordering::Release);
+        Ok(result)
+    }
+
+    #[cfg(test)]
     pub(in crate::infrastructure::daemon) fn publish_prepared_apply(
         &self,
         prepared: crate::infrastructure::workspace_actor::PreparedApplyBatch,
@@ -667,9 +941,14 @@ impl ActorBoundExecution {
         let ActorExecutionRevision::LogicalRead(lease) = &self.revision else {
             return Err("logical read sources are unavailable to a legacy invocation".to_string());
         };
+        let parents = lease
+            .parent_sources
+            .lock()
+            .map_err(|_| "parent read leases are poisoned")?;
         lease
             .sources
             .iter()
+            .chain(parents.iter())
             .map(|source| {
                 self.invocation.actor.validate_binding(&source.binding)?;
                 Ok(ActorReadSourceCapability {
@@ -679,11 +958,63 @@ impl ActorBoundExecution {
                         self.invocation.workspace_identity_hash.as_str(),
                         source.binding.source_set_name()
                     ),
-                    fence: source.fence.clone(),
+                    read_identity: source.read_identity.clone(),
                     deadline: lease.deadline,
+                    registration_cache: Arc::clone(&source.registration_cache),
                 })
             })
             .collect()
+    }
+
+    /// Lazy parent reads use actor-issued leases and join the final read publication.
+    /// Failure to admit any declared candidate makes the whole parent lookup incomplete.
+    pub(in crate::infrastructure::daemon) fn admit_borrowing_parent_sources(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<(), String> {
+        let ActorExecutionRevision::LogicalRead(lease) = &self.revision else {
+            return Err("parent lookup requires a logical read".into());
+        };
+        self.invocation
+            .parent_source_selection
+            .validate(lease.deadline, cancellation)
+            .map_err(|error| error.to_string())?;
+        let mut parents = lease
+            .parent_sources
+            .lock()
+            .map_err(|_| "parent read leases are poisoned")?;
+        let mut fences = Vec::new();
+        for name in &self.invocation.parent_source_names {
+            let source = self
+                .invocation
+                .read_sources
+                .iter()
+                .find(|source| source.binding.source_set_name() == name)
+                .ok_or_else(|| "a declared parent source is unavailable".to_string())?;
+            self.invocation.actor.validate_binding(&source.binding)?;
+            if !lease
+                .sources
+                .iter()
+                .any(|selected| selected.binding.source_set_name() == name)
+            {
+                let existing = parents.iter().find(|parent| {
+                    parent.binding.source_set_name() == source.binding.source_set_name()
+                });
+                fences.push(ActorLogicalReadSourceLease {
+                    binding: source.binding.clone(),
+                    read_identity: existing.map_or_else(
+                        || uuid::Uuid::new_v4().to_string(),
+                        |parent| parent.read_identity.clone(),
+                    ),
+                    registration_cache: existing.map_or_else(
+                        || Arc::new(RegistrationCache::default()),
+                        |parent| Arc::clone(&parent.registration_cache),
+                    ),
+                });
+            }
+        }
+        *parents = fences;
+        Ok(())
     }
 
     /// Admitted roots for the `find` directory: the retained no-follow root of
@@ -732,17 +1063,15 @@ impl ActorBoundExecution {
         &self,
         provider: &str,
         profile: &str,
+        generation: &str,
         work: W,
     ) -> Result<(IndexWorkIdentity, SharedWorkLease<(), LongWorkFailure>), String>
     where
         W: FnOnce(SharedWorkProducer) -> Result<(), LongWorkFailure> + Send + 'static,
     {
-        let ActorExecutionRevision::Legacy(revision) = &self.revision else {
-            return Err("index work is unavailable to a logical read invocation".to_string());
-        };
         self.invocation.actor.join_index_work(
             &self.invocation.provider_root,
-            revision,
+            generation,
             provider,
             profile,
             work,
@@ -810,6 +1139,7 @@ impl ActorBoundExecution {
         cancellation: &CancellationToken,
     ) -> Result<Result<DomainResult, InvocationFailure>, String> {
         match self.revision {
+            #[cfg(test)]
             ActorExecutionRevision::Legacy(revision) => self
                 .invocation
                 .actor
@@ -825,7 +1155,31 @@ impl ActorBoundExecution {
                 ),
             // A layout directory publishes no revision state: `find` neither
             // captures a lease nor confirms one, so its result stands as read.
-            ActorExecutionRevision::LayoutRead(_) => Ok(staged),
+            ActorExecutionRevision::LayoutRead(lease) => {
+                if staged.is_err() {
+                    return Ok(staged);
+                }
+                for binding in &lease.bindings {
+                    self.invocation.actor.validate_binding(binding)?;
+                }
+                if matches!(
+                    self.invocation.tool,
+                    crate::application::invocation_store::ToolIdentity::Search
+                        | crate::application::invocation_store::ToolIdentity::Resolve
+                ) {
+                    if cancellation.is_cancelled() {
+                        return Ok(Ok(DomainResult::canonical_rejection(
+                            None,
+                            RefusalCode::Cancelled,
+                            "Source layout read was cancelled before publication.",
+                        )));
+                    }
+                    if lease.deadline.remaining().is_zero() {
+                        return Ok(Ok(logical_read_deadline_result()));
+                    }
+                }
+                Ok(staged)
+            }
             ActorExecutionRevision::LogicalRead(lease) => {
                 if let ActorLogicalReadRoute::Rejected(expected) = lease.route {
                     let is_closed_typed_rejection = staged.as_ref() == Ok(expected.as_ref());
@@ -834,17 +1188,40 @@ impl ActorBoundExecution {
                             .to_string()
                     });
                 }
-                let fences = lease
-                    .sources
-                    .into_iter()
-                    .map(|source| source.fence)
-                    .collect::<Vec<_>>();
-                self.invocation.actor.publish_logical_read(
-                    &fences,
-                    staged,
-                    lease.deadline,
-                    cancellation,
-                )
+                if staged.is_err() {
+                    return Ok(staged);
+                }
+                let parent_sources = lease
+                    .parent_sources
+                    .into_inner()
+                    .map_err(|_| "parent read leases are poisoned")?;
+                if !parent_sources.is_empty() {
+                    if let Err(error) = self
+                        .invocation
+                        .parent_source_selection
+                        .validate(lease.deadline, cancellation)
+                    {
+                        return if error.kind() == SourceSelectionEvidenceErrorKind::Deadline {
+                            Ok(Ok(logical_read_deadline_result()))
+                        } else {
+                            Err(error.to_string())
+                        };
+                    }
+                }
+                for source in lease.sources.into_iter().chain(parent_sources) {
+                    self.invocation.actor.validate_binding(&source.binding)?;
+                }
+                if cancellation.is_cancelled() {
+                    return Ok(Ok(DomainResult::canonical_rejection(
+                        None,
+                        RefusalCode::Cancelled,
+                        "Logical source read was cancelled before publishing its result.",
+                    )));
+                }
+                if lease.deadline.remaining().is_zero() {
+                    return Ok(Ok(logical_read_deadline_result()));
+                }
+                Ok(staged)
             }
             ActorExecutionRevision::UnpublishedApply(confirmed) => {
                 if confirmed.load(std::sync::atomic::Ordering::Acquire) {
@@ -982,26 +1359,82 @@ fn bind_workspace_invocation_controlled(
     after_actor_admission: impl FnOnce(&mut [DiscoveredActorSource]),
 ) -> Result<ActorBoundInvocation, WorkspaceAdmissionError> {
     let context = discover_workspace(Some(std::path::PathBuf::from(request.workspace_hint())))
-        .map_err(|_| WorkspaceAdmissionError::Invalid)?;
+        .map_err(|reason| WorkspaceAdmissionError::WorkspaceUndiscoverable { reason })?;
+    let unadmitted = |cause| WorkspaceAdmissionError::Unadmitted {
+        workspace_root: context.workspace_root.clone(),
+        cause,
+    };
+    // Истёкший срок обрывает обход той же ошибкой, что и сорванный обход, и
+    // отличить их может только сам чекпоинт. Разница не косметическая: срок
+    // повторяют тем же вызовом, а сорванный обход — нет.
+    let admission_deadline_elapsed = std::cell::Cell::new(false);
     let mut checkpoint = || {
         response_deadline
             .checkpoint_actor_admission()
-            .map_err(str::to_string)
+            .map_err(|error| {
+                admission_deadline_elapsed.set(true);
+                error.to_string()
+            })
     };
     let source_admission =
-        discover_project_source_admission(&context.workspace_root, &mut checkpoint)
-            .map_err(|_| WorkspaceAdmissionError::Invalid)?;
-    let mut admitted_sources = source_admission
-        .map()
-        .source_sets
+        discover_project_source_admission(&context.workspace_root, &mut checkpoint).map_err(
+            |reason| {
+                if admission_deadline_elapsed.get() {
+                    unadmitted(UnadmittedCause::AdmissionDeadline)
+                } else if project_config_present(&context.workspace_root) {
+                    unadmitted(UnadmittedCause::ProjectConfigInvalid(reason))
+                } else {
+                    unadmitted(UnadmittedCause::SourceDiscoveryFailed(reason))
+                }
+            },
+        )?;
+    let declared_sources = &source_admission.map().source_sets;
+    let parent_source_names = declared_sources
+        .iter()
+        .filter(|source| source.kind == SourceSetKind::Configuration)
+        .map(|source| source.name.clone())
+        .collect::<Vec<_>>();
+    let view_extension_target = (request.tool()
+        == crate::application::invocation_store::ToolIdentity::View)
+        .then(|| {
+            request
+                .arguments()
+                .get("at")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|at| QualifiedAddress::parse(at).ok())
+        })
+        .flatten()
+        .filter(|at| {
+            declared_sources.iter().any(|source| {
+                source.name == at.source_set() && source.kind == SourceSetKind::Extension
+            })
+        });
+    let mut admitted_sources = declared_sources
         .iter()
         .filter(|source| source.source_format == SourceFormat::PlatformXml)
+        .filter(|source| {
+            // An unavailable possible parent must not hide a healthy extension.
+            // Its name remains in parent_source_names, making resolution incomplete.
+            !(view_extension_target.is_some()
+                && source.kind == SourceSetKind::Configuration
+                && closed_daemon_source_relative_path(&source.path)
+                    .ok()
+                    .and_then(|relative| source_admission.source_root_identity(&relative))
+                    .is_none())
+        })
         .map(|source| {
+            let unreadable = |reason| {
+                unadmitted(UnadmittedCause::SourceRootUnreadable {
+                    source_set: source.name.clone(),
+                    path: source.path.clone(),
+                    reason,
+                })
+            };
             let relative = closed_daemon_source_relative_path(&source.path)
-                .map_err(|_| WorkspaceAdmissionError::Invalid)?;
+                .map_err(|_| unreadable("its declared path leaves the workspace root"))?;
             let retained_identity = source_admission
                 .source_root_identity(&relative)
-                .ok_or(WorkspaceAdmissionError::Invalid)?;
+                .ok_or_else(|| unreadable("its declared root is absent or cannot be retained"))?;
             let root = context.workspace_root.join(&relative);
             Ok(DiscoveredActorSource {
                 name: source.name.clone(),
@@ -1014,7 +1447,11 @@ fn bind_workspace_invocation_controlled(
         })
         .collect::<Result<Vec<_>, WorkspaceAdmissionError>>()?;
     if admitted_sources.is_empty() {
-        return Err(WorkspaceAdmissionError::Invalid);
+        return Err(unadmitted(if declared_sources.is_empty() {
+            UnadmittedCause::Uninitialized
+        } else {
+            UnadmittedCause::NoPlatformXmlSourceSet(declared_sources.clone())
+        }));
     }
     admitted_sources.sort_by(|left, right| left.name.cmp(&right.name));
     let actor = actors
@@ -1033,7 +1470,11 @@ fn bind_workspace_invocation_controlled(
         )
         .map_err(|error| match error {
             WorkspaceActorRegistryError::Capacity { .. } => WorkspaceAdmissionError::Capacity,
-            WorkspaceActorRegistryError::InvalidIdentity(_) => WorkspaceAdmissionError::Invalid,
+            WorkspaceActorRegistryError::InvalidIdentity(_) => {
+                unadmitted(UnadmittedCause::ActorBindingFailed {
+                    stage: "the actor registry rejected the workspace identity",
+                })
+            }
             WorkspaceActorRegistryError::Poisoned => WorkspaceAdmissionError::RegistryFailed,
         })?;
     after_actor_admission(&mut admitted_sources);
@@ -1049,7 +1490,11 @@ fn bind_workspace_invocation_controlled(
                     }
                     Ok(ActorReadSourceBinding { binding })
                 })
-                .map_err(|_| WorkspaceAdmissionError::Invalid)
+                .map_err(|_| {
+                    unadmitted(UnadmittedCause::ActorBindingFailed {
+                        stage: "an admitted source root changed while the actor was binding it",
+                    })
+                })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let provider_root = read_sources
@@ -1057,10 +1502,16 @@ fn bind_workspace_invocation_controlled(
         .find(|source| source.binding.source_set_name() == "main")
         .or_else(|| read_sources.first())
         .map(|source| source.binding.clone())
-        .ok_or(WorkspaceAdmissionError::Invalid)?;
-    let workspace_identity_hash = actor
-        .safe_identity_hash()
-        .map_err(|_| WorkspaceAdmissionError::Invalid)?;
+        .ok_or_else(|| {
+            unadmitted(UnadmittedCause::ActorBindingFailed {
+                stage: "no admitted source set could serve as the provider root",
+            })
+        })?;
+    let workspace_identity_hash = actor.safe_identity_hash().map_err(|_| {
+        unadmitted(UnadmittedCause::ActorBindingFailed {
+            stage: "the workspace identity hash could not be computed",
+        })
+    })?;
     Ok(ActorBoundInvocation {
         tool: request.tool(),
         arguments: request.arguments().clone(),
@@ -1068,6 +1519,8 @@ fn bind_workspace_invocation_controlled(
         actor,
         provider_root,
         read_sources: Arc::from(read_sources),
+        parent_source_names,
+        parent_source_selection: Arc::new(source_admission.into_evidence()),
         workspace_identity_hash,
         deliveries: resources.deliveries,
         provider_hosts: resources.provider_hosts,
@@ -1092,9 +1545,190 @@ fn closed_daemon_source_relative_path(path: &str) -> Result<std::path::PathBuf, 
     Ok(relative)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Почему допуск наборов не состоялся.
+///
+/// Причина известна ровно в точке отказа: снаружи её пришлось бы
+/// восстанавливать вторым обходом рабочего пространства, а он увидит уже
+/// другое дерево. Слова для провода выбирает `server`, не эта служба — здесь
+/// называется причина, а не ответ.
+#[derive(Debug)]
 pub(super) enum WorkspaceAdmissionError {
+    /// Мест под рабочие пространства больше нет.
     Capacity,
+    /// Реестр акторов отравлен и до перезапуска не допустит ничего.
     RegistryFailed,
-    Invalid,
+    /// Корень рабочего пространства не определён — искать наборы негде.
+    WorkspaceUndiscoverable { reason: String },
+    /// Корень известен, а допущенного набора PlatformXml в нём нет.
+    Unadmitted {
+        workspace_root: std::path::PathBuf,
+        cause: UnadmittedCause,
+    },
+}
+
+/// Отчего в известном корне не оказалось допущенного набора PlatformXml.
+#[derive(Debug)]
+pub(super) enum UnadmittedCause {
+    /// Рабочая область не заведена: ни `v8project.yaml`, ни автоопределяемых
+    /// корней 1С.
+    Uninitialized,
+    /// `v8project.yaml` на месте, но прочитать его нельзя.
+    ProjectConfigInvalid(String),
+    /// Обход наборов не завершился, и не по сроку.
+    SourceDiscoveryFailed(String),
+    /// Срок допуска истёк раньше, чем завершился обход.
+    AdmissionDeadline,
+    /// Наборы объявлены, но ни один не в формате выгрузки конфигуратора.
+    NoPlatformXmlSourceSet(Vec<ProjectSourceSet>),
+    /// Набор PlatformXml объявлен, но его корень не читается.
+    SourceRootUnreadable {
+        source_set: String,
+        path: String,
+        reason: &'static str,
+    },
+    /// Наборы отобраны, но актор их не связал.
+    ActorBindingFailed { stage: &'static str },
+}
+
+#[cfg(test)]
+mod registration_cache_tests {
+    use super::*;
+    use crate::application::invocation_store::ToolIdentity;
+    use crate::application::ports::TokioClock;
+    use crate::infrastructure::v13_large_configuration::{
+        read_configuration_registration_index, RegistrationIndex,
+    };
+    use std::cell::Cell;
+    use std::path::Path;
+
+    fn registrations(
+        source: &ActorReadSourceCapability,
+        path: &Path,
+        builds: &Cell<usize>,
+    ) -> Arc<RegistrationIndex> {
+        source
+            .registration_cache
+            .get_or_build(&source.identity, &source.read_identity, &|| Ok(()), || {
+                builds.set(builds.get() + 1);
+                read_configuration_registration_index(
+                    std::fs::File::open(path).unwrap(),
+                    &|| Ok(()),
+                )
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn logical_read_reuses_registration_cache_and_isolates_sources_and_invocations() {
+        let workspace = tempfile::tempdir().unwrap();
+        let xml = |name: &str| {
+            format!(
+                r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Configuration><Properties><Name>Store</Name></Properties><ChildObjects><Catalog>{name}</Catalog></ChildObjects></Configuration></MetaDataObject>"#
+            )
+        };
+        for name in ["parent", "ext"] {
+            std::fs::create_dir(workspace.path().join(name)).unwrap();
+            std::fs::write(
+                workspace.path().join(name).join("Configuration.xml"),
+                xml("First"),
+            )
+            .unwrap();
+        }
+        std::fs::write(workspace.path().join("v8project.yaml"),
+            "format: DESIGNER\nsource-set:\n  - name: parent\n    type: CONFIGURATION\n    path: parent\n  - name: ext\n    type: EXTENSION\n    path: ext\n").unwrap();
+        let request = InvocationRequest::new(
+            ToolIdentity::View,
+            serde_json::json!({"at": "ext:Configuration"}),
+            std::fs::canonicalize(workspace.path())
+                .unwrap()
+                .to_string_lossy(),
+            7_000,
+        )
+        .unwrap();
+        let actors = WorkspaceActorRegistry::default();
+        let bind = || {
+            bind_workspace_invocation(
+                &request,
+                &actors,
+                Arc::default(),
+                Arc::default(),
+                Arc::default(),
+                None,
+                InvocationResponseDeadline::capture(Arc::new(TokioClock)),
+            )
+            .unwrap()
+        };
+        let cancellation = CancellationToken::new();
+        let execution = bind().begin_execution(&cancellation).unwrap();
+        let first = execution.read_sources().unwrap().remove(0);
+        let again = execution.read_sources().unwrap().remove(0);
+        assert!(
+            Arc::ptr_eq(&first.registration_cache, &again.registration_cache),
+            "reacquiring capabilities must retain the source lease's registration index"
+        );
+        let builds = Cell::new(0);
+        let path = workspace.path().join("ext/Configuration.xml");
+        let index = registrations(&first, &path, &builds);
+        let reused = registrations(&again, &path, &builds);
+        assert!(Arc::ptr_eq(&index, &reused));
+        assert_eq!(builds.get(), 1, "one lease parses Configuration.xml once");
+
+        execution
+            .admit_borrowing_parent_sources(&cancellation)
+            .unwrap();
+        let parent = execution
+            .read_sources()
+            .unwrap()
+            .into_iter()
+            .find(|source| source.source_set_name() == "parent")
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &first.registration_cache,
+            &parent.registration_cache
+        ));
+        execution
+            .admit_borrowing_parent_sources(&cancellation)
+            .unwrap();
+        let parent_again = execution
+            .read_sources()
+            .unwrap()
+            .into_iter()
+            .find(|source| source.source_set_name() == "parent")
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&parent.registration_cache, &parent_again.registration_cache),
+            "repeated parent admission must preserve its existing read lease"
+        );
+        assert_eq!(parent.read_identity, parent_again.read_identity);
+
+        std::fs::write(&path, xml("Later")).unwrap();
+        let next_execution = bind().begin_execution(&cancellation).unwrap();
+        let next = next_execution.read_sources().unwrap().remove(0);
+        assert!(!Arc::ptr_eq(
+            &first.registration_cache,
+            &next.registration_cache
+        ));
+        assert_ne!(first.read_identity, next.read_identity);
+        let fresh = registrations(&next, &path, &builds);
+        assert_eq!(builds.get(), 2);
+        assert!(fresh.contains("Catalog", "Later", &|| Ok(())).unwrap());
+        assert!(!fresh.contains("Catalog", "First", &|| Ok(())).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod search_line_tests {
+    use super::read_search_line_bounded;
+    use std::io::{BufReader, Cursor, ErrorKind};
+
+    #[test]
+    fn overlong_line_refuses_before_retaining_unbounded_bytes() {
+        let mut reader = BufReader::with_capacity(3, Cursor::new(b"abcdefghij\n"));
+        let mut line = Vec::new();
+        let error = read_search_line_bounded(&mut reader, &mut line, 8, || Ok(()))
+            .expect_err("a line beyond the search limit must not be matched in fragments");
+        assert_eq!(error.kind(), ErrorKind::FileTooLarge);
+        assert!(error.to_string().contains("source line exceeds"));
+        assert!(line.len() <= 8);
+    }
 }

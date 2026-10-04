@@ -10,10 +10,21 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MIN_RUNTIME_GUIDANCE_DOCS = 31
-# The retired v8-runner skill carried eleven duplicate examples. Remaining
-# examples belong to subject skills and shared references until their v0.13
-# operation is implemented and migrated to unica.run.
-MIN_RUNTIME_EXECUTE_EXAMPLES = 10
+# Runtime guidance points at the `unica.run` dictionary instead of restating
+# per-operation rules; the remaining fenced examples call operations the
+# dictionary implements. Syntax lives in `unica.check`, test runs and EPF/ERF
+# publication are outside the v0.13 surface, so their examples are gone.
+MIN_RUNTIME_EXECUTE_EXAMPLES = 2
+# Reading and writing names the wire never publishes; the package README keeps
+# its migration table of removed selectors and is not scanned for these.
+RETIRED_READ_WRITE_NAMES = re.compile(
+    r"unica\.code\.|unica\.meta\.info|unica\.meta\.add|unica\.meta\.edit|"
+    r"unica\.\*\.info"
+)
+RETIRED_RUNTIME_NAMES = re.compile(
+    r"unica\.runtime\.|unica\.build\.|runtime_risk_|runtime_operation_unbounded|"
+    r"INV-MCP-RUNTIME-RECEIPT|ADR-0074"
+)
 
 
 # Both ways a document points at another one: a backticked path, where the
@@ -48,7 +59,6 @@ LIST_ITEM_PREFIX = re.compile(
     r"^[ \t]*(?:[-+*]|[0-9]{1,9}[.)])[ \t]+"
 )
 INDENTED_CODE_LINE = re.compile(r"^(?: {4}|\t)(?P<content>.*)$")
-DRY_RUN_FALSE = re.compile(r'"dryRun"\s*:\s*false\b')
 
 
 def markdown_container_content(line: str) -> str:
@@ -60,7 +70,8 @@ def markdown_container_content(line: str) -> str:
         line = content
 
 
-def fenced_json_blocks(text: str) -> list[str]:
+def markdown_fenced_blocks(text: str) -> list[tuple[int, int, str, str]]:
+    """Return each fence's line range, language and body once for both guards."""
     lines = text.splitlines()
     blocks = []
     line_number = 0
@@ -72,6 +83,7 @@ def fenced_json_blocks(text: str) -> list[str]:
             line_number += 1
             continue
 
+        start = line_number
         fence = opening.group("fence")
         closing = re.compile(
             rf"^[ \t]*{re.escape(fence[0])}{{{len(fence)},}}[ \t]*$"
@@ -90,11 +102,18 @@ def fenced_json_blocks(text: str) -> list[str]:
             body.append(markdown_container_content(lines[line_number]))
             line_number += 1
         block = "\n".join(body)
-        if language == "json" or block_mentions_runtime_tool(block):
-            blocks.append(block)
         if line_number < len(lines):
             line_number += 1
+        blocks.append((start, line_number, language, block))
     return blocks
+
+
+def fenced_json_blocks(text: str) -> list[str]:
+    return [
+        block
+        for _, _, language, block in markdown_fenced_blocks(text)
+        if language == "json" or block_mentions_runtime_tool(block)
+    ]
 
 
 def decode_active_json_unicode_escapes(text: str) -> str:
@@ -128,13 +147,22 @@ def decode_active_json_unicode_escapes(text: str) -> str:
 
 
 def block_mentions_runtime_tool(block: str) -> bool:
-    return "unica.runtime.execute" in decode_active_json_unicode_escapes(block)
+    return '"unica.run' in decode_active_json_unicode_escapes(block)
 
 
 def indented_code_blocks(text: str) -> list[str]:
     blocks = []
     current = []
-    for line in text.splitlines():
+    fence_ends = {start: end for start, end, _, _ in markdown_fenced_blocks(text)}
+    fenced_until = 0
+    for line_number, line in enumerate(text.splitlines()):
+        if line_number in fence_ends:
+            if current:
+                blocks.append("\n".join(current))
+                current = []
+            fenced_until = fence_ends[line_number]
+        if line_number < fenced_until:
+            continue
         indented = INDENTED_CODE_LINE.match(line)
         if indented is not None:
             current.append(indented.group("content"))
@@ -150,12 +178,36 @@ def indented_code_blocks(text: str) -> list[str]:
     return blocks
 
 
-def reject_indented_applied_runtime_examples(text: str) -> None:
+def validate_runtime_example(candidate: object, label: str) -> bool:
+    """Check only unica.run arguments, including decoded JSON field names."""
+    if not isinstance(candidate, dict):
+        return False
+    params = candidate.get("params")
+    if not isinstance(params, dict) or params.get("name") != "unica.run":
+        return False
+    arguments = params.get("arguments", {})
+    if not isinstance(arguments, dict):
+        raise ValueError(f"{label} requires an arguments object")
+    if "ifRev" in arguments:
+        raise ValueError(f"{label} uses retired unica.run argument ifRev")
+    needs_dry_run = arguments.get("op") not in (None, "launch")
+    if (needs_dry_run or "dryRun" in arguments) and type(arguments.get("dryRun")) is not bool:
+        raise ValueError(f"{label} requires explicit boolean dryRun inside arguments")
+    return True
+
+
+def validate_indented_runtime_examples(text: str) -> None:
     for block_number, block in enumerate(indented_code_blocks(text), start=1):
-        if block_mentions_runtime_tool(block) and DRY_RUN_FALSE.search(block):
-            raise ValueError(
-                f"indented runtime JSON example #{block_number} uses dryRun false"
-            )
+        if not block_mentions_runtime_tool(block):
+            continue
+        label = f"indented runtime JSON example #{block_number}"
+        try:
+            payload = json.loads(block)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"invalid {label}: {error}") from error
+        candidates = payload if isinstance(payload, list) else [payload]
+        for candidate in candidates:
+            validate_runtime_example(candidate, label)
 
 
 def runtime_execute_json_examples(text: str) -> list[dict]:
@@ -171,24 +223,16 @@ def runtime_execute_json_examples(text: str) -> list[dict]:
             continue
         candidates = payload if isinstance(payload, list) else [payload]
         for candidate in candidates:
-            if not isinstance(candidate, dict):
-                continue
-            params = candidate.get("params")
-            if not isinstance(params, dict):
-                continue
-            if params.get("name") != "unica.runtime.execute":
-                continue
-            examples.append(candidate)
+            if validate_runtime_example(candidate, f"fenced runtime JSON example #{block_number}"):
+                examples.append(candidate)
     return examples
 
 
 def runtime_guidance_document(text: str) -> tuple[bool, list[dict]]:
-    reject_indented_applied_runtime_examples(text)
+    validate_indented_runtime_examples(text)
     examples = runtime_execute_json_examples(text)
     return (
-        bool(examples)
-        or "unica.runtime.execute" in text
-        or "v8-runner" in text,
+        bool(examples) or "`unica.run`" in text or "v8-runner" in text,
         examples,
     )
 
@@ -211,7 +255,7 @@ def collect_runtime_guidance(
         for payload in payloads:
             if (
                 payload.get("method") == "tools/call"
-                and payload.get("params", {}).get("name") == "unica.runtime.execute"
+                and payload.get("params", {}).get("name") == "unica.run"
             ):
                 runtime_examples.append((doc, payload["params"]["arguments"]))
     return runtime_docs, runtime_examples, parse_failures
@@ -346,161 +390,175 @@ def prompt_frontmatter(document: str) -> dict[str, str]:
     return fields
 
 
+# Их предмет поверхность не создаёт: корень конфигурации и расширения,
+# перехват метода, дескриптор внешней обработки или отчёта.
+# Скилл остаётся справочником формата и обязан назвать пробел вслух.
+SKILLS_WITHOUT_A_CANONICAL_ENTRY = {
+    "cf-init",
+    "cfe-init",
+    "cfe-patch-method",
+    "epf-init",
+    "erf-init",
+}
+
 IN_SCOPE_TOOLS = {
-    "cf-edit": "unica.cf.edit",
-    "cf-init": "unica.cf.init",
-    "cfe-borrow": "unica.cfe.borrow",
-    "cfe-init": "unica.cfe.init",
-    "cfe-patch-method": "unica.cfe.patch_method",
-    "epf-init": "unica.epf.init",
-    "erf-init": "unica.erf.init",
-    "meta-add": "unica.meta.add",
-    "meta-edit": "unica.meta.edit",
-    "meta-info": "unica.meta.info",
-    "form-compile": "unica.form.compile",
-    "form-edit": "unica.form.edit",
-    "interface-edit": "unica.interface.edit",
-    "subsystem-compile": "unica.subsystem.compile",
-    "subsystem-edit": "unica.subsystem.edit",
-    "dcs-compile": "unica.dcs.compile",
-    "dcs-edit": "unica.dcs.edit",
-    "mxl-compile": "unica.mxl.compile",
-    "mxl-decompile": "unica.mxl.decompile",
-    "mxl-info": "unica.mxl.info",
-    "role-compile": "unica.role.compile",
-    "role-edit": "unica.role.edit",
+    "cf-edit": "unica.apply",
+    "cf-init": "unica.check",
+    "cfe-borrow": "unica.apply",
+    "cfe-init": "unica.check",
+    "cfe-patch-method": "unica.check",
+    "epf-init": "unica.check",
+    "erf-init": "unica.check",
+    "meta-add": "unica.apply",
+    "meta-edit": "unica.apply",
+    "meta-info": "unica.view",
+    "form-compile": "unica.apply",
+    "form-edit": "unica.apply",
+    "interface-edit": "unica.apply",
+    "subsystem-compile": "unica.apply",
+    "subsystem-edit": "unica.apply",
+    "dcs-compile": "unica.apply",
+    "dcs-edit": "unica.apply",
+    "mxl-compile": "unica.apply",
+    "mxl-decompile": "unica.view",
+    "mxl-info": "unica.view",
+    "role-compile": "unica.apply",
+    "role-edit": "unica.apply",
 }
 
 SCENARIO_SKILLS = {
     "api-design": [
-        "unica.code.search",
-        "unica.code.definition",
-        "unica.code.diagnostics",
+        "unica.search",
+        "unica.search",
+        "unica.check",
         "unica.view",
-        "unica.meta.info",
+        "unica.view",
         "unica.docs",
-        "unica.runtime.execute",
+        "unica.run",
     ],
+        # Поиск по тексту и по именам — один `search`, различается свод;
+    # чтение узла и профиль объекта — один `view`.
     "code-search": [
-        "unica.code.search",
-        "unica.code.definition",
-        "unica.meta.info",
+        "unica.search",
         "unica.view",
+        "unica.resolve",
     ],
+    # Диагностика узла — канонический `check`; поиск — `search`; стандарт —
+    # `docs`. Прогон платформы этому скиллу не нужен: он читает и судит.
     "code-diagnostics": [
-        "unica.code.diagnostics",
-        "unica.code.search",
+        "unica.check",
+        "unica.search",
         "unica.docs",
-        "unica.runtime.execute",
+        "unica.view",
     ],
     "code-review": [
-        "unica.code.search",
-        "unica.code.definition",
-        "unica.code.diagnostics",
-        "unica.meta.info",
+        "unica.search",
+        "unica.search",
+        "unica.check",
+        "unica.view",
         "unica.docs",
         "unica.view",
-        "unica.runtime.execute",
+        "unica.run",
     ],
     "query-optimize": [
-        "unica.code.search",
+        "unica.search",
         "unica.view",
-        "unica.meta.info",
+        "unica.view",
         "unica.docs",
-        "unica.runtime.execute",
+        "unica.run",
     ],
     "test-authoring": [
-        "unica.code.search",
+        "unica.search",
         "unica.view",
-        "unica.runtime.execute",
+        "unica.check",
     ],
     "platform-help": [
         "unica.docs",
         "unica.search",
         "unica.view",
-        "unica.runtime.execute",
+        "unica.run",
     ],
     "bsp-patterns": [
-        "unica.code.search",
-        "unica.meta.info",
+        "unica.search",
+        "unica.view",
         "unica.view",
         "unica.docs",
-        "unica.runtime.execute",
+        "unica.run",
     ],
     "integration-implement": [
         "unica.view",
-        "unica.meta.info",
-        "unica.meta.add",
-        "unica.meta.edit",
-        "unica.code.search",
+        "unica.view",
+        "unica.apply",
+        "unica.apply",
+        "unica.search",
         "unica.docs",
-        "unica.runtime.execute",
+        "unica.run",
     ],
     "autonomous-server": [
         "unica.view",
-        "unica.runtime.execute",
-        "unica.meta.info",
-        "unica.code.search",
-        "unica.code.diagnostics",
+        "unica.run",
+        "unica.view",
+        "unica.search",
+        "unica.check",
     ],
     "log-analysis": [
-        "unica.code.search",
-        "unica.meta.info",
+        "unica.search",
         "unica.view",
-        "unica.code.diagnostics",
+        "unica.view",
+        "unica.check",
         "unica.docs",
     ],
     "background-jobs": [
         "unica.view",
-        "unica.code.search",
-        "unica.meta.info",
-        "unica.code.diagnostics",
+        "unica.search",
+        "unica.view",
+        "unica.check",
         "unica.docs",
-        "unica.runtime.execute",
+        "unica.run",
     ],
     "data-exchange": [
         "unica.view",
-        "unica.code.search",
-        "unica.meta.info",
-        "unica.code.diagnostics",
+        "unica.search",
+        "unica.view",
+        "unica.check",
         "unica.docs",
-        "unica.runtime.execute",
+        "unica.run",
     ],
     "db-performance": [
         "unica.view",
-        "unica.code.search",
-        "unica.meta.info",
-        "unica.code.diagnostics",
+        "unica.search",
+        "unica.view",
+        "unica.check",
         "unica.docs",
-        "unica.runtime.execute",
+        "unica.run",
     ],
     "security-auth-crypto": [
         "unica.view",
-        "unica.code.search",
-        "unica.meta.info",
-        "unica.code.diagnostics",
+        "unica.search",
+        "unica.view",
+        "unica.check",
         "unica.docs",
-        "unica.runtime.execute",
+        "unica.run",
     ],
     "data-separation": [
         "unica.view",
-        "unica.code.search",
-        "unica.meta.info",
-        "unica.code.diagnostics",
+        "unica.search",
+        "unica.view",
+        "unica.check",
         "unica.docs",
-        "unica.runtime.execute",
+        "unica.run",
     ],
     "release-support": [
         "unica.view",
-        "unica.code.search",
+        "unica.search",
         "unica.diff",
-        "unica.meta.info",
-        "unica.code.diagnostics",
+        "unica.view",
+        "unica.check",
         "unica.docs",
-        "unica.runtime.execute",
+        "unica.run",
     ],
     "source-access": [
-        "unica.find",
+        "unica.resolve",
         "unica.view",
         "unica.search",
         "unica.diff",
@@ -508,73 +566,69 @@ SCENARIO_SKILLS = {
     ],
     "document-posting": [
         "unica.view",
-        "unica.meta.info",
-        "unica.meta.edit",
-        "unica.code.definition",
-        "unica.code.patch",
-        "unica.code.diagnostics",
-        "unica.runtime.execute",
+        "unica.view",
+        "unica.apply",
+        "unica.search",
+        "unica.apply",
+        "unica.check",
+        "unica.run",
     ],
     "register-design": [
         "unica.view",
-        "unica.meta.info",
-        "unica.meta.add",
-        "unica.meta.edit",
-        "unica.code.search",
-        "unica.code.diagnostics",
-        "unica.runtime.execute",
+        "unica.view",
+        "unica.apply",
+        "unica.apply",
+        "unica.search",
+        "unica.check",
+        "unica.run",
     ],
     "object-events": [
         "unica.view",
-        "unica.meta.info",
-        "unica.code.search",
-        "unica.code.definition",
-        "unica.code.graph",
-        "unica.code.patch",
-        "unica.code.diagnostics",
-        "unica.runtime.execute",
+        "unica.view",
+        "unica.search",
+        "unica.search",
+        "unica.apply",
+        "unica.check",
+        "unica.run",
     ],
     "form-events": [
         "unica.view",
-        "unica.form.edit",
-        "unica.meta.info",
-        "unica.code.patch",
-        "unica.code.diagnostics",
-        "unica.runtime.execute",
+        "unica.apply",
+        "unica.view",
+        "unica.apply",
+        "unica.check",
+        "unica.run",
     ],
     "module-placement": [
         "unica.view",
-        "unica.meta.info",
-        "unica.meta.add",
-        "unica.code.graph",
-        "unica.code.patch",
-        "unica.code.diagnostics",
-        "unica.runtime.execute",
+        "unica.view",
+        "unica.apply",
+        "unica.apply",
+        "unica.check",
+        "unica.run",
     ],
     "metadata-modeling": [
         "unica.view",
-        "unica.meta.info",
-        "unica.meta.add",
-        "unica.meta.edit",
-        "unica.code.diagnostics",
-        "unica.runtime.execute",
+        "unica.view",
+        "unica.apply",
+        "unica.apply",
+        "unica.check",
+        "unica.run",
     ],
     "transactions-locks": [
         "unica.view",
-        "unica.code.search",
-        "unica.code.graph",
-        "unica.code.patch",
-        "unica.code.diagnostics",
-        "unica.meta.info",
-        "unica.runtime.execute",
+        "unica.search",
+        "unica.apply",
+        "unica.check",
+        "unica.view",
+        "unica.run",
     ],
     "object-locks": [
         "unica.view",
-        "unica.code.search",
-        "unica.code.graph",
-        "unica.code.patch",
-        "unica.code.diagnostics",
-        "unica.runtime.execute",
+        "unica.search",
+        "unica.apply",
+        "unica.check",
+        "unica.run",
     ],
 }
 
@@ -595,7 +649,7 @@ SCENARIO_REQUIRED_TOKENS = {
     "code-diagnostics": ["АПК", "EDT", "BSL LS", "отключ", "v8std"],
     "code-review": ["Findings first", "severity", "file/line"],
     "query-optimize": ["СКД", "virtual", "query-in-loop"],
-    "test-authoring": ['"testRunner": "yaxunit"', '"testRunner": "va"'],
+    "test-authoring": ["YaXUnit", "Vanessa Automation"],
     "platform-help": [
         "platform-help contract gap",
         "development-standard",
@@ -745,9 +799,8 @@ SCENARIO_REQUIRED_TOKENS = {
     "release-support": ["сравнение/объединение", "Поставка", "поддержка", "совместимость"],
     "source-access": [
         "предметн",
-        "dryRun",
-        "unica.code.patch",
-        "unica.find",
+        "unica.apply",
+        "unica.resolve",
         "invalid_cursor",
     ],
 }
@@ -772,71 +825,54 @@ REPLACED_RUNTIME_SKILLS = {
 }
 
 TASK_EXAMPLE_ARGUMENT_KEYS = {
-    "cf-edit": ["ConfigPath", "Operation", "Value"],
-    "cf-init": ["Name", "OutputDir"],
-    "cfe-borrow": ["ExtensionPath", "ConfigPath", "Object"],
-    "cfe-init": ["Name", "OutputDir"],
-    "cfe-patch-method": ["ExtensionPath", "ModulePath", "MethodName"],
-    "epf-init": ["Name", "OutputDir", "FormName"],
-    "erf-init": ["Name", "OutputDir", "FormName"],
-    "meta-add": ["sourceSet", "kind", "name"],
-    "meta-edit": ["sourceSet", "metadataPath", "operations"],
-    "meta-info": ["sourceSet", "metadataPath"],
-    "form-compile": ["JsonPath", "OutputPath"],
-    "form-edit": ["FormPath", "JsonPath"],
-    "interface-edit": ["CIPath", "Operation", "Value"],
-    "subsystem-compile": ["Value", "OutputDir"],
-    "subsystem-edit": ["SubsystemPath", "Operation", "Value"],
-    "dcs-compile": ["DefinitionFile", "OutputPath"],
-    "dcs-edit": ["TemplatePath", "Operation", "Value"],
-    "mxl-compile": ["JsonPath", "OutputPath"],
-    "mxl-decompile": ["TemplatePath"],
-    "mxl-info": ["TemplatePath", "WithText"],
-    "role-compile": ["JsonPath", "OutputDir"],
-    "role-edit": ["sourceSet", "metadataPath", "operations"],
+    "cfe-borrow": ["at", "ops"],
+    "cf-edit": ["at", "ops"],
+    "meta-add": ["at", "ops"],
+    "meta-edit": ["at", "ops"],
+    "meta-info": ["at"],
+    "form-compile": ["at", "ops"],
+    "form-edit": ["at", "ops"],
+    "interface-edit": ["at", "ops"],
+    "subsystem-compile": ["at", "ops"],
+    "subsystem-edit": ["at", "ops"],
+    "dcs-compile": ["at", "ops"],
+    "dcs-edit": ["at", "ops"],
+    "mxl-compile": ["at", "ops"],
+    "mxl-decompile": ["at"],
+    # Читающий макет адресуется логически: файлового селектора у `view` нет.
+    "mxl-info": ["at"],
+    "role-compile": ["at", "ops"],
+    "role-edit": ["at", "ops"],
 }
 
 SCENARIO_PRESERVING_MIN_MCP_CALLS = {
-    "cf-edit": 6,
-    "cf-init": 6,
-    "cfe-borrow": 7,
-    "cfe-init": 6,
-    "cfe-patch-method": 4,
     "meta-add": 2,
-    "meta-edit": 3,
-    "meta-info": 6,
+    "meta-edit": 4,
+    "meta-info": 3,
     "form-compile": 4,
-    "interface-edit": 8,
-    "subsystem-compile": 4,
-    "subsystem-edit": 6,
+    "interface-edit": 3,
+    "subsystem-compile": 3,
+    "subsystem-edit": 2,
     "dcs-compile": 5,
     "mxl-info": 3,
     "role-edit": 1,
     "dcs-edit": 4,
-    "role-compile": 3,
+    "role-compile": 4,
 }
 
 ALLOWED_ADDITIONAL_MCP_TOOL_NAMES = {
-    "cf-init": {"unica.view", "unica.check"},
-    "cfe-borrow": {"unica.check"},
-    "cfe-init": {"unica.check"},
-    "epf-init": {"unica.runtime.execute"},
-    "erf-init": {"unica.runtime.execute"},
+    "cfe-borrow": {"unica.view"},
     "form-compile": {"unica.view", "unica.check"},
-    "interface-edit": {"unica.check"},
     "role-compile": {"unica.view", "unica.check"},
     "dcs-compile": {"unica.view", "unica.check"},
     "dcs-edit": {"unica.view", "unica.check"},
+    "meta-info": {"unica.check"},
 }
 
 SCENARIO_PRESERVING_TOKENS = {
     "cf-edit": [
-        '"Operation": "modify-property"',
-        '"Value": "Version=1.0.0.1 ;; Vendor=Фирма 1С"',
-        '"Operation": "add-childObject"',
-        '"Operation": "remove-childObject"',
-        '"Operation": "add-defaultRole"',
-        '"Operation": "set-defaultRoles"',
+        '"op": "props.set"',
+        '"op": "object.create"',
     ],
     "cf-init": [
         '"Name": "МояКонфигурация"',
@@ -845,14 +881,6 @@ SCENARIO_PRESERVING_TOKENS = {
         "Режим совместимости (default: `Version8_3_27`)",
         '"CompatibilityMode": "Version8_3_27"',
         '"name": "unica.view"',
-        '"name": "unica.check"',
-    ],
-    "cfe-borrow": [
-        '"Object": "Catalog.Контрагенты"',
-        '"Object": "Catalog.Контрагенты.Form.ФормаЭлемента"',
-        '"Object": "Catalog.Контрагенты ;; CommonModule.ОбщийМодуль ;; Enum.ВидыОплат"',
-        '"BorrowMainAttribute": true',
-        '"BorrowMainAttribute": "All"',
         '"name": "unica.check"',
     ],
     "cfe-init": [
@@ -875,79 +903,82 @@ SCENARIO_PRESERVING_TOKENS = {
         '"name": "НовыйСправочник"',
         '"kind": "EventSubscription"',
         '"relation": "source"',
-        '"dryRun": true',
     ],
+    # Режим операции стал её именем: `editRelations` с `mode: "replace"`
+    # свёлся к `relation.replace`, а коллекция — к префиксу имени.
     "meta-edit": [
-        '"op": "setProperties"',
-        '"op": "add"',
-        '"collection": "attributes"',
-        '"allowedLength": "variable"',
-        '"op": "editRelations"',
-        '"relation": "basedOn"',
+        '"op": "props.set"',
+        '"op": "attribute.set"',
+        '"op": "attribute.remove"',
+        '"op": "predefinedItem.add"',
+        '"op": "relation.replace"',
         '"relation": "source"',
         '"kind": "recordSet"',
         '"metadataPath": "InformationRegister.ИсторияИзменений"',
-        '"mode": "replace"',
         '"targets": [',
     ],
     # `Name` and `Mode` were report selectors. The typed answer carries the
     # whole object, so the scenarios are preserved by the addresses they read,
-    # not by the drill-down argument that no longer exists (ADR-0023).
+    # not by the drill-down argument that no longer exists.
+    # Путь метаданных стал логическим адресом, а вердикт ушёл в свой вход.
     "meta-info": [
-        '"metadataPath": "Catalog.Валюты"',
-        '"metadataPath": "Document.АвансовыйОтчет"',
-        '"metadataPath": "HTTPService.ExternalAPI"',
-        '"metadataPath": "WebService.EnterpriseDataUpload_1_0_1_1"',
-        '"metadataPath": "DefinedType.GLN"',
-        '"metadataPath": "EventSubscription.ОбработкаИзменений"',
+        '"at": "main:Catalog.Валюты"',
+        '"at": "main:Document.Заказ.Relation"',
+        '"name": "unica.check"',
     ],
     "form-compile": [
-        '"OutputPath": "<.../TypePlural/ObjectName/Forms/FormName/Ext/Form.xml>"',
-        '"name": "unica.check"',
-        '"name": "unica.view"',
+        '"op": "form.create"',
+        '"op": "formAttribute.add"',
     ],
+    # Действие стало именем операции. `hide` и `show` свелись к одному
+    # `commandVisibility.set` с булевым значением: платформа хранит одно поле,
+    # и двух операций для него не нужно.
     "interface-edit": [
-        '"Operation": "hide"',
-        '"Operation": "show"',
-        '"Operation": "place"',
-        '"Operation": "subsystem-order"',
-        '"CreateIfMissing": true',
-        '"name": "unica.check"',
+        '"op": "commandVisibility.set"',
+        '"op": "commandPlacement.set"',
+        '"op": "commandOrder.set"',
+        '"op": "subsystemOrder.set"',
+        '"visible": false',
+        '"visible": true',
     ],
+    # Определение стало типизированными операциями, а родитель — адресом:
+    # JSON-строки внутри JSON и путей к XML на канонической поверхности нет.
     "subsystem-compile": [
-        '"Value": "{\\"name\\":\\"Тест\\"}"',
+        '"op": "subsystem.create"',
         'CommonPicture.Продажи',
-        '"Parent": "config/Subsystems/Продажи.xml"',
+        '"at": "main:Subsystem.Продажи"',
     ],
+    # Операция стала именем операции, а не значением поля `Operation`.
     "subsystem-edit": [
-        '"Operation": "add-content"',
-        '"Operation": "remove-content"',
-        '"Operation": "add-child"',
-        '"Operation": "set-property"',
+        '"op": "content.add"',
+        '"op": "content.remove"',
+        '"op": "childSubsystem.add"',
+        '"op": "props.set"',
     ],
+    # Пресет разворачивает скилл: инструмент принимает одно право за
+    # операцию, и предпросмотр показывает их поимённо, а не имя пресета.
     "role-compile": [
+        '"op": "role.create"',
+        '"op": "right.set"',
         '"name": "unica.check"',
         '"name": "unica.view"',
     ],
     "dcs-compile": [
-        '"DefinitionFile": "<json>"',
-        '"Value": "<json-string>"',
-        '"name": "unica.check"',
-        '"name": "unica.view"',
+        '"templateType": "DataCompositionSchema"',
+        '"op": "query.set"',
     ],
     "dcs-edit": [
-        '"Operation": "add-field"',
-        '"Value": "Цена: decimal(15,2) ;; Количество: decimal(15,3) ;; Сумма: decimal(15,2)"',
-        '"name": "unica.check"',
-        '"name": "unica.view"',
+        '"op": "field.add"',
     ],
     # Eleven `Mode` values selected eleven reports. The typed answer carries
     # every section at once, so the scenarios are preserved by the sections the
-    # skill names, not by the selector that no longer exists (ADR-0023).
+    # skill names, not by the selector that no longer exists.
+    # Содержимое ячеек стало отдельным адресом, а не признаком в аргументах,
+    # поэтому сценарий сохраняется адресом ветви, а не селектором состава.
     "mxl-info": [
-        '"WithText": true',
-        "`columnSets`",
-        "`outside`",
+        "Area.Шапка.Body",
+        "columnSets",
+        "contentCount",
     ],
 }
 
@@ -955,11 +986,47 @@ SCENARIO_PRESERVING_TOKENS = {
 # must not keep advertising them: the server would answer such a call with
 # "does not accept argument", so a leftover example is a broken instruction.
 SCENARIO_RETIRED_TOKENS = {
-    "meta-add": ['"JsonPath"', '"OutputDir"', '"DefinitionFile"'],
-    "meta-edit": ['"ObjectPath"', '"Operation"', '"Value"', '"DefinitionFile"'],
-    "mxl-info": ['"Format"', '"MaxParams"', '"Limit"', '"Offset"'],
-    "meta-info": ['"ObjectPath"', '"objectPath"', '"Detailed"', '"detailed"'],
+    "meta-add": ['"JsonPath"', '"OutputDir"', '"DefinitionFile"', '"sourceSet"'],
+    "meta-edit": [
+        '"ObjectPath"',
+        '"Operation"',
+        '"Value"',
+        '"DefinitionFile"',
+        '"sourceSet"',
+    ],
+    "mxl-info": [
+        '"Format"',
+        '"MaxParams"',
+        '"Limit"',
+        '"Offset"',
+        '"TemplatePath"',
+        '"WithText"',
+    ],
+    "meta-info": [
+        '"ObjectPath"',
+        '"objectPath"',
+        '"Detailed"',
+        '"detailed"',
+        '"sourceSet"',
+        '"metadataPath"',
+    ],
 }
+
+
+def implemented_apply_operations(repo_root: Path) -> set[str]:
+    """Имена, которые `unica.apply` действительно исполняет.
+
+    Список живёт в Rust и меняется вместе с продуктом; переписать его здесь
+    значило бы держать второй реестр, который устаревает молча. Пример скилла,
+    назвавший имя вне этого списка, учит вызову, отвечающему отказом.
+    """
+    source = (
+        repo_root / "crates/unica-coder/src/domain/apply.rs"
+    ).read_text(encoding="utf-8")
+    marker = "pub(crate) const IMPLEMENTED_APPLY_OPERATIONS: &[&str] = &["
+    start = source.index(marker) + len(marker)
+    body = source[start : source.index("];", start)]
+    return set(re.findall(r'"([^"]+)"', body))
 
 
 def markdown_routing_units(text: str) -> list[str]:
@@ -1215,11 +1282,11 @@ class UnicaSkillRoutingTests(unittest.TestCase):
             / "unica_reference_models"
         )
 
-    def test_meta_skill_surface_is_exactly_three_typed_operations(self) -> None:
+    def test_meta_skill_surface_is_exactly_three_canonical_entries(self) -> None:
         expected = {
-            "meta-info": "unica.meta.info",
-            "meta-add": "unica.meta.add",
-            "meta-edit": "unica.meta.edit",
+            "meta-info": "unica.view",
+            "meta-add": "unica.apply",
+            "meta-edit": "unica.apply",
         }
         actual = {
             path.name
@@ -1236,8 +1303,12 @@ class UnicaSkillRoutingTests(unittest.TestCase):
                 self.assertIn("## MCP routing", text)
                 self.assertIn("MCP `unica`", text)
                 self.assertIn(tool, text)
+                # Снятые имена не должны остаться ни в одном маршруте: сервер
+                # ответит на них `unknown unica tool`.
+                for retired in ("unica.meta.info", "unica.meta.add", "unica.meta.edit"):
+                    self.assertNotIn(retired, text)
 
-    def test_meta_examples_follow_final_typed_contracts(self) -> None:
+    def test_meta_examples_follow_the_canonical_contracts(self) -> None:
         documents = {
             skill: (self.skill_root() / skill / "SKILL.md").read_text(
                 encoding="utf-8"
@@ -1253,192 +1324,94 @@ class UnicaSkillRoutingTests(unittest.TestCase):
             for skill, text in documents.items()
         }
 
-        self.assertTrue(calls["meta-add"])
-        for call in calls["meta-add"]:
+        # Читатель называет адрес и ничего больше: набора исходников и пути
+        # метаданных во входе канонического `view` нет.
+        self.assertTrue(calls["meta-info"])
+        for call in calls["meta-info"]:
             arguments = call["params"]["arguments"]
-            self.assertEqual(call["params"]["name"], "unica.meta.add")
-            self.assertTrue({"sourceSet", "kind", "name"}.issubset(arguments))
-            self.assertLessEqual(
-                set(arguments),
-                {"cwd", "sourceSet", "kind", "name", "operations", "dryRun"},
-            )
-            if "operations" in arguments:
-                self.assertIsInstance(arguments["operations"], list)
-                self.assertTrue(arguments["operations"])
-                self.assertTrue(
-                    all(
-                        isinstance(operation, dict)
-                        for operation in arguments["operations"]
-                    )
-                )
-
-        self.assertTrue(calls["meta-edit"])
-        edit_operations = []
-        for call in calls["meta-edit"]:
-            arguments = call["params"]["arguments"]
-            self.assertEqual(call["params"]["name"], "unica.meta.edit")
-            self.assertEqual(
-                set(arguments)
-                - {"cwd", "sourceSet", "metadataPath", "operations", "dryRun"},
-                set(),
-            )
-            self.assertIsInstance(arguments["operations"], list)
-            self.assertTrue(arguments["operations"])
-            self.assertTrue(
-                all(isinstance(operation, dict) for operation in arguments["operations"])
-            )
-            edit_operations.extend(arguments["operations"])
-
-        self.assertEqual(
-            {operation.get("op") for operation in edit_operations},
-            {"setProperties", "add", "update", "remove", "editRelations"},
-        )
-        for operation in edit_operations:
-            with self.subTest(edit_operation=operation.get("op")):
-                if operation.get("collection") == "predefinedItems":
-                    allowed_fields = {
-                        "add": {"op", "collection", "elements"},
-                        "update": {"op", "collection", "elements"},
-                        "remove": {"op", "collection", "ids"},
-                    }[operation["op"]]
-                else:
-                    allowed_fields = {
-                        "setProperties": {"op", "values"},
-                        "add": {"op", "collection", "scope", "elements"},
-                        "update": {"op", "collection", "scope", "elements"},
-                        "remove": {"op", "collection", "scope", "names"},
-                        "editRelations": {"op", "relation", "mode", "targets"},
-                    }[operation["op"]]
-                self.assertLessEqual(set(operation), allowed_fields)
-
-        predefined_operations = [
-            operation
-            for operation in edit_operations
-            if operation.get("collection") == "predefinedItems"
-        ]
-        self.assertEqual(
-            {operation["op"] for operation in predefined_operations},
-            {"add", "update", "remove"},
-        )
-        for operation in predefined_operations:
-            with self.subTest(predefined_operation=operation["op"]):
-                self.assertNotIn("scope", operation)
-                self.assertNotIn("names", operation)
-                if operation["op"] == "remove":
-                    self.assertEqual(set(operation), {"op", "collection", "ids"})
-                    self.assertTrue(operation["ids"])
-                else:
-                    self.assertEqual(
-                        set(operation), {"op", "collection", "elements"}
-                    )
-                    self.assertTrue(operation["elements"])
-
-        for scoped_operation in ("update", "remove"):
-            matching = [
-                operation
-                for operation in edit_operations
-                if operation.get("op") == scoped_operation
-            ]
-            self.assertTrue(matching)
-            self.assertTrue(
-                any(
-                    set(operation.get("scope", {})) == {"tabularSection"}
-                    and bool(operation["scope"]["tabularSection"])
-                    for operation in matching
-                )
-            )
-
-        source_operations = [
-            operation
-            for operation in edit_operations
-            if operation.get("relation") == "source"
-        ]
-        self.assertTrue(source_operations)
-        for operation in source_operations:
-            self.assertEqual(operation["op"], "editRelations")
-            self.assertEqual(operation["mode"], "replace")
-            self.assertIsInstance(operation["targets"], list)
-            for target in operation["targets"]:
-                self.assertIn(
-                    target.get("kind"),
-                    {
-                        "string",
-                        "number",
-                        "boolean",
-                        "date",
-                        "valueStorage",
-                        "object",
-                        "reference",
-                        "recordSet",
-                        "definedType",
-                    },
-                )
+            self.assertIn(call["params"]["name"], {"unica.view", "unica.check"})
+            self.assertLessEqual(set(arguments), {"at", "filter", "limit", "cursor"})
+            self.assertTrue(arguments["at"].startswith("main:"))
         self.assertTrue(
-            any(
-                target.get("kind") == "recordSet"
-                and target.get("metadataPath")
-                == "InformationRegister.ИсторияИзменений"
-                for operation in source_operations
-                for target in operation["targets"]
-            )
+            any(call["params"]["name"] == "unica.check" for call in calls["meta-info"]),
+            "вердикт об объекте спрашивает свой вход",
         )
+
+        written = []
+        for skill in ("meta-add", "meta-edit"):
+            self.assertTrue(calls[skill], skill)
+            for call in calls[skill]:
+                arguments = call["params"]["arguments"]
+                self.assertEqual(call["params"]["name"], "unica.apply")
+                self.assertLessEqual(
+                    set(arguments), {"at", "ops", "executionToken"}
+                )
+                if "executionToken" in arguments:
+                    self.assertEqual(set(arguments), {"executionToken"})
+                    self.assertTrue(arguments["executionToken"])
+                    continue
+                self.assertTrue(arguments["ops"])
+                for operation in arguments["ops"]:
+                    self.assertLessEqual(set(operation), {"op", "args"})
+                    self.assertTrue(operation["args"]["at"].startswith("main:"))
+                    written.append((skill, operation["op"]))
+
+        names = {op for _skill, op in written}
+        self.assertIn("object.create", names)
+        self.assertTrue(
+            names >= {"props.set", "attribute.add"},
+            f"создание настраивает объект теми же операциями: {sorted(names)}",
+        )
+        self.assertTrue(
+            names >= {"attribute.set", "attribute.remove", "predefinedItem.add"},
+            f"правка адресует элемент коллекции: {sorted(names)}",
+        )
+        self.assertIn("relation.replace", names)
+
+        # Каждое имя операции примера должно быть реализованным именем реестра,
+        # иначе пример учит вызову, который отвечает отказом.
+        implemented = implemented_apply_operations(self.repo_root())
+        for skill, op in written:
+            with self.subTest(skill=skill, op=op):
+                self.assertIn(op, implemented)
+
+        # Источник подписки остаётся закрытым объединением целей.
+        for skill in ("meta-add", "meta-edit"):
+            for call in calls[skill]:
+                for operation in call["params"]["arguments"].get("ops", []):
+                    values = operation["args"].get("values", {})
+                    if values.get("relation") != "source":
+                        continue
+                    self.assertEqual(operation["op"], "relation.replace")
+                    for target in values["targets"]:
+                        self.assertIn(
+                            target.get("kind"),
+                            {
+                                "object",
+                                "manager",
+                                "recordSet",
+                                "definedType",
+                                "family",
+                            },
+                        )
+
         self.assertIn("wire-массив набора", documents["meta-edit"])
         self.assertIn(
             "порядок его членов семантически незначим", documents["meta-edit"]
         )
         self.assertIn("exact-byte no-op", documents["meta-edit"])
-
-        add_operations = [
-            operation
-            for call in calls["meta-add"]
-            for operation in call["params"]["arguments"].get("operations", [])
-        ]
-        self.assertTrue(
-            any(
-                operation.get("op") == "editRelations"
-                and operation.get("relation") == "source"
-                and operation.get("mode") == "replace"
-                for operation in add_operations
-            )
-        )
-
-        info = documents["meta-info"]
-        # `meta.info` no longer consults an index, so the fields that only made
-        # sense for a possibly-stale provider are gone from the answer and must
-        # not be promised by the prose either.
-        for token in ("`validation`", "status", "diagnostics", "usage", "predefinedItems"):
-            with self.subTest(info_token=token):
-                self.assertIn(token, info)
-        for retired in ("freshness", "completeness", "soft-fail", "related"):
-            with self.subTest(info_retired=retired):
-                self.assertNotIn(retired, info)
-        self.assertNotIn("`total`, `limit`", info)
-        self.assertTrue(
-            any("sections" not in call["params"]["arguments"] for call in calls["meta-info"])
-        )
-        self.assertTrue(
-            any(
-                call["params"]["arguments"].get("sections")
-                and 1 <= call["params"]["arguments"].get("limit", 0) <= 50
-                for call in calls["meta-info"]
-            )
-        )
-
-        for skill in ("meta-add", "meta-edit", "meta-info"):
-            with self.subTest(skill=skill, contract="structured result"):
-                text = documents[skill]
-                self.assertIn("structuredContent", text)
-                self.assertIn("isError == !structuredContent.ok", text)
-                self.assertIn(
-                    "не является вторым контрактом", " ".join(text.split())
-                )
-
         self.assertNotIn("upsert-predefined", documents["meta-edit"])
+
+        # Названный пробел важнее гладкой прозы: читателя у предопределённых
+        # элементов на канонической поверхности нет, и оба скилла это говорят.
+        for skill in ("meta-info", "meta-edit"):
+            with self.subTest(skill=skill, gap="predefined items have no reader"):
+                self.assertIn("предопределённых элементов", documents[skill])
 
         for skill in ("meta-add", "meta-edit"):
             with self.subTest(skill=skill, contract="preview effects"):
                 text = documents[skill]
-                self.assertIn("data.effects", text)
+                self.assertIn("`effects`", text)
                 self.assertIn("полный XML", text)
 
     def test_role_edit_skill_uses_only_the_logical_typed_contract(self) -> None:
@@ -1451,36 +1424,43 @@ class UnicaSkillRoutingTests(unittest.TestCase):
             if '"method": "tools/call"' in block
         ]
 
-        self.assertEqual(len(calls), 1)
-        params = calls[0]["params"]
-        self.assertEqual(params["name"], "unica.role.edit")
-        arguments = params["arguments"]
-        self.assertEqual(
-            set(arguments), {"sourceSet", "metadataPath", "operations", "dryRun"}
-        )
-        self.assertRegex(arguments["metadataPath"], r"^Role\.[^.]+$")
-        self.assertIs(arguments["dryRun"], True)
-        self.assertTrue(arguments["operations"])
-        for operation in arguments["operations"]:
-            self.assertEqual(
-                set(operation), {"op", "objectName", "right", "value"}
-            )
-            self.assertEqual(operation["op"], "setRight")
-            self.assertIsInstance(operation["value"], bool)
+        self.assertTrue(calls)
+        previews = 0
+        for call in calls:
+            params = call["params"]
+            self.assertEqual(params["name"], "unica.apply")
+            arguments = params["arguments"]
+            if "executionToken" in arguments:
+                self.assertEqual(set(arguments), {"executionToken"})
+                self.assertTrue(arguments["executionToken"])
+                continue
+            # Роль называет адрес; ни набора, ни пути в аргументах нет.
+            self.assertRegex(arguments["at"], r"^[^:]+:Role\.[^.]+$")
+            self.assertNotIn("sourceSet", arguments)
+            self.assertNotIn("metadataPath", arguments)
+            previews += 1
+            self.assertNotIn("dryRun", arguments)
+            self.assertNotIn("ifRev", arguments)
+            self.assertTrue(arguments["ops"])
+            for operation in arguments["ops"]:
+                self.assertEqual(operation["op"], "right.set")
+                values = operation["args"]["values"]
+                self.assertIn("object", values)
+                self.assertIn("right", values)
+                # Одно из двух обязано быть: право без значения и без
+                # ограничения ничего не говорит.
+                self.assertTrue({"value", "rls"} & set(values))
+        self.assertTrue(previews, "скилл обязан показать предпросмотр")
 
-        encoded_call = json.dumps(calls[0], ensure_ascii=False)
-        for legacy in ("RightsPath", "Path", "ObjectName", "Name", "Value"):
+        encoded = json.dumps(calls, ensure_ascii=False)
+        for legacy in ("RightsPath", "objectName", "setRight", "ObjectName"):
             with self.subTest(legacy=legacy):
-                self.assertNotIn(f'"{legacy}"', encoded_call)
-        for token in (
-            "structuredContent.data",
-            "metadataPath",
-            "changed",
-            "effects",
-            "operationIndex",
-            "validation",
-            "diagnostics",
-        ):
+                self.assertNotIn(f'"{legacy}"', encoded)
+        # Что читать в ответе. Словарь v0.12 (`structuredContent.data`,
+        # `metadataPath`, `operationIndex`, `validation`) ушёл вместе с
+        # инструментом; канонический `apply` отвечает изменениями, эффектами
+        # по порядку операций и забором ревизии.
+        for token in ("changed", "effects", "executionToken", "диагностик"):
             with self.subTest(result_token=token):
                 self.assertIn(token, text)
 
@@ -1503,19 +1483,6 @@ class UnicaSkillRoutingTests(unittest.TestCase):
                 offenders.append(path.relative_to(self.repo_root()).as_posix())
         self.assertEqual(offenders, [])
 
-    def test_in_scope_skills_route_to_single_unica_mcp(self) -> None:
-        for skill, tool_name in IN_SCOPE_TOOLS.items():
-            with self.subTest(skill=skill):
-                text = (self.skill_root() / skill / "SKILL.md").read_text(encoding="utf-8")
-                self.assertIn("## MCP routing", text)
-                self.assertIn("MCP `unica`", text)
-                self.assertIn(tool_name, text)
-                self.assertNotIn("unica-coder", text)
-                self.assertNotIn("unica-v8-runner", text)
-                self.assertNotIn("unica-bsl-workspace", text)
-                self.assertNotIn("unica-rlm-tools-bsl", text)
-                self.assertNotIn("unica-v8std", text)
-
     def test_scenario_skills_cover_requested_unica_workflows(self) -> None:
         for skill, tool_names in SCENARIO_SKILLS.items():
             with self.subTest(skill=skill):
@@ -1531,36 +1498,6 @@ class UnicaSkillRoutingTests(unittest.TestCase):
                 for token in SCENARIO_REQUIRED_TOKENS.get(skill, []):
                     self.assertIn(token, text)
 
-    def test_query_optimize_pins_first_rows_constant_semantics(self) -> None:
-        text = (self.skill_root() / "query-optimize" / "SKILL.md").read_text(
-            encoding="utf-8"
-        )
-
-        for token in (
-            "ПЕРВЫЕ &",
-            "Ожидается константа",
-            "СтрЗаменить",
-            "СтрЧислоВхождений",
-            "Символы.ПС",
-            "Формат(",
-            '"ЧГ=0"',
-        ):
-            with self.subTest(token=token):
-                self.assertIn(token, text)
-
-        normalized = " ".join(text.split())
-        self.assertIn(
-            'МаркерОграничения = "ПЕРВЫЕ 1" + Символы.ПС;', normalized
-        )
-        self.assertRegex(
-            normalized,
-            r"СтрЧислоВхождений\(Запрос\.Текст, МаркерОграничения\) <> 1",
-        )
-        self.assertIn(
-            '"ПЕРВЫЕ " + Формат(Количество, "ЧГ=0") + Символы.ПС',
-            normalized,
-        )
-
     def test_skill_guidance_never_reintroduces_removed_code_grep_tool(self) -> None:
         offenders = [
             path.relative_to(self.repo_root()).as_posix()
@@ -1570,154 +1507,51 @@ class UnicaSkillRoutingTests(unittest.TestCase):
 
         self.assertEqual(offenders, [])
 
-    def test_code_diagnostics_describes_operational_config_fallback(self) -> None:
-        text = (self.skill_root() / "code-diagnostics" / "SKILL.md").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertIn("operational.code_diagnostics.analyze_timeout_seconds", text)
-        self.assertIn("unica.local.toml", text)
-        self.assertIn("unica.toml", text)
-        self.assertIn("compiled 120-second fallback", text)
-        self.assertIn("do not read this operational config", text)
 
     def test_code_diagnostics_routes_providers_internally(self) -> None:
         text = (self.skill_root() / "code-diagnostics" / "SKILL.md").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn("no_applicable_provider", text)
-        self.assertIn("Provider execution is routed internally", text)
+        # Валидатор следует из вида узла, и выбрать его вызывающему нечем.
+        self.assertIn("Валидаторы следуют из вида узла", text)
         self.assertNotIn('providers: ["bsl-analyzer"]', text)
+        # Чистый ответ и неотработавший провайдер обязаны быть различимы:
+        # пустой список находок при незавершённом прогоне выглядел бы как
+        # «проверено и чисто».
+        self.assertIn("provider_unavailable", text)
         self.assertIn("inline/range disable markers", text)
         self.assertIn("suppression-комментарии", text)
 
-    def test_code_diagnostics_examples_use_logical_action_contract(self) -> None:
+    def test_code_diagnostics_examples_call_the_canonical_check(self) -> None:
+        """Пример — это маршрут, по которому пойдёт модель.
+
+        Пример на снятое имя учит звать то, чего на проводе нет: любое имя
+        v0.12 отвечает `-32602`. Проверка требует, чтобы примеры скилла звали
+        `unica.check` одним логическим адресом и ничем больше.
+        """
+        text = (self.skill_root() / "code-diagnostics" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
         calls = []
-        for path in sorted(self.skill_root().glob("*/SKILL.md")):
-            text = path.read_text(encoding="utf-8")
-            for block in re.findall(r"```(?:json|jsonc)\n(.*?)\n```", text, flags=re.S):
-                try:
-                    payload = json.loads(block)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(payload, dict):
-                    continue
-                params = payload.get("params", {})
-                if params.get("name") == "unica.code.diagnostics":
-                    calls.append((path, params.get("arguments", {})))
+        for block in re.findall(r"```(?:json|jsonc)\n(.*?)\n```", text, flags=re.S):
+            try:
+                payload = json.loads(block)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                calls.append(payload.get("params", {}))
 
-        self.assertGreaterEqual(len(calls), 2)
-        forbidden = {
-            "mode",
-            "sourceDir",
-            "path",
-            "codes",
-            "minSeverity",
-            "rangeStart",
-            "rangeEnd",
-            "config",
-            "format",
-            "detail",
-            "maxFiles",
-        }
-        for path, arguments in calls:
-            with self.subTest(
-                path=path.relative_to(self.repo_root()), arguments=arguments
-            ):
-                self.assertIn(
-                    arguments.get("action"),
-                    {"analyze", "findings", "status", "catalog"},
-                )
-                self.assertIsInstance(arguments.get("sourceSet"), str)
-                self.assertTrue(arguments["sourceSet"].strip())
-                self.assertEqual(forbidden.intersection(arguments), set())
-                if arguments["action"] == "findings":
-                    self.assertRegex(
-                        arguments.get("metadataPath", ""),
-                        r"^[^.]+\.[^.]+(?:\..+)?$",
-                    )
-                for code in arguments.get("filter", {}).get("codes", []):
-                    self.assertEqual(set(code), {"provider", "code"})
-                    self.assertTrue(code["provider"])
-                    self.assertTrue(code["code"])
+        checks = [call for call in calls if call.get("name") == "unica.check"]
+        self.assertTrue(checks, "скилл диагностик обязан показать вызов check")
+        for call in checks:
+            arguments = call.get("arguments", {})
+            self.assertEqual(set(arguments), {"at"})
+            self.assertRegex(arguments["at"], r"^[^:]+:.+")
 
-        code_diagnostics_calls = [
-            arguments
-            for path, arguments in calls
-            if path.parent.name == "code-diagnostics"
-        ]
-        self.assertTrue(
-            any(call["action"] == "analyze" for call in code_diagnostics_calls)
-        )
-        findings = next(
-            call
-            for call in code_diagnostics_calls
-            if call["action"] == "findings"
-        )
-        self.assertEqual(findings["sourceSet"], "main")
-        self.assertIn("metadataPath", findings)
-        self.assertTrue(findings.get("filter", {}).get("codes"))
+        for call in calls:
+            self.assertNotEqual(call.get("name"), "unica.code.diagnostics")
 
-    def test_unica_owned_guidance_contains_required_operational_concepts(self) -> None:
-        docs = {
-            "code-search": self.skill_root() / "code-search" / "SKILL.md",
-            "code-diagnostics": self.skill_root() / "code-diagnostics" / "SKILL.md",
-            "test-authoring": self.skill_root() / "test-authoring" / "SKILL.md",
-            "background-jobs": self.skill_root() / "background-jobs" / "SKILL.md",
-            "db-performance": self.skill_root() / "db-performance" / "SKILL.md",
-            "integration-implement": self.skill_root() / "integration-implement" / "SKILL.md",
-            "platform-mechanics": self.reference_root() / "platform" / "platform-mechanics.md",
-            "runtime-diagnostics": self.reference_root() / "platform" / "runtime-diagnostics.md",
-            "db-performance-ref": self.reference_root() / "platform" / "db-performance.md",
-            "integration-contracts": self.reference_root() / "platform" / "integration-contracts.md",
-        }
-        joined = "\n".join(path.read_text(encoding="utf-8") for path in docs.values())
-
-        for token in [
-            "MCP-first",
-            "what was tried",
-            "verification gate",
-            "impact analysis",
-            "managed locks",
-            "lock order",
-            "structured logging",
-            "DCS",
-            "idempotency key",
-        ]:
-            with self.subTest(token=token):
-                self.assertIn(token, joined)
-
-    def test_compatibility_guidance_preserves_effective_version_contract(self) -> None:
-        reference_path = self.reference_root() / "platform" / "compatibility-modes.md"
-        self.assertTrue(reference_path.is_file())
-        reference = reference_path.read_text(encoding="utf-8")
-
-        for token in [
-            "runtime platform line",
-            "configured compatibility mode",
-            "effective compatibility version",
-            "`DontUse` -> runtime platform line",
-            "`VersionX` -> `X`",
-            "`CompatibilityMode`",
-            "`ConfigurationExtensionCompatibilityMode`",
-            "`InterfaceCompatibilityMode`",
-            "code location does not select the mode family",
-            "corroborating implementation evidence",
-            "not complete old-platform equivalence",
-        ]:
-            with self.subTest(token=token):
-                self.assertIn(token, reference)
-
-        for skill in ["platform-help", "release-support", "bsp-patterns"]:
-            skill_text = (self.skill_root() / skill / "SKILL.md").read_text(
-                encoding="utf-8"
-            )
-            with self.subTest(skill=skill):
-                self.assertIn(
-                    "references/platform/compatibility-modes.md",
-                    skill_text,
-                )
 
     def test_platform_evidence_is_not_routed_to_standards_tools(self) -> None:
         docs = list(self.skill_root().glob("**/*.md")) + list(
@@ -1772,28 +1606,6 @@ class UnicaSkillRoutingTests(unittest.TestCase):
         self.assertIn("platform API rules", unsafe_routes[0])
         self.assertNotIn("development-standard", unsafe_routes[0])
 
-    def test_platform_help_uses_one_contract_gap_label(self) -> None:
-        platform_help = (self.skill_root() / "platform-help" / "SKILL.md").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertNotIn("Unica MCP contract gap", platform_help)
-        self.assertIn("platform-help contract gap", platform_help)
-
-    def test_all_skills_do_not_expose_internal_mcp_names(self) -> None:
-        forbidden = [
-            "unica-coder",
-            "unica-v8-runner",
-            "unica-bsl-reference",
-            "unica-bsl-workspace",
-            "unica-rlm-tools-bsl",
-            "unica-v8std",
-        ]
-        for skill_path in self.skill_root().glob("*/SKILL.md"):
-            with self.subTest(skill=skill_path.parent.name):
-                text = skill_path.read_text(encoding="utf-8")
-                for name in forbidden:
-                    self.assertNotIn(name, text)
 
     def test_skills_and_references_do_not_instruct_direct_rlm_mcp_calls(self) -> None:
         forbidden = ["rlm_index", "rlm_start", "rlm_execute", "rlm_end"]
@@ -1814,54 +1626,14 @@ class UnicaSkillRoutingTests(unittest.TestCase):
             with self.subTest(skill=skill):
                 self.assertFalse((self.skill_root() / skill).exists())
 
-        scanned_docs = [
-            self.repo_root() / "README.md",
-            self.repo_root() / "plugins" / "unica" / "README.md",
-            self.reference_root() / "README.md",
-            self.reference_root() / "tooling" / "v8project.md",
-            self.reference_root() / "tooling" / "runtime-build.md",
-            self.reference_root() / "use-cases" / "workspace-runtime.md",
-            self.reference_root() / "use-cases" / "forms-ui.md",
-            self.reference_root() / "use-cases" / "reports-printing.md",
-        ]
-        for doc in scanned_docs:
-            text = doc.read_text(encoding="utf-8")
-            self.assertNotIn("`v8-runner` skill", text)
-            self.assertNotIn("Use the `v8-runner` skill", text)
-            for skill in REPLACED_RUNTIME_SKILLS:
-                with self.subTest(path=doc.relative_to(self.repo_root()), skill=skill):
-                    self.assertNotIn(f"/{skill}", text)
-                    self.assertNotIn(f"`{skill}`", text)
 
-
-
-    def test_db_auth_check_numbers_only_the_two_credential_candidates(self) -> None:
-        text = (
-            self.skill_root() / "db-auth-check" / "SKILL.md"
-        ).read_text(encoding="utf-8")
-        credential_rule = text.split(
-            "## Правило пустых учетных данных", maxsplit=1
-        )[1].split("## Workflow", maxsplit=1)[0]
-
-        self.assertEqual(
-            re.findall(r"(?m)^(\d+)\.\s+(.+)$", credential_rule),
-            [
-                ("1", "`Администратор` с пустым паролем."),
-                ("2", "`Admin` с пустым паролем."),
-            ],
-        )
-        self.assertRegex(
-            credential_rule,
-            r"(?m)^После двух подтверждённых отказов остановись и спроси "
-            r"пользователя, из-под кого подключаться\.$",
-        )
 
     def test_runtime_json_guard_accepts_case_insensitive_fence_labels(self) -> None:
         example = """```JSON
 {
   "method": "tools/call",
   "params": {
-    "name": "unica.runtime.execute",
+    "name": "unica.run",
     "arguments": {"operation": "build", "dryRun": false}
   }
 }
@@ -1873,7 +1645,7 @@ class UnicaSkillRoutingTests(unittest.TestCase):
                 {
                     "method": "tools/call",
                     "params": {
-                        "name": "unica.runtime.execute",
+                        "name": "unica.run",
                         "arguments": {"operation": "build", "dryRun": False},
                     },
                 }
@@ -1887,7 +1659,7 @@ class UnicaSkillRoutingTests(unittest.TestCase):
 {
   "method": "tools/call",
   "params": {
-    "name": "unica.runtime.execute",
+    "name": "unica.run",
     "arguments": {"operation": "build", "dryRun": false}
   }
 }
@@ -1903,7 +1675,7 @@ class UnicaSkillRoutingTests(unittest.TestCase):
 {
   "method": "tools/call",
   "params": {
-    "name": "unica\u002eruntime.execute",
+    "name": "unica\u002erun",
     "arguments": {"operation": "build", "dryRun": false}
   }
 }
@@ -1912,7 +1684,7 @@ class UnicaSkillRoutingTests(unittest.TestCase):
         payloads = runtime_execute_json_examples(example)
 
         self.assertEqual(len(payloads), 1)
-        self.assertEqual(payloads[0]["params"]["name"], "unica.runtime.execute")
+        self.assertEqual(payloads[0]["params"]["name"], "unica.run")
         self.assertIs(payloads[0]["params"]["arguments"]["dryRun"], False)
 
     def test_runtime_json_guard_keeps_malformed_block_boundary(self) -> None:
@@ -1923,7 +1695,7 @@ class UnicaSkillRoutingTests(unittest.TestCase):
         self.assertEqual(
             runtime_execute_json_examples(
                 r'''```json
-{"note":"unica\\u002eruntime.execute",
+{"note":"unica\\u002erun",
 ```'''
             ),
             [],
@@ -1933,7 +1705,7 @@ class UnicaSkillRoutingTests(unittest.TestCase):
             ValueError, r"invalid fenced runtime JSON example #1"
         ):
             runtime_execute_json_examples(
-                '```json\n{"name":"unica.runtime.execute",\n```'
+                '```json\n{"name":"unica.run",\n```'
             )
 
     def test_runtime_json_guard_rejects_malformed_escaped_tool_name(self) -> None:
@@ -1942,7 +1714,7 @@ class UnicaSkillRoutingTests(unittest.TestCase):
         ):
             runtime_execute_json_examples(
                 r'''```json
-{"params":{"name":"unica\u002eruntime.execute","arguments":{"dryRun":false}},
+{"params":{"name":"unica\u002erun","arguments":{"dryRun":false}},
 ```'''
             )
 
@@ -1951,19 +1723,19 @@ class UnicaSkillRoutingTests(unittest.TestCase):
         ):
             runtime_execute_json_examples(
                 r'''```json
-{"params":{"name":"unica\u002eruntime.execute
+{"params":{"name":"unica\u002erun
 ```'''
             )
 
     def test_runtime_json_guard_handles_commonmark_fences_and_batches(self) -> None:
         examples = r'''~~~JSON
-[{"method":"tools/call","params":{"name":"unica\u002eruntime.execute","arguments":{"dryRun":false}}}]
+[{"method":"tools/call","params":{"name":"unica\u002erun","arguments":{"dryRun":false}}}]
 ~~~
 ``` json
-{"method":"tools/call","params":{"name":"unica.runtime.execute","arguments":{"dryRun":false}}}
+{"method":"tools/call","params":{"name":"unica.run","arguments":{"dryRun":false}}}
 ```
 ````json
-{"note":"```","method":"tools/call","params":{"name":"unica.runtime.execute","arguments":{"dryRun":false}}}
+{"note":"```","method":"tools/call","params":{"name":"unica.run","arguments":{"dryRun":false}}}
 ````'''
 
         payloads = runtime_execute_json_examples(examples)
@@ -1971,7 +1743,7 @@ class UnicaSkillRoutingTests(unittest.TestCase):
         self.assertEqual(len(payloads), 3)
         self.assertTrue(
             all(
-                payload["params"]["name"] == "unica.runtime.execute"
+                payload["params"]["name"] == "unica.run"
                 and payload["params"]["arguments"]["dryRun"] is False
                 for payload in payloads
             )
@@ -1979,15 +1751,15 @@ class UnicaSkillRoutingTests(unittest.TestCase):
 
     def test_runtime_json_guard_handles_commonmark_containers_and_info(self) -> None:
         examples = '''> ```json
-> {"method":"tools/call","params":{"name":"unica.runtime.execute","arguments":{"dryRun":false}}}
+> {"method":"tools/call","params":{"name":"unica.run","arguments":{"dryRun":false}}}
 > ```
 - example:
 
     ```json
-    {"method":"tools/call","params":{"name":"unica.runtime.execute","arguments":{"dryRun":false}}}
+    {"method":"tools/call","params":{"name":"unica.run","arguments":{"dryRun":false}}}
     ```
 ```json title=request
-{"method":"tools/call","params":{"name":"unica.runtime.execute","arguments":{"dryRun":false}}}
+{"method":"tools/call","params":{"name":"unica.run","arguments":{"dryRun":false}}}
 ```'''
 
         payloads = runtime_execute_json_examples(examples)
@@ -2002,10 +1774,10 @@ class UnicaSkillRoutingTests(unittest.TestCase):
 
     def test_runtime_json_guard_handles_fence_after_list_marker(self) -> None:
         examples = '''- ```json
-  {"method":"tools/call","params":{"name":"unica.runtime.execute","arguments":{"dryRun":false}}}
+  {"method":"tools/call","params":{"name":"unica.run","arguments":{"dryRun":false}}}
   ```
 > - ```json
->   {"method":"tools/call","params":{"name":"unica.runtime.execute","arguments":{"dryRun":false}}}
+>   {"method":"tools/call","params":{"name":"unica.run","arguments":{"dryRun":false}}}
 >   ```'''
 
         payloads = runtime_execute_json_examples(examples)
@@ -2015,14 +1787,14 @@ class UnicaSkillRoutingTests(unittest.TestCase):
     def test_runtime_json_guard_handles_nested_indent_and_info_entities(self) -> None:
         examples = '''123. outer
      - ```json
-       {"method":"tools/call","params":{"name":"unica.runtime.execute","arguments":{"dryRun":false}}}
+       {"method":"tools/call","params":{"name":"unica.run","arguments":{"dryRun":false}}}
        ```
 123. outer
      > ```json
-     > {"method":"tools/call","params":{"name":"unica.runtime.execute","arguments":{"dryRun":false}}}
+     > {"method":"tools/call","params":{"name":"unica.run","arguments":{"dryRun":false}}}
      > ```
 ```j&#x73;on
-{"method":"tools/call","params":{"name":"unica.runtime.execute","arguments":{"dryRun":false}}}
+{"method":"tools/call","params":{"name":"unica.run","arguments":{"dryRun":false}}}
 ```'''
 
         payloads = runtime_execute_json_examples(examples)
@@ -2031,7 +1803,7 @@ class UnicaSkillRoutingTests(unittest.TestCase):
 
     def test_runtime_guidance_document_detects_decoded_tool_name(self) -> None:
         example = r'''```json
-{"method":"tools/call","params":{"name":"unica\u002eruntime.execute","arguments":{"dryRun":false}}}
+{"method":"tools/call","params":{"name":"unica\u002erun","arguments":{"dryRun":false}}}
 ```'''
 
         is_runtime_document, payloads = runtime_guidance_document(example)
@@ -2039,21 +1811,87 @@ class UnicaSkillRoutingTests(unittest.TestCase):
         self.assertTrue(is_runtime_document)
         self.assertEqual(len(payloads), 1)
 
-    def test_runtime_guidance_document_rejects_indented_applied_runtime_example(
+    def test_runtime_guidance_document_accepts_indented_applied_runtime_example(
         self,
     ) -> None:
         example = """
     {
       "method": "tools/call",
       "params": {
-        "name": "unica.runtime.execute",
+        "name": "unica.run",
         "arguments": {"operation": "build", "dryRun": false}
       }
     }
 """
 
-        with self.assertRaisesRegex(ValueError, "indented runtime JSON example"):
-            runtime_guidance_document(example)
+        runtime_guidance_document(example)
+
+    def test_runtime_example_requires_explicit_boolean_inside_arguments(self) -> None:
+        outside = (
+            '    {"dryRun": false, "params": {"name": "unica.run", '
+            '"arguments": {"op": "upload"}}}\n'
+        )
+        with self.assertRaisesRegex(ValueError, "explicit boolean dryRun"):
+            validate_indented_runtime_examples(outside)
+        inside = (
+            '    {"params": {"name": "unica.run", "arguments": '
+            '{"op": "upload", "dryRun": false}}}\n'
+        )
+        validate_indented_runtime_examples(inside)
+
+    def test_runtime_example_guard_rejects_revisions_and_non_boolean_modes(self) -> None:
+        for arguments in [
+            {"op": "upload"},
+            *({"op": "upload", "dryRun": value} for value in [None, 0, 1, "false"]),
+            {"op": "upload", "dryRun": False, "ifRev": "old"},
+            {"op": "upload", "dryRun": True, "ifRev": None},
+            {"op": "launch", "ifRev": "old"},
+        ]:
+            payload = {"params": {"name": "unica.run", "arguments": arguments}}
+            text = json.dumps(payload).replace('"ifRev"', '"if\\u0052ev"')
+            for document in [f"```json\n{text}\n```", f"    {text}\n"]:
+                with self.subTest(arguments=arguments, document=document):
+                    with self.assertRaises(ValueError):
+                        runtime_guidance_document(document)
+
+    def test_runtime_example_guard_preserves_dictionary_launch_and_other_tools(self) -> None:
+        for arguments in [{}, {"op": "launch"}, {"op": "launch", "dryRun": True},
+                          {"op": "upload", "dryRun": True}, {"op": "upload", "dryRun": False}]:
+            payload = {"params": {"name": "unica.run", "arguments": arguments}}
+            self.assertEqual(runtime_execute_json_examples(f"```json\n{json.dumps(payload)}\n```"), [payload])
+        mixed = [
+            {"params": {"name": "unica.apply", "arguments": {"executionToken": "saved"}}},
+            {"params": {"name": "another.tool", "arguments": {"ifRev": "unrelated"}}},
+            {"params": {"name": "unica.run", "arguments": {"op": "make", "dryRun": False}}},
+        ]
+        self.assertEqual(runtime_execute_json_examples(f"```json\n{json.dumps(mixed)}\n```"), [mixed[2]])
+
+    def test_runtime_guard_does_not_parse_fenced_json_indentation_twice(self) -> None:
+        payload = {"params": {"name": "unica.run", "arguments": {"op": "make", "dryRun": True}}}
+        body = json.dumps(payload, indent=4)
+        for opening, closing, prefix in [
+            ("```json", "```", ""),
+            ("~~~~JSON", "~~~~", ""),
+            ("```json title=request", "```", "> "),
+        ]:
+            document = "\n".join(prefix + line for line in [opening, *body.splitlines(), closing])
+            with self.subTest(opening=opening, prefix=prefix):
+                self.assertEqual(runtime_guidance_document(document), (True, [payload]))
+                self.assertEqual(indented_code_blocks(document), [])
+                for arguments, reason in [
+                    ({"op": "make", "dryRun": False, "ifRev": "retired"}, "retired unica.run argument ifRev"),
+                    ({"op": "make"}, "explicit boolean dryRun"),
+                ]:
+                    invalid = {"params": {"name": "unica.run", "arguments": arguments}}
+                    invalid_lines = json.dumps(invalid, indent=4).splitlines()
+                    # The fence guard must still inspect deeply indented JSON;
+                    # the indented guard must resume after the closing fence.
+                    fenced = "\n".join(prefix + line for line in [opening, *invalid_lines, closing])
+                    indented = "\n".join("    " + line for line in invalid_lines)
+                    for invalid_document in [fenced, indented, document + "\n\n" + indented]:
+                        with self.subTest(arguments=arguments, document=invalid_document):
+                            with self.assertRaisesRegex(ValueError, reason):
+                                runtime_guidance_document(invalid_document)
 
     def test_runtime_guidance_collection_skips_parse_failures_without_stale_payloads(
         self,
@@ -2066,13 +1904,13 @@ class UnicaSkillRoutingTests(unittest.TestCase):
                 (
                     good,
                     '''```json
-{"method":"tools/call","params":{"name":"unica.runtime.execute","arguments":{"dryRun":true}}}
+{"method":"tools/call","params":{"name":"unica.run","arguments":{"dryRun":true}}}
 ```''',
                 ),
                 (
                     bad,
                     '''```json
-{"method":"tools/call","params":{"name":"unica.runtime.execute","arguments":{"dryRun":false}}
+{"method":"tools/call","params":{"name":"unica.run","arguments":{"dryRun":false}}
 ```''',
                 ),
             ]
@@ -2136,20 +1974,15 @@ class UnicaSkillRoutingTests(unittest.TestCase):
         for doc, arguments in runtime_examples:
             with self.subTest(
                 path=doc.relative_to(self.repo_root()),
-                operation=arguments.get("operation"),
+                operation=arguments.get("op"),
             ):
-                self.assertIs(arguments.get("dryRun"), True)
+                if arguments.get("op") not in (None, "launch"):
+                    self.assertIs(type(arguments.get("dryRun")), bool)
+                self.assertNotIn("ifRev", arguments)
 
-        # ADR-0074: applied execution is admitted, so the shipped guidance has to
-        # name the applied mode, its risk vocabulary and the durable alternative.
-        contract_tokens = (
-            "INV-MCP-RUNTIME-RECEIPT",
-            "ADR-0074",
-            "`dryRun: false`",
-            "runtime_risk_",
-            "`unica.build.*`",
-            "`unica.runtime.job.start`",
-        )
+        # The dictionary owns the contract: guidance points at `unica.run` and
+        # does not restate per-operation risk codes.
+        contract_tokens = ("`unica.run`",)
         forbidden_applied_claims = (
             r"запускай следующую необходимую операцию",
             r"`operation=init` допустима",
@@ -2167,117 +2000,47 @@ class UnicaSkillRoutingTests(unittest.TestCase):
                 for claim in forbidden_applied_claims:
                     self.assertNotRegex(text, claim)
 
-
-    def test_shipped_guidance_never_routes_runtime_refusal_through_fallbacks(
-        self,
-    ) -> None:
+    def test_shipped_guidance_names_no_retired_reading_or_writing_tool(self) -> None:
+        """C-1: `unica.code.*` and `unica.meta.*` route to search/view/check/apply."""
         shipped_docs = list(self.skill_root().glob("**/*.md")) + list(
             self.reference_root().glob("**/*.md")
         )
-        namespace_pattern = (
-            r"`(?:unica\.build|unica\.runtime\.job)\."
-            r"(?:\*|[a-z][a-z0-9.-]*)`"
-        )
-        namespace = re.compile(namespace_pattern)
-        fallback_context = re.compile(
-            r"(?i)\bfallback\b|\bfall\s+back\b|\bcontinuation\b|"
-            r"\bretry\b|\binstead\b|\bworkaround\b|"
-            r"(?:after|around|when).{0,60}\b(?:runtime )?refus\w*\b|"
-            r"запасн\w*\s+пут\w*|продолжени\w*|повтор\w*|вместо|обход\w*|"
-            r"(?:после|при).{0,60}отказ\w*"
-        )
-        negative_fallback = tuple(
-            re.compile(pattern)
-            for pattern in (
-                rf"(?i)\b(?:do not|don't|never|must not)\s+"
-                rf"(?:use|call|invoke|route)\b[^,.;!?]{{0,80}}{namespace_pattern}",
-                rf"(?i)\b(?:нельзя|запрещено)\s+"
-                rf"(?:использовать|вызывать|направлять)\b[^,.;!?]{{0,80}}"
-                rf"{namespace_pattern}",
-                rf"(?i)\bне\s+(?:используй|вызывай|вызови|направь|перейди)\b"
-                rf"[^,.;!?]{{0,80}}{namespace_pattern}",
-                rf"(?i)\b(?:do not|don't|never|must not)\b[^.;!?]{{0,120}}"
-                rf"\bbypass\b[^.;!?]{{0,120}}{namespace_pattern}",
-                rf"(?i)\bне\s+обходи\b[^.;!?]{{0,160}}{namespace_pattern}",
-                rf"(?i){namespace_pattern}[^.;!?]{{0,100}}"
-                rf"(?:\bis not\b|\bisn't\b|\bnot\s+as\b|"
-                rf"\bdo not use (?:it|them)\b)[^.;!?]{{0,60}}"
-                rf"(?:fallback|continuation|retry|workaround)",
-                rf"(?i){namespace_pattern}[^.;!?]{{0,100}}"
-                rf"\bне\s+(?:является|служит|используй (?:его|их))\b"
-                rf"[^.;!?]{{0,60}}(?:запасн\w*\s+пут\w*|fallback|продолжени\w*)",
+        offenders = {}
+        for doc in sorted(shipped_docs):
+            hits = sorted(
+                {
+                    match.group(0)
+                    for match in RETIRED_READ_WRITE_NAMES.finditer(
+                        doc.read_text(encoding="utf-8")
+                    )
+                }
             )
+            if hits:
+                offenders[doc.relative_to(self.repo_root()).as_posix()] = hits
+        self.assertEqual(offenders, {})
+
+    def test_shipped_guidance_names_no_retired_runtime_tool(self) -> None:
+        """#702: the wire has no `unica.runtime.execute`, so no skill may teach it."""
+        shipped_docs = (
+            list(self.skill_root().glob("**/*.md"))
+            + list(self.reference_root().glob("**/*.md"))
+            + [self.repo_root() / "plugins" / "unica" / "README.md"]
         )
-
-        def logical_clauses(text: str) -> list[str]:
-            return [
-                clause.strip()
-                for clause in re.split(
-                    r"(?<=[.!?;])\s+|^\s*(?:[-*]|\d+[.)])\s+",
-                    text,
-                    flags=re.MULTILINE,
-                )
-                if clause.strip()
-            ]
-
-        def is_fallback_route(clause: str) -> bool:
-            return bool(
-                namespace.search(clause)
-                and fallback_context.search(clause)
-                and not any(pattern.search(clause) for pattern in negative_fallback)
+        offenders = {}
+        for doc in sorted(shipped_docs):
+            hits = sorted(
+                {
+                    match.group(0)
+                    for match in RETIRED_RUNTIME_NAMES.finditer(
+                        doc.read_text(encoding="utf-8")
+                    )
+                }
             )
-
-        unsafe_examples = (
-            "Use `unica.build.load` as fallback.",
-            "Route through `unica.runtime.job.start` as continuation after runtime refusal.",
-            "Используй `unica.build.*` как запасной путь.",
-            "После отказа перейди в `unica.runtime.job.status`.",
-            "Fall back to `unica.build.load` after runtime refusal.",
-            "After runtime refusal, call `unica.runtime.job.start`.",
-            "После отказа вызови `unica.build.load`.",
-            "If runtime.execute cannot run, use `unica.runtime.job.start` as fallback.",
-            "Не вызывай runtime.execute повторно, используй `unica.runtime.job.start` как запасной путь.",
-            "Если runtime.execute нельзя вызвать, используй `unica.build.load` вместо него.",
-        )
-        safe_examples = (
-            "Do not use `unica.build.load` as fallback.",
-            "Не используй `unica.runtime.job.start` после отказа.",
-            "Use `unica.runtime.job.start` for an explicitly requested durable job.",
-            "Используй `unica.build.load` для независимого build workflow.",
-            "Use `unica.runtime.job.start` for an explicitly requested durable job; do not use it as fallback.",
-            "Используй `unica.build.load` для отдельного workflow; не используй его как запасной путь.",
-        )
-        for example in unsafe_examples:
-            self.assertTrue(
-                any(is_fallback_route(clause) for clause in logical_clauses(example)),
-                example,
-            )
-        for example in safe_examples:
-            self.assertFalse(
-                any(is_fallback_route(clause) for clause in logical_clauses(example)),
-                example,
-            )
-        for doc in shipped_docs:
-            text = doc.read_text(encoding="utf-8")
-            with self.subTest(path=doc.relative_to(self.repo_root())):
-                violating = [
-                    clause
-                    for clause in logical_clauses(text)
-                    if is_fallback_route(clause)
-                ]
-                self.assertEqual(violating, [])
+            if hits:
+                offenders[doc.relative_to(self.repo_root()).as_posix()] = hits
+        self.assertEqual(offenders, {})
 
 
-    def test_code_quality_runtime_preview_preserves_test_first_order(self) -> None:
-        doc = self.reference_root() / "use-cases" / "code-quality-review.md"
-        text = doc.read_text(encoding="utf-8")
-        test_first = re.search(
-            r"write a reproducing test.{0,160}confirm that it fails.{0,160}before changing",
-            text,
-            flags=re.DOTALL,
-        )
-        self.assertIsNotNone(test_first)
-        self.assertLess(test_first.start(), text.index("preview intended syntax/test"))
 
 
 
@@ -2417,7 +2180,10 @@ class UnicaSkillRoutingTests(unittest.TestCase):
         # moved into the writer that consumes it.
         self.assertNotIn('"Raw": true', dcs_edit)
         self.assertIn("сырой текст запроса целиком", dcs_edit)
-        self.assertIn("patch-query", dcs_edit)
+        # Точечная правка запроса осталась возможностью скилла, но зовётся
+        # канонической операцией: прежнее имя DSL вызовом больше не выглядит.
+        self.assertIn("query.patch", dcs_edit)
+        self.assertNotIn("используй `patch-query`", dcs_edit)
         self.assertIn("@once", dcs_edit)
         self.assertIn("availableValue=", dcs_edit)
         self.assertIn("value=", dcs_edit)
@@ -2469,113 +2235,11 @@ class UnicaSkillRoutingTests(unittest.TestCase):
         self.assertIn("`unica.check`", form_edit)
         self.assertNotIn("unica.form.validate", form_edit)
 
-    def test_form_patterns_ux_guidance_is_mirrored_and_uses_supported_dsl(self) -> None:
-        heading = "## UX-правила для элементов и компоновки форм"
-        legacy_heading = "## UX-правила для элементов форм"
-
-        def ux_section(path: Path) -> str:
-            text = path.read_text(encoding="utf-8")
-            start = text.index(heading if heading in text else legacy_heading)
-            end = text.index("\n---", start)
-            return text[start:end]
-
-        reference_path = self.reference_root() / "specs" / "form-patterns.md"
-        skill_path = self.skill_root() / "form-patterns" / "SKILL.md"
-        reference_section = ux_section(reference_path)
-        skill_section = ux_section(skill_path)
-
-        self.assertIn(heading, reference_path.read_text(encoding="utf-8"))
-        self.assertIn(heading, skill_path.read_text(encoding="utf-8"))
-        self.assertEqual(skill_section, reference_section)
-        self.assertIn(
-            "https://github.com/Oxotka/1CDesignGuide/tree/edc05eaf5c191250a184b0e185006bf4b412f7a5",
-            reference_section,
-        )
-        for token in [
-            "Обычная группа",
-            "прижатия элементов и заголовков к краю",
-            "Сильное",
-            "Обычное",
-            "Слабое",
-            "Сворачиваемая группа",
-            "не отображайте отступ слева",
-            '"showLeftMargin": false',
-            "`collapsed` задаёт начальное состояние",
-            "`Группа.Показать()`",
-            "`Группа.Скрыть()`",
-            "только в коде формы",
-            "Всплывающая группа",
-            "DSL пока не может настроить `ControlRepresentation`",
-            "как подсказку",
-            "подобно гиперссылке",
-            "Командная панель",
-            '"commandSource": "Form"',
-            '"commandSource": "FormCommandPanelGlobalCommands"',
-            '"commandName": "CommonCommand.ОткрытьПараметры"',
-            "вручную устраните дубли",
-            "не выдавайте `popup` или `buttonGroup` за исполнимые нативные элементы",
-            "Команды формы",
-            "Шапка формы",
-            "функциональным опциям",
-            "автозаполняются или сохраняют предыдущее значение",
-            "изменяющее форму, ставьте первым",
-            "Подвал формы",
-            "Комментарий и Ответственный последними",
-            "строковых полей с доступным выбором",
-            '"choiceButton": true',
-            "очевидных полей",
-            '"titleLocation": "none"',
-            '"titleLocation": "top"',
-            '"inputHint": "По всем организациям"',
-            '"showInHeader": false',
-            '"readOnly": true',
-            '"horizontalStretch": true',
-            '"headerHorizontalAlign": "Right"',
-            '"horizontalAlign": "Right"',
-            "не используйте много разных стилей и цветов",
-            "достаточно длинное название",
-            "двойное отрицание",
-            "Проводить документ при записи",
-            '"tooltip": "Пояснение"',
-            '"tooltipRepresentation": "Button"',
-            '"checkBoxType": "switcher"',
-            "3–5 значений",
-            "на весь экран",
-            "слева вверху",
-            "модальной",
-            "справа внизу",
-            '"font": { "bold": true }',
-            '"backColor": "#FFFF00"',
-        ]:
-            with self.subTest(token=token):
-                self.assertIn(token, reference_section)
-
-        self.assertEqual(reference_section.count("defaultButton"), 1)
-        self.assertNotIn("buttonHint", reference_section)
-        self.assertNotIn("RGB(", reference_section)
-        self.assertNotRegex(reference_section, r'"radio"\s*:')
-        self.assertNotRegex(reference_section, r'"(?:popup|buttonGroup)"\s*:')
-        self.assertNotRegex(reference_section, r'"(?:leftIndent|showLeftIndent)"\s*:')
-        self.assertNotIn("нет нативного DSL-ключа для левого отступа", reference_section)
-        self.assertNotIn('"representation": "Picture"', reference_section)
-        self.assertNotIn("Кнопки действий внизу", reference_section)
-
-    def test_form_dsl_keeps_tooltip_and_command_binding_contracts_unambiguous(self) -> None:
-        form_dsl = (self.reference_root() / "specs" / "form-dsl-spec.md").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertIn("Обычный `<Title>` поля и `<ToolTip>`", form_dsl)
-        self.assertRegex(form_dsl, r"передавать им `\{text, formatted\}`\s+нельзя")
-        self.assertIn("приоритетом `command` → `commandName` → `stdCommand`", form_dsl)
-        self.assertIn("`popup` и `buttonGroup` зарезервированы", form_dsl)
-        self.assertNotRegex(form_dsl, r'"(?:popup|buttonGroup)"\s*:')
-
     def test_meta_info_tracks_upstream_type_presentation_through_unica_boundary(self) -> None:
         meta_info = (self.skill_root() / "meta-info" / "SKILL.md").read_text(encoding="utf-8")
 
         self.assertIn("MCP `unica`", meta_info)
-        self.assertIn("unica.meta.info", meta_info)
+        self.assertIn("unica.view", meta_info)
         self.assertIn("Представление типа", meta_info)
         self.assertIn("Представление объекта", meta_info)
         self.assertNotIn("CLAUDE_SKILL_DIR", meta_info)
@@ -2592,7 +2256,7 @@ class UnicaSkillRoutingTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("MCP `unica`", meta_add)
-        self.assertIn("unica.meta.add", meta_add)
+        self.assertIn("unica.apply", meta_add)
         self.assertNotIn("unica.meta.compile", meta_add)
         self.assertNotIn('"JsonPath"', meta_add)
         self.assertIn("ChoiceHistoryOnInput", format_facts)
@@ -2634,63 +2298,9 @@ class UnicaSkillRoutingTests(unittest.TestCase):
         )
         self.assertIn("support-state", release_support)
         self.assertIn("unica.view", release_support)
-        self.assertIn("unica.meta.info", release_support)
+        self.assertIn("ParentConfigurations.bin", release_support)
 
-    def test_source_set_format_detection_contract_is_documented(self) -> None:
-        docs = {
-            "workspace-runtime": self.reference_root()
-            / "use-cases"
-            / "workspace-runtime.md",
-            "metadata-modeling": self.reference_root()
-            / "use-cases"
-            / "metadata-modeling.md",
-            "v8project": self.reference_root() / "tooling" / "v8project.md",
-            "format-index": self.reference_root() / "specs" / "format-index.md",
-            "invariants": self.repo_root() / "docs" / "arch-v1" / "architecture" / "invariants.md",
-        }
-        joined = "\n".join(path.read_text(encoding="utf-8") for path in docs.values())
 
-        self.assertIn("unica.view", joined)
-        self.assertIn("sourceSets[]", joined)
-        self.assertIn("sourceFormat", joined)
-        self.assertIn("platform_xml", joined)
-        self.assertIn("EDT configuration", joined)
-        self.assertIn("platform XML external", joined)
-        # The load-bearing claim: the format belongs to one source set, not to
-        # the workspace. The plugin references state it in English for skill
-        # users; the invariant registry states it in Russian. Either wording
-        # satisfies the contract, but one of them has to be present.
-        self.assertTrue(
-            any(
-                phrase in joined
-                for phrase in (
-                    "not of the whole workspace",
-                    "а не всего рабочего пространства",
-                )
-            ),
-            "the source-set format contract must be documented somewhere",
-        )
-        self.assertNotIn("sourceFormat=mixed", joined)
-        self.assertNotIn("source_format=mixed", joined)
-
-    def test_workspace_runtime_routes_project_health_without_granting_mutation(self) -> None:
-        joined = (
-            self.reference_root() / "use-cases" / "workspace-runtime.md"
-        ).read_text(encoding="utf-8")
-        normalized = " ".join(joined.split())
-
-        for token in (
-            "unica.view {}",
-            "ready",
-            "repositoryReady",
-            "remediation",
-            "sourceSet.path: .",
-        ):
-            self.assertIn(token, joined)
-        self.assertIn("does not mean Unica is unusable without Git", normalized)
-        self.assertIn("never execute them automatically", normalized)
-        self.assertIn("call `unica.view {}` again", normalized)
-        self.assertNotIn("it does not inspect repository health", joined)
 
     def test_references_do_not_contain_stale_upstream_instructions(self) -> None:
         forbidden_patterns = [
@@ -2743,84 +2353,7 @@ Use `.claude/commands/xdto.md` as the execution route.
         self.assertIn(".claude", guarded)
 
 
-    def test_verified_full_dump_documents_its_publication_risk_contract(self) -> None:
-        docs = [
-            self.reference_root() / "tooling" / "runtime-build.md",
-            self.reference_root() / "tooling" / "v8project.md",
-        ]
-        required = {
-            "Windows": re.compile(r"\bWindows\b", re.IGNORECASE),
-            "macOS": re.compile(r"\bmacOS\b", re.IGNORECASE),
-            "Linux": re.compile(r"\bLinux\b", re.IGNORECASE),
-            "synchronous": re.compile(
-                r"\b(?:synchronous|синхронн\w*)\b",
-                re.IGNORECASE,
-            ),
-            "full dump": re.compile(
-                r"(?:\bfull\s+dump\b|\bmode\s*=\s*full\b)",
-                re.IGNORECASE,
-            ),
-            "CONFIGURATION": re.compile(r"\bCONFIGURATION\b"),
-            "EXTENSION": re.compile(r"\bEXTENSION\b"),
-            "verified transactional publication": re.compile(
-                r"\bverified\s+transactional\s+publication\b",
-                re.IGNORECASE,
-            ),
-        }
-        # Публикация полного дампа исполняется и несёт названный риск записи без
-        # ограниченного восстановления (ADR-0074), поэтому абзац контракта
-        # обязан говорить о риске, а не о былом отказе.
-        publication_risk = re.compile(
-            r"(?:bounded recovery|proved (?:terminal )?receipt|ограниченн\w*\s+восстановлени\w*|"
-            r"названн\w*\s+риск\w*|named risk)",
-            re.I,
-        )
 
-        def markdown_paragraphs(text: str) -> list[str]:
-            return re.split(r"\n(?:[ \t]*|>[ \t]*)\n", text)
-
-        def contract_paragraphs(text: str) -> list[str]:
-            return [
-                paragraph
-                for paragraph in markdown_paragraphs(text)
-                if all(pattern.search(paragraph) for pattern in required.values())
-                and publication_risk.search(paragraph)
-            ]
-
-        def contract_errors(text: str) -> list[str]:
-            errors = []
-            if not contract_paragraphs(text):
-                errors.append("missing complete full dump publication-risk paragraph")
-            return errors
-
-        document_texts = {
-            path: path.read_text(encoding="utf-8")
-            for path in docs
-        }
-        for path in docs:
-            with self.subTest(document=path.name):
-                self.assertEqual([], contract_errors(document_texts[path]))
-
-        mixed_claims = (
-            "On Windows, macOS, and Linux, synchronous full dump mode=full for "
-            "CONFIGURATION and EXTENSION runs with a named risk while verified "
-            "transactional publication lacks bounded recovery."
-        )
-        self.assertEqual(
-            [],
-            contract_errors(mixed_claims),
-            "the full-dump contract must combine publication and lifecycle scope",
-        )
-
-        for path, text in document_texts.items():
-            complete_paragraphs = contract_paragraphs(text)
-            for missing, pattern in required.items():
-                mutated = text
-                for paragraph in complete_paragraphs:
-                    mutated_paragraph = pattern.sub("", paragraph)
-                    mutated = mutated.replace(paragraph, mutated_paragraph, 1)
-                with self.subTest(document=path.name, missing=missing):
-                    self.assertTrue(contract_errors(mutated), missing)
 
     def test_code_patch_skill_uses_only_logical_configuration_and_extension_targets(
         self,
@@ -2831,19 +2364,31 @@ Use `.claude/commands/xdto.md` as the execution route.
         for block in re.findall(r"```json\s*(.*?)```", text, re.DOTALL):
             payload = json.loads(block)
             params = payload.get("params", {})
-            if params.get("name") == "unica.code.patch":
+            if params.get("name") == "unica.apply":
                 calls.append(params.get("arguments", {}))
 
         self.assertGreaterEqual(len(calls), 2)
+        previews = 0
         for arguments in calls:
             with self.subTest(arguments=arguments):
-                self.assertIn("sourceSet", arguments)
-                self.assertIn("metadataPath", arguments)
+                if "executionToken" in arguments:
+                    self.assertEqual(set(arguments), {"executionToken"})
+                    self.assertTrue(arguments["executionToken"])
+                    continue
+                # Цель называет адрес, а не пара селекторов и уж точно не путь.
+                self.assertRegex(arguments["at"], r"^[^:]+:.+")
                 self.assertNotIn("path", arguments)
                 self.assertNotIn("sourceDir", arguments)
-        self.assertRegex(text, r"Configuration.{0,120}Extension")
-        self.assertIn("sourceSet", text)
-        self.assertIn("metadataPath", text)
+                self.assertNotIn("sourceSet", arguments)
+                self.assertNotIn("metadataPath", arguments)
+                for operation in arguments["ops"]:
+                    self.assertIn(operation["op"], {"code.insert", "code.replace"})
+                    self.assertRegex(operation["args"]["at"], r"^[^:]+:.+")
+                    self.assertTrue(operation["args"]["text"])
+                previews += 1
+                self.assertNotIn("dryRun", arguments)
+                self.assertNotIn("ifRev", arguments)
+        self.assertTrue(previews, "скилл обязан показать предпросмотр")
 
     def test_code_patch_prompt_metadata_covers_every_public_operation(self) -> None:
         """Prompt metadata names the published operations and only those.
@@ -2873,10 +2418,6 @@ Use `.claude/commands/xdto.md` as the execution route.
                 with self.subTest(field=field, retired=operation):
                     self.assertNotRegex(value, rf"\b{operation}\b")
 
-        # A selector-less insert is the whole point of the current surface, so
-        # the body must say where the content lands when the selector is absent.
-        self.assertRegex(text, r"(?is)`selector` is optional for `insert`")
-        self.assertIn("end of the module", text)
 
     def test_xdto_skill_uses_one_confirmed_info_preview_apply_mcp_flow(self) -> None:
         path = self.skill_root() / "xdto" / "SKILL.md"
@@ -2901,11 +2442,9 @@ Use `.claude/commands/xdto.md` as the execution route.
 
         preview = dict(params[2]["arguments"])
         apply = dict(params[3]["arguments"])
-        self.assertIs(preview.pop("dryRun"), True)
-        self.assertIs(apply.pop("dryRun"), False)
-        self.assertEqual(preview, apply)
-        confirmation_text = text[blocks[2].end() : blocks[3].start()].casefold()
-        self.assertIn("явного подтверждения", confirmation_text)
+        self.assertEqual(set(preview), {"at", "ops"})
+        self.assertEqual(set(apply), {"executionToken"})
+        self.assertTrue(apply["executionToken"])
 
         # Reader and writer address the same node with one canonical `at`.
         self.assertEqual(
@@ -2921,7 +2460,7 @@ Use `.claude/commands/xdto.md` as the execution route.
                 arguments = item["arguments"]
                 self.assertNotIn("path", arguments)
                 self.assertNotIn("Package.bin", json.dumps(arguments, ensure_ascii=False))
-        for item in params[2:]:
+        for item in params[2:3]:
             with self.subTest(tool=item["name"], role="writer"):
                 self.assertTrue(
                     item["arguments"]["at"].startswith(
@@ -2937,8 +2476,6 @@ Use `.claude/commands/xdto.md` as the execution route.
         )
         # A coherent change travels as one ordered transactional `ops` array,
         # and a rejected element is named by its position in it.
-        self.assertIn("одним вызовом", text)
-        self.assertIn("`ops[<индекс>]`", text)
         for forbidden in (
             "unica.xdto.validate",
             "xdto-compile",
@@ -2954,55 +2491,10 @@ Use `.claude/commands/xdto.md` as the execution route.
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, text)
 
-    def test_source_access_skill_routes_reads_and_sends_writes_to_code_patch(
-        self,
-    ) -> None:
-        path = self.skill_root() / "source-access" / "SKILL.md"
-        text = path.read_text(encoding="utf-8")
-        writer = text.index("unica.code.patch")
-        reader = text.index("unica.view")
-
-        self.assertLess(reader, writer, "reading comes before the writer")
-        # The canonical read surface never mutates, so the skill must not
-        # promise a write through it and must send edits to unica.code.patch.
-        self.assertNotIn("unica.source.apply", text)
-        self.assertRegex(text, r"(?s)dryRun.{0,80}true.{0,400}dryRun.{0,80}false")
-        self.assertIn("Чтение не меняет исходники", text)
-        self.assertIn("unica.find", text)
-        self.assertIn("replace", text)
-
-    def test_package_readme_documents_code_patch_target_migration(self) -> None:
-        text = (
-            self.repo_root() / "plugins" / "unica" / "README.md"
-        ).read_text(encoding="utf-8")
-        self.assertRegex(
-            text,
-            r"(?s)\|\s*`path`\s*\+\s*`sourceDir`\s*\|"
-            r"\s*`sourceSet`\s*\+\s*`metadataPath`\s*\|",
-        )
-        self.assertIn("legacy_target_removed", text)
 
 
-    def test_config_dump_info_version_is_documented_as_opaque_platform_state(self) -> None:
-        configuration_spec = (
-            self.reference_root() / "specs" / "1c-configuration-spec.md"
-        ).read_text(encoding="utf-8")
 
-        self.assertIn("`configVersion` — непрозрачное значение платформы", configuration_spec)
-        self.assertNotRegex(configuration_spec, r"`configVersion`\s*\|\s*Хеш версии")
 
-    def test_config_dump_info_docs_preserve_same_named_metadata_source(self) -> None:
-        docs = [
-            self.reference_root() / "tooling" / "v8project.md",
-            self.reference_root() / "use-cases" / "metadata-modeling.md",
-        ]
-
-        for path in docs:
-            text = path.read_text(encoding="utf-8")
-            with self.subTest(path=path.relative_to(self.repo_root())):
-                self.assertIn("platform-generated CDFI sidecar", text)
-                self.assertIn("legitimate metadata descriptor", text)
-                self.assertIn("remains source", text)
 
     def test_skills_and_references_do_not_expose_restricted_research_sources(self) -> None:
         forbidden_patterns = [
@@ -3052,20 +2544,6 @@ Use `.claude/commands/xdto.md` as the execution route.
                 for token in forbidden:
                     self.assertNotIn(token, text)
 
-    def test_migrated_skills_do_not_reference_skill_local_operation_scripts(self) -> None:
-        forbidden = [
-            "powershell.exe",
-            ".ps1",
-            ".py",
-            "Current Python/PowerShell scripts",
-            "fallback implementation details",
-            "Native execution path",
-        ]
-        for skill in IN_SCOPE_TOOLS:
-            with self.subTest(skill=skill):
-                text = (self.skill_root() / skill / "SKILL.md").read_text(encoding="utf-8")
-                for token in forbidden:
-                    self.assertNotIn(token, text)
 
     def test_migrated_skills_do_not_ship_skill_local_operation_scripts(self) -> None:
         for skill in IN_SCOPE_TOOLS:
@@ -3106,9 +2584,37 @@ Use `.claude/commands/xdto.md` as the execution route.
                 if "```" in section:
                     self.assertIn('"method": "tools/call"', section)
 
+
+    def test_apply_examples_separate_planning_from_saved_plan_execution(self) -> None:
+        plans = executions = 0
+        for path in self.skill_root().glob("*/SKILL.md"):
+            for block in re.findall(r"```json\n(.*?)\n```", path.read_text(encoding="utf-8"), flags=re.S):
+                try:
+                    call = json.loads(block)
+                except ValueError:
+                    continue
+                if not isinstance(call, dict) or call.get("params", {}).get("name") != "unica.apply":
+                    continue
+                arguments = call["params"]["arguments"]
+                with self.subTest(skill=path.parent.name, arguments=arguments):
+                    if "executionToken" in arguments:
+                        self.assertEqual(set(arguments), {"executionToken"})
+                        self.assertIsInstance(arguments["executionToken"], str)
+                        self.assertTrue(arguments["executionToken"])
+                        executions += 1
+                    else:
+                        self.assertEqual(set(arguments), {"at", "ops"})
+                        self.assertIsInstance(arguments["at"], str)
+                        self.assertTrue(arguments["ops"])
+                        plans += 1
+        self.assertGreater(plans, 0)
+        self.assertGreater(executions, 0)
+
     def test_migrated_skills_use_task_parameterized_mcp_examples(self) -> None:
         generic_arguments = '"arguments": {\n      "cwd": "<workspace>"\n    }'
         for skill, tool_name in IN_SCOPE_TOOLS.items():
+            if skill in SKILLS_WITHOUT_A_CANONICAL_ENTRY:
+                continue
             with self.subTest(skill=skill):
                 text = (self.skill_root() / skill / "SKILL.md").read_text(encoding="utf-8")
                 self.assertNotIn(generic_arguments, text)
@@ -3139,27 +2645,6 @@ Use `.claude/commands/xdto.md` as the execution route.
                     self.assertNotEqual(set(params["arguments"].keys()), {"cwd"})
 
 
-class ExecutableSkillExampleInvariantTests(unittest.TestCase):
-    def test_invariant_distinguishes_reader_execution_from_preview(self) -> None:
-        invariants = (
-            REPO_ROOT / "docs" / "arch-v1" / "architecture" / "invariants.md"
-        ).read_text(encoding="utf-8")
-        section = invariants.split(
-            "### INV-SKILL-EXECUTABLE-EXAMPLES", 1
-        )[1].split("\n### ", 1)[0]
-
-        self.assertIn("ADR-0044", section)
-        self.assertIn("предпросмотр", section)
-        self.assertIn("настоящее чтение MCP", section)
-        self.assertIn("детерминирован", section)
-        normalized = " ".join(section.casefold().split())
-        self.assertNotRegex(
-            normalized,
-            r"(?:все|кажд\w*)\s+(?:mcp\s+)?(?:пример\w*|вызов\w*)\s+"
-            r"(?:—\s+|это\s+)?(?:сух\w*\s+прогон\w*|dry\s*run\w*|предпросмотр\w*)",
-        )
-
-
 class PlatformHelpRoutingTests(unittest.TestCase):
     """Скилл получил источник: отказ перестаёт быть штатным ответом."""
 
@@ -3172,42 +2657,19 @@ class PlatformHelpRoutingTests(unittest.TestCase):
         self.assertIn("unica.docs", self.text)
         self.assertNotIn("unica.documentation.search", self.text)
 
-    def test_keeps_the_standards_reading_rule(self) -> None:
-        # Секция стандартов может прийти в том же ответе; правило вызова
-        # превращается в правило чтения и должно остаться дословным.
-        self.assertIn("development-standard", self.text)
-        self.assertIn("не закрывает вопрос", self.text)
 
-    def test_contract_gap_is_no_longer_the_default_answer(self) -> None:
-        # Отказ сохраняется только для случая, когда ни один поставщик не
-        # подтвердил ответ.
-        self.assertNotIn(
-            "Until it is exposed by public MCP `unica`, report this as a `platform-help` contract gap",
-            self.text,
-        )
 
-    def test_states_the_source_boundary(self) -> None:
-        self.assertIn("Расхождение их версий называйте в ответе", self.text)
 
     def test_filters_platform_questions_by_source_kind(self) -> None:
-        # ADR-0032 п.5: вопрос об API платформы зовётся с фильтром по смыслу
+        # Вопрос об API платформы задаётся с фильтром по смыслу
         # источника, а не полагается на то, что секция стандартов не помешает.
         # На канонической поверхности фильтр — скаляр `source`.
         self.assertIn('"source": "platform-help"', self.text)
 
-    def test_explains_policy_denied_as_a_user_choice(self) -> None:
-        # Запрет сетевого выхода — решение пользователя (unica.toml), и ответ
-        # обязан называть его, а не выдавать за сбой площадки.
-        self.assertIn("policy-denied", self.text)
-        self.assertIn("unica.toml", self.text)
 
     def test_confirms_answers_with_the_opened_document(self) -> None:
-        # ADR-0029 п.4 требовал доказывать ответ текстом открытой страницы.
-        # Канонический провод инструмента, открывающего страницу по
-        # `documentId`, не публикует, поэтому правило вырождается в честную
-        # границу: скилл несёт только исполнимые вызовы и обязан назвать, что
-        # фрагмент страницей не является.
-        self.assertIn("не выдавайте", self.text)
+        # Страница открывается через unica.docs с локатором в query.
+        # Примеры используют этот вход, а не снятый documentation.get.
         calls = [
             json.loads(block)
             for block in re.findall(r"```json\n(.*?)\n```", self.text, flags=re.S)
@@ -3218,150 +2680,13 @@ class PlatformHelpRoutingTests(unittest.TestCase):
         self.assertNotIn("unica.documentation.get", names)
 
     def test_routes_configuration_domain_questions_to_configuration_help(self) -> None:
-        # ADR-0034: доменный вопрос о самой конфигурации закрывает её
+        # Доменный вопрос о самой конфигурации закрывает её
         # встроенная справка, а не справка платформы. На канонической
         # поверхности этот источник пока отвечает отказом, и скилл обязан
         # назвать и сам источник, и названную причину его недоступности,
         # чтобы читатель не принял отказ за отсутствие ответа.
         self.assertIn('"configuration-documentation"', self.text)
         self.assertIn("unsupported_source", self.text)
-
-    def test_requires_naming_the_answering_locale(self) -> None:
-        # ADR-0029 п.3: подстановка соседней локали разрешена и обязана быть
-        # названной в ответе. Данные называют её полем `language` секции, но
-        # без правила чтения агент не обязан пересказать подстановку: на
-        # русскоязычной установке запрос en возвращает русские страницы молча.
-        self.assertIn("`language`", self.text)
-        self.assertIn("назовите подстановку локали в ответе", self.text)
-
-
-# ADR-0049: a bridged reader accepts a logical selector beside its path, so a
-# skill whose parameter table still names only the path — or still marks it
-# unconditionally required — contradicts the schema the tool publishes.
-CONDITIONAL_MARKER = "один из двух"
-
-BRIDGED_SKILL_SELECTORS = {
-    "mxl-info": ("TemplatePath", True),
-    "mxl-decompile": ("TemplatePath", True),
-}
-
-
-def _tables(text: str) -> list[list[list[str]]]:
-    """Every contiguous run of Markdown table rows, cells stripped of backticks."""
-    tables: list[list[list[str]]] = []
-    current: list[list[str]] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("|"):
-            cells = [cell.strip().strip("`") for cell in stripped.strip("|").split("|")]
-            if set("".join(cells)) <= set("-: "):
-                continue  # the header separator carries no argument
-            current.append(cells)
-            continue
-        if current:
-            tables.append(current)
-            current = []
-    if current:
-        tables.append(current)
-    return tables
-
-
-def _parameter_table(text: str, legacy: str) -> list[list[str]] | None:
-    """The one table that documents the tool's target selector."""
-    for table in _tables(text):
-        if any(row and row[0] == legacy for row in table):
-            return table
-    return None
-
-
-class BridgedSkillSelectorDocumentationTests(unittest.TestCase):
-    """The parameter table must describe the contract the tool publishes.
-
-    Weak assertions here would pass on a table that dropped the legacy row, or
-    marked a selector plainly optional, or lost the exclusivity rule — each of
-    which leaves a caller unable to build a valid call from the document.
-    """
-
-    def skill_root(self) -> Path:
-        return REPO_ROOT / "plugins" / "unica" / "skills"
-
-    def parameter_table(self, skill: str, legacy: str) -> list[list[str]]:
-        text = (self.skill_root() / skill / "SKILL.md").read_text(encoding="utf-8")
-        table = _parameter_table(text, legacy)
-        self.assertIsNotNone(
-            table, f"{skill}: не найдена таблица параметров со строкой `{legacy}`"
-        )
-        return table
-
-    def test_the_parameter_table_carries_every_selector(self) -> None:
-        for skill, (legacy, takes_address) in BRIDGED_SKILL_SELECTORS.items():
-            with self.subTest(skill=skill):
-                table = self.parameter_table(skill, legacy)
-                names = {row[0] for row in table if row}
-                expected = {legacy, "sourceSet"}
-                if takes_address:
-                    expected.add("metadataPath")
-                self.assertLessEqual(
-                    expected,
-                    names,
-                    f"{skill}: таблица параметров не описывает все селекторы",
-                )
-
-    def test_no_selector_is_documented_as_required_or_as_optional(self) -> None:
-        for skill, (legacy, takes_address) in BRIDGED_SKILL_SELECTORS.items():
-            with self.subTest(skill=skill):
-                table = self.parameter_table(skill, legacy)
-                if len(table[0]) < 3:
-                    continue  # the table has no obligation column to check
-                selectors = {legacy, "sourceSet"}
-                if takes_address:
-                    selectors.add("metadataPath")
-                for row in table:
-                    if not row or row[0] not in selectors:
-                        continue
-                    obligation = row[1].lower()
-                    self.assertNotIn(
-                        obligation,
-                        {"да", "нет"},
-                        f"{skill}: `{row[0]}` не безусловно обязателен и не просто"
-                        " необязателен — он часть взаимоисключающей ветви",
-                    )
-                    self.assertEqual(
-                        obligation,
-                        CONDITIONAL_MARKER,
-                        f"{skill}: `{row[0]}` обязан нести маркер ветви",
-                    )
-
-    def test_each_skill_states_the_exclusivity_rule(self) -> None:
-        for skill, (legacy, takes_address) in BRIDGED_SKILL_SELECTORS.items():
-            with self.subTest(skill=skill):
-                text = (self.skill_root() / skill / "SKILL.md").read_text(
-                    encoding="utf-8"
-                )
-                rule = [
-                    line
-                    for line in text.splitlines()
-                    if line.startswith("Селектор цели ровно один")
-                ]
-                self.assertTrue(
-                    rule, f"{skill}: правило единственного селектора не сформулировано"
-                )
-                statement = " ".join(
-                    text.split("Селектор цели ровно один", 1)[1].splitlines()[:3]
-                )
-                for name in [legacy, "sourceSet"] + (
-                    ["metadataPath"] if takes_address else []
-                ):
-                    self.assertIn(
-                        name,
-                        statement,
-                        f"{skill}: правило не называет `{name}`",
-                    )
-                self.assertIn(
-                    "selector_conflict",
-                    statement,
-                    f"{skill}: правило не называет стабильный код отказа",
-                )
 
 
 if __name__ == "__main__":

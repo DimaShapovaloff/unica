@@ -27,7 +27,7 @@ pub(crate) struct CatalogSemantics {
     pub(crate) check_reads_persisted_state: bool,
     pub(crate) apply_dry_run_uses_validator_registry: bool,
     pub(crate) diff_is_read_only: bool,
-    pub(crate) diff_cursor_carries_both_source_revisions: bool,
+    pub(crate) diff_cursor_keeps_the_saved_comparison: bool,
     pub(crate) diff_rejects_incomparable_node_kinds: bool,
     pub(crate) search_scope_is_logical_subtree_address: bool,
     pub(crate) docs_filters_source_kinds_not_provider_identities: bool,
@@ -38,18 +38,19 @@ pub(crate) struct CatalogSemantics {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunIntent {
-    WorkspaceInitialize,
-    SourceCreate,
     InfobaseCreate,
-    InfobaseBuild,
-    SourceDump,
-    SourceConvert,
+    SourceImport,
+    SourceExport,
     ArtifactBuild,
-    InfobaseConfigurationExport,
-    InfobaseConfigurationLoad,
-    InfobaseDump,
-    InfobaseRestore,
+    CfExport,
+    CfImport,
+    InfobaseExport,
+    InfobaseImport,
     ClientRun,
+    ExtensionList,
+    ExtensionActivate,
+    ConfigurationApply,
+    ConfigurationReset,
 }
 
 #[derive(Debug)]
@@ -63,49 +64,64 @@ pub(crate) struct RunOperation {
 impl RunOperation {
     pub(crate) const fn name(&self) -> &'static str {
         match self.intent {
-            RunIntent::WorkspaceInitialize => "workspace.initialize",
-            RunIntent::SourceCreate => "source.create",
             RunIntent::InfobaseCreate => "infobase.create",
-            RunIntent::InfobaseBuild => "infobase.build",
-            RunIntent::SourceDump => "source.dump",
-            RunIntent::SourceConvert => "source.convert",
-            RunIntent::ArtifactBuild => "artifact.build",
-            RunIntent::InfobaseConfigurationExport => "infobase.configuration.export",
-            RunIntent::InfobaseConfigurationLoad => "infobase.configuration.load",
-            RunIntent::InfobaseDump => "infobase.dump",
-            RunIntent::InfobaseRestore => "infobase.restore",
-            RunIntent::ClientRun => "client.run",
+            RunIntent::SourceImport => "push",
+            RunIntent::SourceExport => "pull",
+            RunIntent::ArtifactBuild => "make",
+            RunIntent::CfExport => "download",
+            RunIntent::CfImport => "upload",
+            RunIntent::InfobaseExport => "infobase.dump",
+            RunIntent::InfobaseImport => "infobase.restore",
+            RunIntent::ClientRun => "launch",
+            RunIntent::ExtensionList => "extensions.list",
+            RunIntent::ExtensionActivate => "extensions.set",
+            RunIntent::ConfigurationApply => "apply",
+            RunIntent::ConfigurationReset => "reset",
         }
     }
 
     pub(crate) const fn description(&self) -> &'static str {
         match self.intent {
-            RunIntent::WorkspaceInitialize => {
-                "Create a missing v8project.yaml from autodetected 1C source sets."
+            RunIntent::InfobaseCreate => {
+                "Create an absent infobase. The compatibility adapter does not establish a synchronization baseline; inspect the preview for source initialization."
             }
-            RunIntent::SourceCreate => {
-                "Create a new 1C source set in a requested supported source format."
+            RunIntent::SourceImport => {
+                "Push source sets and apply the database configuration with explicit force, or delete an installed extension. Generation protection and noApply are unavailable."
             }
-            RunIntent::InfobaseCreate => "Create an empty target 1C infobase.",
-            RunIntent::InfobaseBuild => "Build or update a 1C infobase from attached sources.",
-            RunIntent::SourceDump => "Export a 1C infobase into a workspace source set.",
-            RunIntent::SourceConvert => "Convert source sets between supported source formats.",
+            RunIntent::SourceExport => {
+                "Fully replace a source set from the infobase with explicit force. Local-work protection and merge are unavailable."
+            }
             RunIntent::ArtifactBuild => {
-                "Build a CF, CFE, EPF, or ERF artifact from attached sources."
+                "Build a CF or CFE artifact from attached sources. EPF and ERF are unavailable with the runner 0.11 adapter."
             }
-            RunIntent::InfobaseConfigurationExport => {
-                "Export a working configuration, database configuration, or extension from an infobase to CF or CFE."
+            RunIntent::CfExport => {
+                "Export the working configuration, the database configuration, or an extension out of the infobase to a CF or CFE file."
             }
-            RunIntent::InfobaseConfigurationLoad => {
-                "Load a CF or CFE configuration artifact into a target infobase."
+            RunIntent::CfImport => {
+                "Upload a CF or CFE into the working configuration without applying the database configuration."
             }
-            RunIntent::InfobaseDump => {
+            RunIntent::InfobaseExport => {
                 "Export the complete infobase to a DT transfer file; this is not a backup."
             }
-            RunIntent::InfobaseRestore => {
-                "Create or replace an infobase from a DT transfer file."
+            RunIntent::InfobaseImport => {
+                "Import a DT transfer file as the infobase; the mode states whether an absent infobase is created or the data of an existing one is discarded."
             }
+            RunIntent::ExtensionList => "Read installed extensions through a previewed platform session. Each namePrefix is the provider-attested value or null when unknown.",
+            RunIntent::ExtensionActivate => "Set the named installed extension active or inactive.",
+            RunIntent::ConfigurationApply => "Apply the working configuration to the database configuration; unlike unica.apply this changes the infobase.",
+            RunIntent::ConfigurationReset => "Discard pending configuration changes in the infobase, restoring its database configuration.",
             RunIntent::ClientRun => "Launch an interactive 1C client session.",
+        }
+    }
+
+    pub(crate) const fn support_reason(&self) -> Option<&'static str> {
+        match self.intent {
+            RunIntent::CfImport => Some("compatibility upload supports load mode for CF/CFE; combine/update modes require a later adapter"),
+            RunIntent::SourceImport => Some("source push requires force:true and applies the database configuration; generation protection and noApply:true are unavailable"),
+            RunIntent::SourceExport => Some("pull requires force:true and replaces one full source set; local-work protection and all mode are unavailable"),
+            RunIntent::InfobaseCreate => Some("creates an absent infobase without establishing runner 1.0 synchronization state"),
+            RunIntent::ConfigurationApply | RunIntent::ConfigurationReset => Some("Designer main configuration or explicitly named extension only; reset requires force:true; session management and generation checks are unavailable"),
+            _ => None,
         }
     }
 
@@ -118,30 +134,38 @@ impl RunOperation {
 
     pub(crate) const fn effects(&self) -> &'static [&'static str] {
         match self.intent {
-            RunIntent::WorkspaceInitialize
-            | RunIntent::SourceCreate
-            | RunIntent::SourceConvert
-            | RunIntent::ArtifactBuild => &["workspaceFiles"],
-            RunIntent::SourceDump
-            | RunIntent::InfobaseConfigurationExport
-            | RunIntent::InfobaseDump => &["infobaseRead", "workspaceFiles"],
+            RunIntent::ArtifactBuild => &["workspaceFiles"],
+            RunIntent::SourceExport | RunIntent::CfExport | RunIntent::InfobaseExport => {
+                &["infobaseRead", "workspaceFiles"]
+            }
             RunIntent::InfobaseCreate
-            | RunIntent::InfobaseBuild
-            | RunIntent::InfobaseConfigurationLoad
-            | RunIntent::InfobaseRestore => &["infobase"],
+            | RunIntent::SourceImport
+            | RunIntent::CfImport
+            | RunIntent::InfobaseImport => &["infobase"],
             RunIntent::ClientRun => &["clientSession"],
+            RunIntent::ExtensionList => &["infobaseRead"],
+            RunIntent::ExtensionActivate
+            | RunIntent::ConfigurationApply
+            | RunIntent::ConfigurationReset => &["infobase"],
         }
     }
 
     pub(crate) fn args_schema(&self) -> Option<Value> {
         match self.intent {
-            RunIntent::WorkspaceInitialize => Some(json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {},
-                "required": []
-            })),
-            RunIntent::InfobaseConfigurationExport => Some(json!({
+            RunIntent::ExtensionList => {
+                Some(json!({"type":"object","additionalProperties":false,"properties":{}}))
+            }
+            RunIntent::ExtensionActivate => Some(
+                json!({"type":"object","additionalProperties":false,"required":["name","active"],"properties":{"name":{"type":"string","description":"Installed extension name, a 1C identifier."},"active":{"type":"boolean","description":"True to activate; false to deactivate without deleting."}}}),
+            ),
+            RunIntent::ConfigurationApply => Some(
+                json!({"type":"object","additionalProperties":false,"properties":{"extension":{"type":"string","description":"1C extension name; omit to target the main configuration."}}}),
+            ),
+            RunIntent::ConfigurationReset => Some(
+                json!({"type":"object","additionalProperties":false,"required":["force"],"properties":{"extension":{"type":"string","description":"1C extension name; omit to target the main configuration."},"force":{"const":true,"description":"Must be true to reset; session management and generation checks are unavailable."}}}),
+            ),
+
+            RunIntent::CfExport => Some(json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
@@ -151,7 +175,7 @@ impl RunOperation {
                 },
                 "required": ["state", "output"]
             })),
-            RunIntent::InfobaseDump => Some(json!({
+            RunIntent::InfobaseExport => Some(json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
@@ -159,7 +183,61 @@ impl RunOperation {
                 },
                 "required": ["output"]
             })),
-            _ => None,
+            RunIntent::InfobaseCreate => Some(json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {},
+                "required": []
+            })),
+            RunIntent::ArtifactBuild => Some(json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "output": {"type": "string", "description": "Workspace-relative .cf or .cfe file to build; .epf and .erf are not published in v0.13."},
+                    "sourceSet": {"type": "string", "description": "Name of one source set declared in v8project.yaml when several are declared."},
+                    "extension": {"type": "string", "description": "Extension name in the infobase for a .cfe output; required for .cfe and refused for .cf."}
+                },
+                "required": ["output"]
+            })),
+            RunIntent::SourceExport => Some(
+                json!({"type":"object","additionalProperties":false,"required":["force"],"properties":{"sourceSet":{"type":"string","description":"Declared source set to fully replace from the infobase; omit for the main configuration."},"extension":{"type":"string","description":"1C extension name; required for an extension source set and must match it."},"force":{"const":true,"description":"Must be true; pull fully replaces one source set without protecting local changes."}}}),
+            ),
+            RunIntent::SourceImport => Some(
+                json!({"type":"object","additionalProperties":false,"properties":{"sourceSet":{"type":"string","description":"Declared source set to push; omit to push all declared sets."},"full":{"type":"boolean","description":"Request a full rebuild instead of letting the runner choose the loading mode."},"force":{"const":true,"description":"Must be true when pushing sources; applies the database configuration without generation checks."},"noApply":{"const":false,"description":"Must be false if supplied; source push always applies the database configuration."},"delete":{"type":"string","description":"Installed extension platform name to delete, including its data. Exclusive with source sending options."}},"oneOf":[{"required":["delete"],"not":{"anyOf":[{"required":["sourceSet"]},{"required":["full"]},{"required":["force"]},{"required":["noApply"]}]}},{"required":["force"],"not":{"required":["delete"]}}]}),
+            ),
+            RunIntent::CfImport => Some(json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "input": {"type": "string", "description": "Workspace-relative .cf file to import as the main configuration, or .cfe file to import as an extension."},
+                    "extension": {"type": "string", "description": "Extension name the infobase will know the .cfe by; required for .cfe and refused for .cf."}
+                },
+                "required": ["input"]
+            })),
+            RunIntent::InfobaseImport => Some(json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "input": {"type": "string", "description": "Workspace-relative .dt transfer file to load."},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["create", "replace"],
+                        "description": "Which irreversible change is allowed: create an absent infobase, or replace the data of an existing one. A mode that does not match the observed target is refused."
+                    }
+                },
+                "required": ["input", "mode"]
+            })),
+            RunIntent::ClientRun => Some(json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "clientMode": {"type": "string", "enum": ["designer", "thin", "thick", "ordinary"], "description": "1C client to launch."},
+                    "execute": {"type": "string", "description": "Workspace-relative .epf or .erf external processor to run with /Execute; enterprise clients only."},
+                    "waitForExit": {"type": "boolean", "default": false, "description": "Wait for a thin-client .epf session to exit; requires execute and waitTimeoutMs."},
+                    "waitTimeoutMs": {"type": "integer", "minimum": 1, "maximum": 86400000, "description": "Bound for waitForExit in milliseconds."}
+                },
+                "required": ["clientMode"]
+            })),
         }
     }
 }
@@ -187,7 +265,8 @@ pub(crate) fn catalog_for(release: SurfaceRelease) -> Option<V13Catalog> {
                         json!({
                             "at": logical_address(),
                             "filter": data_object("Optional projection such as sections; valid only with at."),
-                            "limit": limit("Maximum child items to return; valid only with at."),
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20,
+                                "description": "Maximum child items per addressed view page; a preferred 64 KiB page size may stop earlier, but an indivisible item remains whole."},
                             "cursor": cursor("Continuation cursor from an earlier addressed view."),
                         }),
                         json!([]),
@@ -195,8 +274,8 @@ pub(crate) fn catalog_for(release: SurfaceRelease) -> Option<V13Catalog> {
                 },
                 V13ToolContract {
                     name: "apply",
-                    description: "Preview or atomically apply typed edits to one logically addressed 1C node.",
-                    input_schema: schema(
+                    description: "Plan typed edits with at and ops without writing; execute that saved plan with executionToken alone. Use data.executionToken from the successful plan response.",
+                    input_schema: schema_for_saved_apply_plan(
                         json!({
                             "at": logical_address(),
                             "ops": {
@@ -213,43 +292,47 @@ pub(crate) fn catalog_for(release: SurfaceRelease) -> Option<V13Catalog> {
                                     "required": ["op"],
                                 },
                             },
-                            "dryRun": {"type": "boolean", "description": "Validate and return the plan without publishing when true.", "default": false},
-                            "ifRev": {"type": "string", "description": "Optional revision fence from an earlier read."},
                         }),
                         json!(["at", "ops"]),
                     ),
                 },
                 V13ToolContract {
-                    name: "find",
-                    description: "Map between object names, logical addresses and where objects live in the source layout, in both directions.",
+                    name: "resolve",
+                    description: "Emergency bridge between a logical address and the source layout, in both directions. Use it only when a path arrived from outside Unica - a diff, a build log, a stack trace - or when a file has to be opened outside Unica. To find an object by name use search; to read it use view.",
                     input_schema: schema(
                         json!({
-                            "query": {"type": "string", "description": "Object name, synonym, logical address, or a path to a source file or object directory."},
-                            "kind": {"type": "string", "description": "Optional logical kind such as Catalog or CommonModule."},
-                            "limit": limit("Maximum candidates to return."),
+                            "at": logical_address_with("Qualified logical address whose source location is needed."),
+                            "path": {"type": "string", "description": "Path to a source file or object directory, absolute or relative to the workspace root."},
                         }),
-                        json!(["query"]),
+                        json!([]),
                     ),
                 },
                 V13ToolContract {
                     name: "search",
-                    description: "Search BSL content or symbols, optionally under one logical subtree.",
+                    description: "Search one corpus for a query: BSL module text, or the names and synonyms of metadata objects. Optionally under one logical subtree. Results use pages; provider roles report whether their finite search window is complete. Names report descriptor-read coverage separately from approximate name matching.",
                     input_schema: schema(
                         json!({
-                            "query": {"type": "string", "description": "Literal BSL text or symbol to search for."},
+                            "query": {"type": "string", "description": "Literal BSL text, symbol, or metadata name to search for."},
+                            "corpus": {"type": "string", "enum": ["text", "names"], "description": "Where to search: `text` matches BSL module content and answers scope, line, column and snippet; `names` matches metadata names and synonyms and answers at, kind and title. Defaults to `text`.", "default": "text"},
+                            "kind": {"type": "string", "description": "`names` corpus only: narrow the search to one logical node kind."},
+                            "role": {"type": "string", "enum": ["lexical", "symbol", "semantic"], "description": "`text` corpus only: which provider answers. `lexical` matches literally, `symbol` uses the symbol index, `semantic` matches by meaning. Omit for the literal search Unica performs itself."},
                             "scope": logical_subtree_address(),
-                            "regex": {"type": "boolean", "description": "Request regex matching; currently only false is implemented.", "default": false},
-                            "limit": limit("Maximum matches to return."),
+                            "regex": {"type": "boolean", "description": "Use a regular expression for local text search.", "default": false},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20,
+                                "description": "Maximum matches per page, from 1 to 50. Provider roles may stop after their first 200 retrieved matches and mark the search incomplete."},
+                            "cursor": cursor("Continue a previous search page. Bound to the question, source sets and page limit. Text search reads live sources; indexed providers report freshness and the build generation when known."),
                         }),
                         json!(["query"]),
                     ),
                 },
                 V13ToolContract {
                     name: "check",
-                    description: "Confirm workspace source-set admission, or validate one logical node: readability plus every validator its kind owns.",
+                    description: "Confirm workspace source-set admission, or validate one logical node: readability plus every validator its kind owns. If an incomplete workspace EOL inspection offers another check, call unica.check with an empty object again to resume its bounded checkpoint; each call uses a fresh deadline. Capacity and other fixed failures require their reported cause to be resolved. Node diagnostics are returned in stable pages.",
                     input_schema: schema(
                         json!({
-                            "at": logical_address(),
+                            "at": {"type": ["string", "null"], "description": "Qualified logical address: <sourceSet>:<Kind>[.<Name>...]. Omit or use null to check workspace source-set admission."},
+                            "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 50, "default": 20, "description": "Maximum diagnostics in one node-check page (maximum 50). Omit or use null for the default of 20."},
+                            "cursor": {"type": ["string", "null"], "description": "Continuation cursor from an earlier check of the same node. Omit or use null for the first page; an empty string is invalid."},
                         }),
                         json!([]),
                     ),
@@ -273,21 +356,23 @@ pub(crate) fn catalog_for(release: SurfaceRelease) -> Option<V13Catalog> {
                     description: "List canonical runtime operations and their invocation contract, or preview/execute one implemented operation.",
                     input_schema: schema(
                         json!({
-                            "op": {"type": "string", "description": "Canonical operation name; omit to list operation status."},
+                            "op": {"type": "string", "description": "Runner 1.0 operation name; omit to list the target dictionary and adapter support."},
+                            "infobase": {"type":"string", "description":"Named infobase; defaults to origin. The runner 0.11 adapter supports only origin."},
                             "args": data_object("Typed arguments for the selected operation."),
-                            "dryRun": {"type": "boolean", "description": "Required by previewApply operations: true returns a non-mutating plan and revision; false requires ifRev and applies that plan."},
-                            "ifRev": {"type": "string", "description": "Revision returned by a prior preview of the same previewApply operation; required when dryRun is false."},
+                            "dryRun": {"type": "boolean", "description": "Required by previewApply operations: true returns a non-mutating preview; false executes with the current arguments without requiring a prior preview."},
                         }),
                         json!([]),
                     ),
                 },
                 V13ToolContract {
                     name: "docs",
-                    description: "Search bundled Unica and safe 1C documentation by topic.",
+                    description: "Search bundled Unica and safe 1C documentation by topic, or open a document locator. Search hits and long document text use pages; each search source reports whether its retrieved window is complete.",
                     input_schema: schema(
                         json!({
                             "query": {"type": "string", "description": "Documentation question or search phrase."},
                             "source": {"type": "string", "description": "Optional documented source kind, not a provider identity."},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20, "description": "Maximum hits per search page or text fragments per long document page, from 1 to 50. A text fragment is one line or at most 16 KiB of a longer line; short documents still arrive whole."},
+                            "cursor": cursor("Continue the same documentation search or long document. A document cursor checks its complete text and metadata for changes; concatenate document.text fragments in page order."),
                         }),
                         json!(["query"]),
                     ),
@@ -299,7 +384,7 @@ pub(crate) fn catalog_for(release: SurfaceRelease) -> Option<V13Catalog> {
                 check_reads_persisted_state: true,
                 apply_dry_run_uses_validator_registry: true,
                 diff_is_read_only: true,
-                diff_cursor_carries_both_source_revisions: true,
+                diff_cursor_keeps_the_saved_comparison: true,
                 diff_rejects_incomparable_node_kinds: true,
                 search_scope_is_logical_subtree_address: true,
                 docs_filters_source_kinds_not_provider_identities: true,
@@ -311,6 +396,28 @@ pub(crate) fn catalog_for(release: SurfaceRelease) -> Option<V13Catalog> {
             result_envelope_schema: result_envelope_schema(),
         }),
     }
+}
+
+/// Planning and execution are disjoint shapes: execution carries only the saved token.
+fn schema_for_saved_apply_plan(properties: Value, required: Value) -> Value {
+    let plan = schema(properties.clone(), required);
+    let token = json!({"type": "string", "minLength": 1, "description": "data.executionToken returned by a successful plan; executes that saved plan without resending at or ops."});
+    let execute = schema(
+        json!({"executionToken": token.clone()}),
+        json!(["executionToken"]),
+    );
+    let mut properties = properties;
+    properties
+        .as_object_mut()
+        .unwrap()
+        .insert("executionToken".into(), token);
+    let mut result = schema(properties, json!([]));
+    // Some tool clients reject composition at the schema root. Select by presence so an
+    // invalid token can never fall back to planning, even alongside at and ops.
+    result["if"] = json!({"required": ["executionToken"]});
+    result["then"] = execute;
+    result["else"] = plan;
+    result
 }
 
 fn schema(properties: Value, required: Value) -> Value {
@@ -348,30 +455,26 @@ fn cursor(description: &'static str) -> Value {
 
 fn run_dictionary() -> Vec<RunOperation> {
     [
-        RunIntent::WorkspaceInitialize,
-        RunIntent::SourceCreate,
         RunIntent::InfobaseCreate,
-        RunIntent::InfobaseBuild,
-        RunIntent::SourceDump,
-        RunIntent::SourceConvert,
+        RunIntent::SourceImport,
+        RunIntent::SourceExport,
         RunIntent::ArtifactBuild,
-        RunIntent::InfobaseConfigurationExport,
-        RunIntent::InfobaseConfigurationLoad,
-        RunIntent::InfobaseDump,
-        RunIntent::InfobaseRestore,
+        RunIntent::CfExport,
+        RunIntent::CfImport,
+        RunIntent::InfobaseExport,
+        RunIntent::InfobaseImport,
         RunIntent::ClientRun,
+        RunIntent::ExtensionList,
+        RunIntent::ExtensionActivate,
+        RunIntent::ConfigurationApply,
+        RunIntent::ConfigurationReset,
     ]
     .into_iter()
     .map(|intent| RunOperation {
+        intent,
         terminal: intent == RunIntent::ClientRun,
         rejects_sessions: intent == RunIntent::ClientRun,
-        implemented: matches!(
-            intent,
-            RunIntent::WorkspaceInitialize
-                | RunIntent::InfobaseConfigurationExport
-                | RunIntent::InfobaseDump
-        ),
-        intent,
+        implemented: true,
     })
     .collect()
 }
@@ -392,6 +495,15 @@ fn result_envelope_schema() -> Value {
             "next": {"type": "array", "minItems": 1, "items": {}},
             "rev": {"type": "string"},
             "cursor": cursor("Opaque continuation cursor issued by this result stream."),
+            "page": {"type": "object", "additionalProperties": false,
+                "properties": {
+                    "stoppedBy": {"type": "string", "enum": ["limit", "bytes", "complete"]},
+                    "startByte": {"type": "integer", "minimum": 0},
+                    "endByte": {"type": "integer", "minimum": 0},
+                    "totalBytes": {"type": "integer", "minimum": 0},
+                    "fragmentsReturned": {"type": "integer", "minimum": 0}
+                },
+                "required": ["stoppedBy"]},
         },
         "required": ["ok", "summary"],
     })
@@ -399,6 +511,60 @@ fn result_envelope_schema() -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn target_upload_does_not_advertise_the_legacy_implicit_database_apply() {
+        let catalog =
+            super::catalog_for(crate::application::tool_contracts::SurfaceRelease::V13).unwrap();
+        let upload = catalog
+            .run_dictionary
+            .iter()
+            .find(|op| op.name() == "upload")
+            .unwrap();
+        assert!(upload.implemented);
+        assert!(upload.description().contains("without applying"));
+    }
+    #[test]
+    fn runner_one_vocabulary_replaces_the_previous_public_dictionary() {
+        let catalog =
+            super::catalog_for(crate::application::tool_contracts::SurfaceRelease::V13).unwrap();
+        let names = catalog
+            .run_dictionary
+            .iter()
+            .map(|op| op.name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            names,
+            [
+                "infobase.create",
+                "push",
+                "pull",
+                "make",
+                "download",
+                "upload",
+                "infobase.dump",
+                "infobase.restore",
+                "launch",
+                "extensions.list",
+                "extensions.set",
+                "apply",
+                "reset"
+            ]
+            .into_iter()
+            .collect()
+        );
+        for name in ["push", "pull", "apply", "reset", "infobase.create"] {
+            let op = catalog
+                .run_dictionary
+                .iter()
+                .find(|op| op.name() == name)
+                .unwrap();
+            assert!(
+                op.implemented && op.support_reason().is_some(),
+                "{name} must not claim full 1.0 semantics with runner 0.11"
+            );
+        }
+    }
+
     use super::{catalog_for, FindProjection, RunIntent, SearchProjection};
     use crate::application::tool_contracts::SurfaceRelease;
     use serde_json::{json, Value};
@@ -442,7 +608,16 @@ mod tests {
             properties,
             "unica.{name} argument set drifted"
         );
-        for forbidden in ["jobId", "path", "provider", "providerId"] {
+        // Физический путь на поверхности живёт ровно в одном инструменте.
+        // Аварийный мост затем и заведён, чтобы путь не просачивался в
+        // частые ответы: приглашение прочитать файл напрямую подрывает
+        // адресное пространство, ради которого весь слой и существует.
+        let forbidden: &[&str] = if name == "resolve" {
+            &["jobId", "provider", "providerId"]
+        } else {
+            &["jobId", "path", "provider", "providerId"]
+        };
+        for forbidden in forbidden {
             assert!(
                 schema["properties"].get(forbidden).is_none(),
                 "unica.{name} must not expose `{forbidden}`"
@@ -482,6 +657,51 @@ mod tests {
         );
     }
 
+    /// Роль объявлена закрытым набором и **без умолчания**: отсутствие роли
+    /// не равно `lexical`, оно означает поиск силами самой Unica, без
+    /// внешнего провайдера и без его цены.
+    #[test]
+    fn extension_operations_are_previewed_tasks_with_closed_arguments() {
+        let catalog = catalog_for(crate::application::tool_contracts::SurfaceRelease::V13).unwrap();
+        for name in ["extensions.list", "extensions.set"] {
+            let op = catalog
+                .run_dictionary
+                .iter()
+                .find(|op| op.name() == name)
+                .expect("extension operation in dictionary");
+            assert!(op.implemented);
+            assert_eq!(op.execution(), "previewApply");
+            assert_eq!(op.args_schema().unwrap()["additionalProperties"], false);
+        }
+    }
+
+    #[test]
+    fn search_publishes_three_provider_roles_and_stays_literal_without_one() {
+        let catalog = catalog_for(SurfaceRelease::V13).expect("canonical catalog");
+        let role = input_field(&catalog.tools, "search", "role");
+        assert_eq!(role["type"], "string");
+        assert_eq!(
+            role["enum"],
+            serde_json::json!(["lexical", "symbol", "semantic"])
+        );
+        assert!(
+            role.get("default").is_none(),
+            "у роли не должно быть умолчания: {role}"
+        );
+    }
+
+    /// Свод объявлен закрытым набором и по умолчанию текстовый: третий свод
+    /// нельзя добавить молча, а существующий вызов без `corpus` обязан
+    /// остаться текстовым поиском, каким он был.
+    #[test]
+    fn search_publishes_exactly_two_corpora_and_defaults_to_text() {
+        let catalog = catalog_for(SurfaceRelease::V13).expect("canonical catalog");
+        let corpus = input_field(&catalog.tools, "search", "corpus");
+        assert_eq!(corpus["type"], "string");
+        assert_eq!(corpus["enum"], serde_json::json!(["text", "names"]));
+        assert_eq!(corpus["default"], "text");
+    }
+
     #[test]
     fn v13_catalog_locks_the_eight_domain_contracts_without_publishing_them() {
         let catalog =
@@ -493,7 +713,7 @@ mod tests {
                 .iter()
                 .map(|contract| contract.name)
                 .collect::<Vec<_>>(),
-            ["view", "apply", "find", "search", "check", "diff", "run", "docs"]
+            ["view", "apply", "resolve", "search", "check", "diff", "run", "docs"]
         );
         assert_eq!(
             SurfaceRelease::from_package_version(),
@@ -511,22 +731,36 @@ mod tests {
         assert_schema(
             &catalog.tools,
             "apply",
-            json!(["at", "ops"]),
-            &["at", "ops", "dryRun", "ifRev"],
+            json!([]),
+            &["at", "ops", "executionToken"],
         );
-        assert_schema(
-            &catalog.tools,
-            "find",
-            json!(["query"]),
-            &["query", "kind", "limit"],
-        );
+        assert_schema(&catalog.tools, "resolve", json!([]), &["at", "path"]);
         assert_schema(
             &catalog.tools,
             "search",
             json!(["query"]),
-            &["query", "scope", "regex", "limit"],
+            &[
+                "query", "corpus", "kind", "role", "scope", "regex", "limit", "cursor",
+            ],
         );
-        assert_schema(&catalog.tools, "check", json!([]), &["at"]);
+        assert_schema(
+            &catalog.tools,
+            "check",
+            json!([]),
+            &["at", "limit", "cursor"],
+        );
+        let check = catalog
+            .tools
+            .iter()
+            .find(|tool| tool.name == "check")
+            .unwrap();
+        assert_eq!(check.input_schema["properties"]["limit"]["maximum"], 50);
+        for (field, kind) in [("at", "string"), ("limit", "integer"), ("cursor", "string")] {
+            assert_eq!(
+                check.input_schema["properties"][field]["type"],
+                json!([kind, "null"])
+            );
+        }
         assert_schema(
             &catalog.tools,
             "diff",
@@ -537,31 +771,30 @@ mod tests {
             &catalog.tools,
             "run",
             json!([]),
-            &["op", "args", "dryRun", "ifRev"],
+            &["op", "infobase", "args", "dryRun"],
         );
         assert_schema(
             &catalog.tools,
             "docs",
             json!(["query"]),
-            &["query", "source"],
+            &["query", "source", "limit", "cursor"],
         );
 
         for (tool, field) in [
             ("view", "at"),
             ("apply", "at"),
-            ("apply", "ifRev"),
-            ("find", "query"),
-            ("find", "kind"),
+            ("apply", "executionToken"),
+            ("resolve", "at"),
+            ("resolve", "path"),
             ("search", "query"),
             ("search", "scope"),
-            ("check", "at"),
             ("diff", "left"),
             ("diff", "right"),
             ("diff", "cursor"),
             ("run", "op"),
-            ("run", "ifRev"),
             ("docs", "query"),
             ("docs", "source"),
+            ("docs", "cursor"),
         ] {
             assert_field_type(&catalog.tools, tool, field, "string");
         }
@@ -578,16 +811,23 @@ mod tests {
                 if field == "ops" { "array" } else { "object" },
             );
         }
-        for (tool, field) in [
-            ("view", "limit"),
-            ("find", "limit"),
-            ("search", "limit"),
-            ("diff", "limit"),
-        ] {
+        for (tool, field) in [("view", "limit"), ("search", "limit"), ("diff", "limit")] {
             let limit = input_field(&catalog.tools, tool, field);
             assert_eq!(limit["type"], "integer");
             assert_eq!(limit["minimum"], 1);
         }
+        assert_eq!(input_field(&catalog.tools, "view", "limit")["default"], 20);
+        assert_eq!(input_field(&catalog.tools, "view", "limit")["maximum"], 50);
+        assert_eq!(input_field(&catalog.tools, "docs", "limit")["default"], 20);
+        assert_eq!(input_field(&catalog.tools, "docs", "limit")["maximum"], 50);
+        assert_eq!(
+            input_field(&catalog.tools, "search", "limit")["default"],
+            20
+        );
+        assert_eq!(
+            input_field(&catalog.tools, "search", "limit")["maximum"],
+            50
+        );
         assert_field_type(&catalog.tools, "view", "cursor", "string");
         assert_data_object(
             input_field(&catalog.tools, "view", "filter"),
@@ -603,14 +843,6 @@ mod tests {
             "boolean"
         );
         assert_eq!(
-            input_field(&catalog.tools, "apply", "dryRun")["type"],
-            "boolean"
-        );
-        assert_eq!(
-            input_field(&catalog.tools, "apply", "dryRun")["default"],
-            false
-        );
-        assert_eq!(
             input_field(&catalog.tools, "search", "regex")["type"],
             "boolean"
         );
@@ -622,7 +854,11 @@ mod tests {
         let apply = contract(&catalog.tools, "apply");
         assert_eq!(apply.input_schema["properties"]["ops"]["type"], "array");
         assert_eq!(apply.input_schema["properties"]["ops"]["minItems"], 1);
-        assert_eq!(apply.input_schema["properties"]["dryRun"]["default"], false);
+        assert_eq!(apply.input_schema["else"]["required"], json!(["at", "ops"]));
+        assert_eq!(
+            apply.input_schema["then"]["required"],
+            json!(["executionToken"])
+        );
         assert_eq!(
             apply.input_schema["properties"]["ops"]["items"]["type"],
             "object"
@@ -678,7 +914,7 @@ mod tests {
         assert!(catalog.semantics.check_reads_persisted_state);
         assert!(catalog.semantics.apply_dry_run_uses_validator_registry);
         assert!(catalog.semantics.diff_is_read_only);
-        assert!(catalog.semantics.diff_cursor_carries_both_source_revisions);
+        assert!(catalog.semantics.diff_cursor_keeps_the_saved_comparison);
         assert!(catalog.semantics.diff_rejects_incomparable_node_kinds);
         assert!(
             catalog
@@ -701,18 +937,19 @@ mod tests {
                 .map(|operation| operation.intent)
                 .collect::<Vec<_>>(),
             [
-                RunIntent::WorkspaceInitialize,
-                RunIntent::SourceCreate,
                 RunIntent::InfobaseCreate,
-                RunIntent::InfobaseBuild,
-                RunIntent::SourceDump,
-                RunIntent::SourceConvert,
+                RunIntent::SourceImport,
+                RunIntent::SourceExport,
                 RunIntent::ArtifactBuild,
-                RunIntent::InfobaseConfigurationExport,
-                RunIntent::InfobaseConfigurationLoad,
-                RunIntent::InfobaseDump,
-                RunIntent::InfobaseRestore,
+                RunIntent::CfExport,
+                RunIntent::CfImport,
+                RunIntent::InfobaseExport,
+                RunIntent::InfobaseImport,
                 RunIntent::ClientRun,
+                RunIntent::ExtensionList,
+                RunIntent::ExtensionActivate,
+                RunIntent::ConfigurationApply,
+                RunIntent::ConfigurationReset,
             ]
         );
         assert!(catalog
@@ -723,7 +960,7 @@ mod tests {
             .run_dictionary
             .iter()
             .find(|operation| operation.intent == RunIntent::ClientRun)
-            .expect("client.run belongs to the v0.13 dictionary");
+            .expect("launch belongs to the v0.13 dictionary");
         assert!(client_run.terminal);
         assert!(client_run.rejects_sessions);
         assert_eq!(
@@ -734,16 +971,37 @@ mod tests {
                 .map(|operation| operation.name())
                 .collect::<Vec<_>>(),
             [
-                "workspace.initialize",
-                "infobase.configuration.export",
-                "infobase.dump"
-            ]
+                "infobase.create",
+                "push",
+                "pull",
+                "make",
+                "download",
+                "upload",
+                "infobase.dump",
+                "infobase.restore",
+                "launch",
+                "extensions.list",
+                "extensions.set",
+                "apply",
+                "reset"
+            ],
+            "only operations whose target semantics are proven on runner 0.11 are executable"
         );
 
         let output = &catalog.result_envelope_schema;
         assert_eq!(output["type"], "object");
         assert_eq!(output["additionalProperties"], false);
         assert_eq!(output["required"], json!(["ok", "summary"]));
+        for field in ["startByte", "endByte", "totalBytes", "fragmentsReturned"] {
+            assert_eq!(
+                output["properties"]["page"]["properties"][field]["type"],
+                "integer"
+            );
+            assert_eq!(
+                output["properties"]["page"]["properties"][field]["minimum"],
+                0
+            );
+        }
         assert_eq!(
             output["properties"]
                 .as_object()
@@ -762,7 +1020,8 @@ mod tests {
                 "artifacts",
                 "next",
                 "rev",
-                "cursor"
+                "cursor",
+                "page"
             ]
         );
         for forbidden in ["set", "sourceState", "fileExists", "job", "work"] {
@@ -804,9 +1063,23 @@ mod tests {
         for tool in &catalog.tools {
             assert_described(&format!("unica.{}", tool.name), &tool.input_schema);
         }
+        for operation in &catalog.run_dictionary {
+            if operation.support_reason().is_some() {
+                assert_described(
+                    &format!("unica.run.{}", operation.name()),
+                    &operation.args_schema().expect("limited operation schema"),
+                );
+            }
+        }
     }
 
     #[test]
+    // Имя удерживает счёт, которого больше нет: две операции сняты решением
+    // DEC.2026-09-09.PROJECT-CONFIG-IS-HANDWRITTEN, третья —
+    // DEC.2026-09-15.SOURCE-CONVERT-LEAVES-THE-DICTIONARY. Переименовать нельзя —
+    // на это имя ссылаются принятые записи реестра как на доказательство, а
+    // переименование там читается как правка обещания. Счёт в имени проверки
+    // устаревает так же, как счёт в прозе правила (#798).
     fn v13_run_dictionary_has_twelve_directional_runtime_intents() {
         let catalog =
             catalog_for(SurfaceRelease::V13).expect("v0.13 catalog must be test-loadable");
@@ -819,20 +1092,21 @@ mod tests {
         assert_eq!(
             names,
             [
-                "workspace.initialize",
-                "source.create",
                 "infobase.create",
-                "infobase.build",
-                "source.dump",
-                "source.convert",
-                "artifact.build",
-                "infobase.configuration.export",
-                "infobase.configuration.load",
+                "push",
+                "pull",
+                "make",
+                "download",
+                "upload",
                 "infobase.dump",
                 "infobase.restore",
-                "client.run",
+                "launch",
+                "extensions.list",
+                            "extensions.set",
+                "apply",
+                "reset",
             ],
-            "v0.13 Run dictionary must distinguish source builds, configuration transfers, and full infobase transfers"
+            "словарь `run` различает сборку исходников, перенос конфигурации и перенос базы целиком — и не держит операции, которым платформа не нужна"
         );
         for ambiguous_or_deferred in [
             "source.attach",
@@ -856,31 +1130,195 @@ mod tests {
                 .map(|operation| operation.name())
                 .collect::<Vec<_>>(),
             [
-                "workspace.initialize",
-                "infobase.configuration.export",
-                "infobase.dump"
+                "infobase.create",
+                "push",
+                "pull",
+                "make",
+                "download",
+                "upload",
+                "infobase.dump",
+                "infobase.restore",
+                "launch",
+                "extensions.list",
+                "extensions.set",
+                "apply",
+                "reset"
             ],
-            "the initialization and first two infobase export verticals are implemented"
+            "only operations whose target semantics are proven on runner 0.11 are executable"
         );
     }
 
     #[test]
-    fn run_preview_apply_fields_describe_the_execution_protocol() {
+    fn v13_artifact_build_is_implemented_for_cf_and_cfe_inside_the_workspace() {
         let catalog =
             catalog_for(SurfaceRelease::V13).expect("v0.13 catalog must be test-loadable");
-        for field in ["dryRun", "ifRev"] {
-            let description = input_field(&catalog.tools, "run", field)["description"]
-                .as_str()
-                .expect("run protocol field description");
+        let build = catalog
+            .run_dictionary
+            .iter()
+            .find(|operation| operation.intent == RunIntent::ArtifactBuild)
+            .expect("make belongs to the v0.13 dictionary");
+        assert!(build.implemented);
+        assert_eq!(build.execution(), "previewApply");
+        assert_eq!(build.effects(), &["workspaceFiles"]);
+        let schema = build.args_schema().expect("make publishes its args");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["output"]));
+        assert!(
+            catalog
+                .run_dictionary
+                .iter()
+                .filter(|operation| operation.implemented)
+                .count()
+                == 13,
+            "only the proven runner 0.11 subset is implemented"
+        );
+    }
+
+    #[test]
+    fn v13_source_export_is_implemented_with_a_closed_mode_set_and_extension() {
+        let catalog = catalog_for(SurfaceRelease::V13).unwrap();
+        let op = catalog
+            .run_dictionary
+            .iter()
+            .find(|op| op.name() == "pull")
+            .unwrap();
+        assert!(op.implemented);
+        assert!(op.support_reason().unwrap().contains("protection"));
+        assert_eq!(op.args_schema().unwrap()["additionalProperties"], false);
+        assert!(op.args_schema().unwrap()["properties"]
+            .get("mode")
+            .is_none());
+    }
+
+    #[test]
+    fn v13_source_import_is_implemented_with_closed_source_set_and_full_rebuild() {
+        let catalog = catalog_for(SurfaceRelease::V13).unwrap();
+        let op = catalog
+            .run_dictionary
+            .iter()
+            .find(|op| op.name() == "push")
+            .unwrap();
+        assert!(op.implemented);
+        assert!(op.args_schema().unwrap()["properties"]
+            .get("delete")
+            .is_some());
+        assert!(op.args_schema().unwrap()["properties"]
+            .get("fullRebuild")
+            .is_none());
+    }
+
+    #[test]
+    fn v13_infobase_create_is_implemented_without_arguments() {
+        let catalog =
+            catalog_for(SurfaceRelease::V13).expect("v0.13 catalog must be test-loadable");
+        let create = catalog
+            .run_dictionary
+            .iter()
+            .find(|operation| operation.intent == RunIntent::InfobaseCreate)
+            .expect("infobase.create belongs to the v0.13 dictionary");
+        assert!(create.implemented);
+        assert_eq!(create.execution(), "previewApply");
+        assert_eq!(create.effects(), &["infobase"]);
+        let schema = create
+            .args_schema()
+            .expect("infobase.create publishes its args");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"], json!({}));
+        assert_eq!(
+            schema["required"],
+            json!([]),
+            "соединение задаёт проектный файл, аргументов у создания базы нет"
+        );
+    }
+
+    #[test]
+    fn v13_cf_import_is_implemented_with_a_closed_input_and_extension() {
+        let catalog =
+            catalog_for(SurfaceRelease::V13).expect("v0.13 catalog must be test-loadable");
+        let import = catalog
+            .run_dictionary
+            .iter()
+            .find(|operation| operation.intent == RunIntent::CfImport)
+            .expect("upload belongs to the v0.13 dictionary");
+        assert!(import.implemented);
+        assert_eq!(import.execution(), "previewApply");
+        assert_eq!(import.effects(), &["infobase"]);
+        let schema = import.args_schema().expect("upload publishes its args");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["input"]));
+        assert_eq!(
+            schema["properties"]
+                .as_object()
+                .map(|properties| properties.keys().cloned().collect::<Vec<_>>()),
+            Some(vec!["input".to_string(), "extension".to_string()]),
+            "режим один — load; merge с внешним файлом настроек за словарём"
+        );
+    }
+
+    #[test]
+    fn v13_run_names_read_as_layer_and_direction() {
+        runner_one_vocabulary_replaces_the_previous_public_dictionary();
+        let catalog = catalog_for(SurfaceRelease::V13).unwrap();
+        for old in [
+            "source.import",
+            "source.export",
+            "cf.import",
+            "cf.export",
+            "artifact.build",
+            "client.run",
+            "extension.list",
+            "extension.info",
+            "extension.create",
+            "extension.delete",
+            "extension.activate",
+        ] {
+            assert!(catalog.run_dictionary.iter().all(|op| op.name() != old));
+        }
+    }
+
+    #[test]
+    fn v13_run_dictionary_names_no_operation_that_needs_edt() {
+        // Unica читает и пишет выгрузку Designer; операция, которой нужен EDT
+        // или его CLI, в словаре была бы адресом в тупик
+        // (DEC.2026-09-15.SOURCE-CONVERT-LEAVES-THE-DICTIONARY).
+        let catalog =
+            catalog_for(SurfaceRelease::V13).expect("v0.13 catalog must be test-loadable");
+        for operation in &catalog.run_dictionary {
             assert!(
-                description.contains("previewApply"),
-                "unica.run.{field} must describe the previewApply execution protocol: {description}"
+                !operation.name().contains("convert"),
+                "{} converts between formats, and Unica supports one",
+                operation.name()
             );
+            let description = operation.description().to_ascii_lowercase();
             assert!(
-                !description.contains("workspace-mutating"),
-                "unica.run.{field} must also cover infobase and artifact effects: {description}"
+                !description.contains("edt") && !description.contains("source format"),
+                "{} promises a format Unica does not read: {description}",
+                operation.name()
             );
         }
+        assert!(catalog
+            .run_dictionary
+            .iter()
+            .all(|operation| operation.name() != "source.convert"));
+    }
+
+    #[test]
+    fn run_schema_accepts_direct_execution_and_rejects_revision_arguments() {
+        let catalog =
+            catalog_for(SurfaceRelease::V13).expect("v0.13 catalog must be test-loadable");
+        let contract = catalog
+            .tools
+            .iter()
+            .find(|tool| tool.name == "run")
+            .unwrap();
+        let validator = jsonschema::validator_for(&contract.input_schema).unwrap();
+        for dry_run in [true, false] {
+            let mut arguments = json!({"op":"infobase.create", "args":{}, "dryRun":dry_run});
+            assert!(validator.is_valid(&arguments));
+            arguments["ifRev"] = json!("old-preview");
+            assert!(!validator.is_valid(&arguments));
+        }
+        assert!(!validator.is_valid(&json!({"op":"infobase.create", "args":{}, "dryRun":"false"})));
     }
 
     #[test]
@@ -888,6 +1326,37 @@ mod tests {
         // The no-query guarantee remains independently active while the
         // directional-intents test above owns the exact operation names.
         v13_run_dictionary_has_twelve_directional_runtime_intents();
+    }
+
+    #[test]
+    fn v13_client_run_is_implemented_as_a_terminal_operation_with_closed_arguments() {
+        let catalog = catalog_for(SurfaceRelease::V13).expect("canonical catalog exists");
+        let client_run = catalog
+            .run_dictionary
+            .iter()
+            .find(|operation| operation.intent == RunIntent::ClientRun)
+            .expect("launch belongs to the dictionary");
+        assert!(client_run.implemented);
+        assert_eq!(client_run.execution(), "terminal");
+        assert_eq!(client_run.effects(), ["clientSession"]);
+        let schema = client_run
+            .args_schema()
+            .expect("implemented operations publish argsSchema");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["clientMode"]));
+        assert_eq!(
+            schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["clientMode", "execute", "waitForExit", "waitTimeoutMs"]
+        );
+        assert_eq!(
+            schema["properties"]["clientMode"]["enum"],
+            json!(["designer", "thin", "thick", "ordinary"])
+        );
     }
 
     #[test]
@@ -901,7 +1370,7 @@ mod tests {
                 .expect("runtime operation")
         };
 
-        let configuration = operation(RunIntent::InfobaseConfigurationExport);
+        let configuration = operation(RunIntent::CfExport);
         assert!(configuration.implemented);
         assert_eq!(
             configuration.args_schema(),
@@ -917,7 +1386,7 @@ mod tests {
             }))
         );
 
-        let dump = operation(RunIntent::InfobaseDump);
+        let dump = operation(RunIntent::InfobaseExport);
         assert!(dump.implemented);
         assert_eq!(
             dump.args_schema(),

@@ -8,7 +8,9 @@ use self::invocation_service::{
     bind_workspace_invocation_with_source_override_for_test, ActorInvocationResourcesForTest,
     ActorReadSourceCapability,
 };
-use self::invocation_service::{bind_workspace_invocation, WorkspaceAdmissionError};
+use self::invocation_service::{
+    bind_workspace_invocation, UnadmittedCause, WorkspaceAdmissionError,
+};
 pub(crate) use self::invocation_service::{
     ActorBoundExecution, ActorBoundInvocation, CanonicalInvocationService,
 };
@@ -25,18 +27,204 @@ use crate::infrastructure::runtime_jobs::RuntimeJobService;
 use crate::infrastructure::runtime_jobs::RuntimeResourceOwner;
 use crate::infrastructure::workspace_actor::WorkspaceActorRegistry;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) const MAX_HANDSHAKES: usize = 8;
 pub(crate) const MAX_OWNER_SESSIONS: usize = 64;
 
+/// Безымянный неуспех — только для стенда.
+///
+/// На проводе такого ответа нет: у отказа канонической поверхности есть код из
+/// закрытого словаря, исход и продолжение, см. [`reject_workspace_admission`].
+#[cfg(test)]
 fn failed_domain_result(summary: &str) -> DomainResult {
     let mut result = DomainResult::success(summary);
     result.ok = false;
     result
 }
 
+/// Отказ допуска словами: код из закрытого словаря, названная причина и
+/// маршрут дальше.
+///
+/// Из того же каталога `unica.view {}` отвечает фактами и рецептом
+/// `v8project.yaml`, `unica.check {}` — вердиктом, `unica.run {}` — словарём
+/// инициализации. Всем трём набор исходников не нужен, поэтому отказ ведёт
+/// туда, а не в тупик.
+fn reject_workspace_admission(
+    request: &InvocationRequest,
+    error: WorkspaceAdmissionError,
+) -> V5CanonicalPrepareError {
+    // Ёмкость и отравленный реестр — состояния демона, а не рабочего
+    // пространства: у них свой маршрут, и объяснений про наборы они не ждут.
+    let daemon_state = matches!(
+        error,
+        WorkspaceAdmissionError::Capacity | WorkspaceAdmissionError::RegistryFailed
+    );
+    if !daemon_state {
+        // Недоступная операция `run` объясняется своим словарём: спрашивали не
+        // о наборах, и рассказ о них увёл бы в сторону.
+        if let Some(result) =
+            super::v13_run_dictionary::reject_unavailable_run_before_admission(request)
+        {
+            return V5CanonicalPrepareError::Direct(Box::new(result));
+        }
+    }
+    let (workspace_root, cause) = match error {
+        WorkspaceAdmissionError::Capacity => return V5CanonicalPrepareError::WorkspaceCapacity,
+        WorkspaceAdmissionError::RegistryFailed => {
+            return V5CanonicalPrepareError::WorkspaceRegistryFailed
+        }
+        // Корня нет — фактов о нём тоже нет, и звать за ними некуда.
+        WorkspaceAdmissionError::WorkspaceUndiscoverable { reason } => {
+            return V5CanonicalPrepareError::Rejected(Box::new(DomainResult::canonical_rejection(
+                None,
+                RefusalCode::ProviderUnavailable,
+                format!("workspace discovery failed: {reason}"),
+            )))
+        }
+        WorkspaceAdmissionError::Unadmitted {
+            workspace_root,
+            cause,
+        } => (workspace_root, cause),
+    };
+
+    let facts = || {
+        super::v13_workspace_bootstrap::next_action(
+            "unica.view",
+            serde_json::Value::Object(serde_json::Map::new()),
+            "source sets, infobase target, and the recommended v8project.yaml content",
+        )
+    };
+    let verdict = || {
+        super::v13_workspace_bootstrap::next_action(
+            "unica.check",
+            serde_json::Value::Object(serde_json::Map::new()),
+            "the workspace readiness verdict with its diagnostics",
+        )
+    };
+    let initialization = || {
+        super::v13_workspace_bootstrap::next_action(
+            "unica.run",
+            serde_json::Value::Object(serde_json::Map::new()),
+            "the initialization dictionary: source, CF/DT, and existing-infobase routes",
+        )
+    };
+
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "workspaceRoot".to_string(),
+        serde_json::Value::String(workspace_root.to_string_lossy().into_owned()),
+    );
+    let (code, summary, next) = match cause {
+        UnadmittedCause::Uninitialized => (
+            RefusalCode::InvalidState,
+            "no PlatformXml source set is admitted: workspace is uninitialized; no v8project.yaml or 1C source roots were found"
+                .to_string(),
+            vec![facts(), verdict(), initialization()],
+        ),
+        UnadmittedCause::NoPlatformXmlSourceSet(declared) => {
+            let declared = serde_json::to_value(declared).expect("project source sets serialize");
+            let formats = declared
+                .as_array()
+                .map(|sets| {
+                    let mut formats = sets
+                        .iter()
+                        .filter_map(|source| source["sourceFormat"].as_str())
+                        .collect::<Vec<_>>();
+                    formats.sort_unstable();
+                    formats.dedup();
+                    formats.join(", ")
+                })
+                .unwrap_or_default();
+            let count = declared.as_array().map_or(0, Vec::len);
+            payload.insert("sourceSets".to_string(), declared);
+            (
+                RefusalCode::InvalidSource,
+                format!(
+                    "no PlatformXml source set is admitted: all {count} declared source sets are in a format this surface does not read ({formats})"
+                ),
+                vec![facts(), verdict(), initialization()],
+            )
+        }
+        UnadmittedCause::SourceRootUnreadable {
+            source_set,
+            path,
+            reason,
+        } => {
+            payload.insert(
+                "sourceSet".to_string(),
+                serde_json::Value::String(source_set.clone()),
+            );
+            payload.insert("path".to_string(), serde_json::Value::String(path.clone()));
+            (
+                RefusalCode::InvalidSource,
+                format!(
+                    "no PlatformXml source set is admitted: source set `{source_set}` declares `{path}`, and {reason}"
+                ),
+                vec![facts(), verdict()],
+            )
+        }
+        // Те же слова, что у корня: причина одна, и разойтись им нельзя.
+        UnadmittedCause::ProjectConfigInvalid(reason) => {
+            payload.insert(
+                "config".to_string(),
+                serde_json::json!({"state": "invalid", "path": "v8project.yaml"}),
+            );
+            (
+                RefusalCode::InvalidState,
+                format!("v8project.yaml is present but invalid: {reason}"),
+                vec![facts(), verdict()],
+            )
+        }
+        UnadmittedCause::SourceDiscoveryFailed(reason) => (
+            RefusalCode::ProviderUnavailable,
+            format!("workspace source discovery failed: {reason}"),
+            vec![verdict()],
+        ),
+        // Повторяют тем же вызовом, поэтому продолжения нет: маршрут в обход
+        // рабочего пространства стоил бы того же срока.
+        UnadmittedCause::AdmissionDeadline => (
+            RefusalCode::DeadlineExceeded,
+            "workspace source discovery did not finish within the actor admission deadline"
+                .to_string(),
+            Vec::new(),
+        ),
+        UnadmittedCause::ActorBindingFailed { stage } => (
+            RefusalCode::InvalidState,
+            format!("workspace actor admission failed: {stage}"),
+            vec![facts(), verdict()],
+        ),
+    };
+
+    let mut result = DomainResult::canonical_rejection(None, code, summary);
+    result.data = Some(serde_json::Value::Object(payload));
+    result.next = next;
+    V5CanonicalPrepareError::Rejected(Box::new(result))
+}
+
 fn validate_hidden_v13_request(request: &InvocationRequest) -> Result<(), String> {
+    if request.tool() == crate::application::invocation_store::ToolIdentity::Apply {
+        let arguments = request.arguments();
+        if arguments.contains_key("dryRun") || arguments.contains_key("ifRev") {
+            return Err("unica.apply no longer accepts dryRun or ifRev. Call with at and ops to get a saved plan and data.executionToken, then call with executionToken only to execute that plan".to_string());
+        }
+        if arguments.contains_key("executionToken") {
+            if arguments.len() != 1 {
+                return Err("executionToken must be the only apply argument; at and ops belong to the planning call".to_string());
+            }
+            if !arguments["executionToken"]
+                .as_str()
+                .is_some_and(|token| !token.is_empty())
+            {
+                return Err(
+                    "executionToken must be non-empty text returned by a successful apply plan"
+                        .to_string(),
+                );
+            }
+        } else if !arguments.contains_key("at") || !arguments.contains_key("ops") {
+            return Err("call unica.apply with at and ops to prepare a plan, or with executionToken only to execute a saved plan".to_string());
+        }
+    }
     let catalog = crate::application::v13::tool_catalog::catalog_for(SurfaceRelease::V13)
         .ok_or_else(|| "canonical v0.13 catalog is unavailable".to_string())?;
     let contract = catalog
@@ -85,14 +273,20 @@ fn validate_canonical_value(
     value: &serde_json::Value,
     schema: &serde_json::Value,
 ) -> Result<(), String> {
-    let expected = schema.get("type").and_then(serde_json::Value::as_str);
-    let type_matches = match expected {
+    let matches_type = |expected: Option<&str>| match expected {
         Some("string") => value.is_string(),
         Some("boolean") => value.is_boolean(),
         Some("integer") => value.as_i64().is_some() || value.as_u64().is_some(),
         Some("object") => value.is_object(),
         Some("array") => value.is_array(),
+        Some("null") => value.is_null(),
         Some(_) | None => true,
+    };
+    let type_matches = match schema.get("type") {
+        Some(serde_json::Value::Array(types)) => {
+            types.iter().any(|expected| matches_type(expected.as_str()))
+        }
+        expected => matches_type(expected.and_then(serde_json::Value::as_str)),
     };
     if !type_matches {
         return Err(format!(
@@ -174,6 +368,9 @@ fn validate_canonical_value(
 pub(super) struct V5CanonicalInvocationRuntime {
     service: Arc<dyn CanonicalInvocationService>,
     clock: Arc<dyn Clock>,
+    documentation_cursors: Arc<crate::application::result_store::SearchCursorStore>,
+    root_check_continuations:
+        Arc<crate::infrastructure::project_health::resources::RootCheckContinuationStore>,
     workspace_actors: WorkspaceActorRegistry,
     deliveries: Arc<crate::infrastructure::engine_delivery::DeliveryDesk>,
     provider_hosts: Arc<ProviderHostOwner>,
@@ -190,25 +387,173 @@ pub(super) enum V5CanonicalPrepareError {
     WorkspaceRegistryFailed,
 }
 
+#[derive(Clone)]
+pub(super) struct RunEngineDelivery {
+    workspace_hint: std::path::PathBuf,
+    desk: Arc<crate::infrastructure::engine_delivery::DeliveryDesk>,
+}
+
+impl RunEngineDelivery {
+    fn execute(
+        &self,
+        cancellation: CancellationToken,
+        run: impl FnOnce(CancellationToken) -> DomainResult,
+    ) -> DomainResult {
+        use crate::application::shared_work::EngineDeliveryState;
+
+        if cancellation.is_cancelled() {
+            return DomainResult::canonical_rejection(
+                None,
+                RefusalCode::Cancelled,
+                "run cancelled before engine delivery",
+            );
+        }
+        let progress = crate::infrastructure::engine_delivery::CanonicalDeliveryProgress::default();
+        let state = crate::infrastructure::plugin_runtime::find_plugin_root(&self.workspace_hint)
+            .map(|plugin_root| {
+                crate::infrastructure::engine_delivery::deliver_if_missing(
+                    &self.desk,
+                    &plugin_root,
+                    "v8-runner",
+                    &cancellation,
+                    &progress,
+                )
+            })
+            .unwrap_or(EngineDeliveryState::NotRequired);
+        if cancellation.is_cancelled() {
+            return DomainResult::canonical_rejection(
+                None,
+                RefusalCode::Cancelled,
+                "run cancelled while waiting for engine delivery",
+            );
+        }
+        match crate::infrastructure::engine_delivery::canonical_delivery_result(state, &progress) {
+            Some(result) => result,
+            None => run(cancellation),
+        }
+    }
+}
+
 pub(super) enum V5ActorBoundCanonicalInvocation {
+    WorkspaceInspection {
+        inspection: Arc<super::v13_workspace_bootstrap::PreparedWorkspaceInspection>,
+    },
     Workspace {
         invocation: Box<ActorBoundInvocation>,
         service: Arc<dyn CanonicalInvocationService>,
     },
+    ConfigurationTransition {
+        transition: Arc<super::v13_configuration_transition::PreparedConfigurationTransition>,
+        workspace_identity_hash: crate::domain::invocation::SafeIdentityHash,
+        delivery: RunEngineDelivery,
+    },
+    Extensions {
+        extensions: Arc<super::v13_extensions::PreparedExtensions>,
+        workspace_identity_hash: crate::domain::invocation::SafeIdentityHash,
+        delivery: RunEngineDelivery,
+    },
     InfobaseExport {
         export: Arc<super::v13_infobase_exports::PreparedInfobaseExport>,
         workspace_identity_hash: crate::domain::invocation::SafeIdentityHash,
+        delivery: RunEngineDelivery,
+    },
+    /// Терминальный запуск клиента: как выгрузка, готовится до admission
+    /// PlatformXml и известен длинным по внешнему процессу.
+    ClientRun {
+        launch: Arc<super::v13_client_run::PreparedClientRun>,
+        workspace_identity_hash: crate::domain::invocation::SafeIdentityHash,
+        delivery: RunEngineDelivery,
+    },
+    /// Загрузка CF/CFE в базу: previewApply с забором, как выгрузки,
+    /// готовится до admission PlatformXml и известна длинной по внешнему
+    /// процессу.
+    CfImport {
+        import: Arc<super::v13_cf_import::PreparedCfImport>,
+        workspace_identity_hash: crate::domain::invocation::SafeIdentityHash,
+        delivery: RunEngineDelivery,
+    },
+    /// Создание базы: previewApply с забором, без аргументов, известно
+    /// длинным по внешнему процессу.
+    InfobaseCreate {
+        create: Arc<super::v13_infobase_create::PreparedInfobaseCreate>,
+        workspace_identity_hash: crate::domain::invocation::SafeIdentityHash,
+        delivery: RunEngineDelivery,
+    },
+    /// Импорт исходников в базу: previewApply с забором, известен длинным по
+    /// внешнему процессу.
+    SourceImport {
+        import: Arc<super::v13_source_import::PreparedSourceImport>,
+        workspace_identity_hash: crate::domain::invocation::SafeIdentityHash,
+        delivery: RunEngineDelivery,
+    },
+    /// Выгрузка базы в исходники: previewApply с забором, известна длинной
+    /// по внешнему процессу.
+    SourceExport {
+        export: Arc<super::v13_source_export::PreparedSourceExport>,
+        workspace_identity_hash: crate::domain::invocation::SafeIdentityHash,
+        delivery: RunEngineDelivery,
+    },
+    /// Сборка CF/CFE из исходников: previewApply с забором, известна длинной
+    /// по внешнему процессу.
+    ArtifactBuild {
+        build: Arc<super::v13_artifact_build::PreparedArtifactBuild>,
+        workspace_identity_hash: crate::domain::invocation::SafeIdentityHash,
+        delivery: RunEngineDelivery,
+    },
+    Documentation {
+        search: Arc<super::v13_documentation::PreparedDocumentationSearch>,
+        workspace_identity_hash: crate::domain::invocation::SafeIdentityHash,
+        response_deadline: InvocationResponseDeadline,
     },
 }
 
 pub(super) enum V5PreparedCanonicalInvocation {
+    WorkspaceInspection {
+        inspection: Arc<super::v13_workspace_bootstrap::PreparedWorkspaceInspection>,
+    },
     Workspace {
         invocation: Box<ActorBoundInvocation>,
         class: ExecutionClass,
         service: Arc<dyn CanonicalInvocationService>,
     },
+    ConfigurationTransition {
+        transition: Arc<super::v13_configuration_transition::PreparedConfigurationTransition>,
+        delivery: RunEngineDelivery,
+    },
+    Extensions {
+        extensions: Arc<super::v13_extensions::PreparedExtensions>,
+        delivery: RunEngineDelivery,
+    },
     InfobaseExport {
         export: Arc<super::v13_infobase_exports::PreparedInfobaseExport>,
+        delivery: RunEngineDelivery,
+    },
+    ClientRun {
+        launch: Arc<super::v13_client_run::PreparedClientRun>,
+        delivery: RunEngineDelivery,
+    },
+    CfImport {
+        import: Arc<super::v13_cf_import::PreparedCfImport>,
+        delivery: RunEngineDelivery,
+    },
+    InfobaseCreate {
+        create: Arc<super::v13_infobase_create::PreparedInfobaseCreate>,
+        delivery: RunEngineDelivery,
+    },
+    SourceImport {
+        import: Arc<super::v13_source_import::PreparedSourceImport>,
+        delivery: RunEngineDelivery,
+    },
+    SourceExport {
+        export: Arc<super::v13_source_export::PreparedSourceExport>,
+        delivery: RunEngineDelivery,
+    },
+    ArtifactBuild {
+        build: Arc<super::v13_artifact_build::PreparedArtifactBuild>,
+        delivery: RunEngineDelivery,
+    },
+    Documentation {
+        search: Arc<super::v13_documentation::PreparedDocumentationSearch>,
     },
 }
 
@@ -225,6 +570,12 @@ impl V5CanonicalInvocationRuntime {
         Self {
             service,
             clock,
+            documentation_cursors: Arc::new(
+                crate::application::result_store::SearchCursorStore::default(),
+            ),
+            root_check_continuations: Arc::new(
+                crate::infrastructure::project_health::resources::RootCheckContinuationStore::default(),
+            ),
             workspace_actors,
             deliveries: Arc::new(crate::infrastructure::engine_delivery::DeliveryDesk::default()),
             provider_hosts: Arc::new(ProviderHostOwner::default()),
@@ -251,6 +602,19 @@ impl V5CanonicalInvocationRuntime {
         self
     }
 
+    #[cfg(test)]
+    pub(super) fn with_delivery_downloader_for_test(
+        mut self,
+        downloader: Arc<dyn unica_bootstrap::Downloader>,
+    ) -> Self {
+        self.deliveries = Arc::new(
+            crate::infrastructure::engine_delivery::DeliveryDesk::with_downloader_for_test(
+                downloader,
+            ),
+        );
+        self
+    }
+
     /// One fresh daemon-side deadline of this runtime's clock: what `bind`
     /// captures for every request, exposed to tests that bind by hand.
     #[cfg(test)]
@@ -258,27 +622,93 @@ impl V5CanonicalInvocationRuntime {
         InvocationResponseDeadline::capture(Arc::clone(&self.clock))
     }
 
+    /// The one daemon-side deadline of a request: captured on this runtime's
+    /// clock before strict validation and narrowed to the frontend budget.
+    pub(super) fn capture_response_deadline(
+        &self,
+        response_budget_ms: u64,
+    ) -> InvocationResponseDeadline {
+        InvocationResponseDeadline::capture(Arc::clone(&self.clock))
+            .restrict_to_frontend_budget(Duration::from_millis(response_budget_ms))
+    }
+
+    /// The instant this runtime's clock reads now; fail-stop watchdogs are
+    /// armed and read on it.
+    pub(super) fn now(&self) -> Instant {
+        self.clock.now()
+    }
+
+    /// Bind under a deadline captured here and now: the direct path tests
+    /// take, production captures at the reservation and binds with it.
+    #[cfg(test)]
     pub(super) fn bind(
         &self,
         request: InvocationRequest,
     ) -> Result<V5ActorBoundCanonicalInvocation, V5CanonicalPrepareError> {
-        let response_deadline = InvocationResponseDeadline::capture(Arc::clone(&self.clock))
-            .restrict_to_frontend_budget(Duration::from_millis(request.response_budget_ms()));
+        let response_deadline = self.capture_response_deadline(request.response_budget_ms());
+        self.bind_with_deadline(request, response_deadline)
+    }
+
+    /// Binds under a deadline the caller captured earlier: the same clock and
+    /// the same handoff moment every later stage measures against.
+    pub(super) fn bind_with_deadline(
+        &self,
+        mut request: InvocationRequest,
+        response_deadline: InvocationResponseDeadline,
+    ) -> Result<V5ActorBoundCanonicalInvocation, V5CanonicalPrepareError> {
         if let Err(summary) = validate_hidden_v13_request(&request) {
             return Err(V5CanonicalPrepareError::Rejected(Box::new(
                 DomainResult::canonical_rejection(None, RefusalCode::BadValue, summary),
             )));
         }
-        if let Some(result) =
-            super::v13_workspace_bootstrap::execute_view_bootstrap(&request, &response_deadline)
-        {
+        request.normalize_check_options();
+        match super::v13_workspace_bootstrap::prepare(
+            &request,
+            response_deadline.clone(),
+            &self.root_check_continuations,
+        ) {
+            super::v13_workspace_bootstrap::Preparation::NotApplicable => {}
+            super::v13_workspace_bootstrap::Preparation::Rejected(result) => {
+                return Err(V5CanonicalPrepareError::Rejected(result))
+            }
+            super::v13_workspace_bootstrap::Preparation::Ready(inspection) => {
+                return Ok(V5ActorBoundCanonicalInvocation::WorkspaceInspection { inspection });
+            }
+        }
+        if let Some(result) = super::v13_run_dictionary::execute_run_dictionary(&request) {
             return Err(V5CanonicalPrepareError::Direct(Box::new(result)));
         }
-        if let Some(result) = super::v13_workspace_initialize::execute_workspace_initialize(
-            &request,
-            &response_deadline,
-        ) {
-            return Err(V5CanonicalPrepareError::Direct(Box::new(result)));
+        let run_delivery = RunEngineDelivery {
+            workspace_hint: std::path::PathBuf::from(request.workspace_hint()),
+            desk: Arc::clone(&self.deliveries),
+        };
+        match super::v13_configuration_transition::prepare(&request) {
+            super::v13_configuration_transition::Preparation::NotApplicable => {}
+            super::v13_configuration_transition::Preparation::Rejected(result) => {
+                return Err(V5CanonicalPrepareError::Rejected(result))
+            }
+            super::v13_configuration_transition::Preparation::Ready(transition) => {
+                let workspace_identity_hash = transition.workspace_identity_hash();
+                return Ok(V5ActorBoundCanonicalInvocation::ConfigurationTransition {
+                    transition,
+                    workspace_identity_hash,
+                    delivery: run_delivery.clone(),
+                });
+            }
+        }
+        match super::v13_extensions::prepare(&request) {
+            super::v13_extensions::Preparation::NotApplicable => {}
+            super::v13_extensions::Preparation::Rejected(result) => {
+                return Err(V5CanonicalPrepareError::Rejected(result))
+            }
+            super::v13_extensions::Preparation::Ready(extensions) => {
+                let workspace_identity_hash = extensions.workspace_identity_hash();
+                return Ok(V5ActorBoundCanonicalInvocation::Extensions {
+                    extensions,
+                    workspace_identity_hash,
+                    delivery: run_delivery.clone(),
+                });
+            }
         }
         match super::v13_infobase_exports::prepare(&request) {
             super::v13_infobase_exports::Preparation::NotApplicable => {}
@@ -290,6 +720,105 @@ impl V5CanonicalInvocationRuntime {
                 return Ok(V5ActorBoundCanonicalInvocation::InfobaseExport {
                     export,
                     workspace_identity_hash,
+                    delivery: run_delivery.clone(),
+                });
+            }
+        }
+        match super::v13_client_run::prepare(&request) {
+            super::v13_client_run::Preparation::NotApplicable => {}
+            super::v13_client_run::Preparation::Rejected(result) => {
+                return Err(V5CanonicalPrepareError::Rejected(result))
+            }
+            super::v13_client_run::Preparation::Ready(launch) => {
+                let workspace_identity_hash = launch.workspace_identity_hash();
+                return Ok(V5ActorBoundCanonicalInvocation::ClientRun {
+                    launch,
+                    workspace_identity_hash,
+                    delivery: run_delivery.clone(),
+                });
+            }
+        }
+        match super::v13_cf_import::prepare(&request) {
+            super::v13_cf_import::Preparation::NotApplicable => {}
+            super::v13_cf_import::Preparation::Rejected(result) => {
+                return Err(V5CanonicalPrepareError::Rejected(result))
+            }
+            super::v13_cf_import::Preparation::Ready(import) => {
+                let workspace_identity_hash = import.workspace_identity_hash();
+                return Ok(V5ActorBoundCanonicalInvocation::CfImport {
+                    import,
+                    workspace_identity_hash,
+                    delivery: run_delivery.clone(),
+                });
+            }
+        }
+        match super::v13_infobase_create::prepare(&request) {
+            super::v13_infobase_create::Preparation::NotApplicable => {}
+            super::v13_infobase_create::Preparation::Rejected(result) => {
+                return Err(V5CanonicalPrepareError::Rejected(result))
+            }
+            super::v13_infobase_create::Preparation::Ready(create) => {
+                let workspace_identity_hash = create.workspace_identity_hash();
+                return Ok(V5ActorBoundCanonicalInvocation::InfobaseCreate {
+                    create,
+                    workspace_identity_hash,
+                    delivery: run_delivery.clone(),
+                });
+            }
+        }
+        match super::v13_source_import::prepare(&request) {
+            super::v13_source_import::Preparation::NotApplicable => {}
+            super::v13_source_import::Preparation::Rejected(result) => {
+                return Err(V5CanonicalPrepareError::Rejected(result))
+            }
+            super::v13_source_import::Preparation::Ready(import) => {
+                let workspace_identity_hash = import.workspace_identity_hash();
+                return Ok(V5ActorBoundCanonicalInvocation::SourceImport {
+                    import,
+                    workspace_identity_hash,
+                    delivery: run_delivery.clone(),
+                });
+            }
+        }
+        match super::v13_source_export::prepare(&request) {
+            super::v13_source_export::Preparation::NotApplicable => {}
+            super::v13_source_export::Preparation::Rejected(result) => {
+                return Err(V5CanonicalPrepareError::Rejected(result))
+            }
+            super::v13_source_export::Preparation::Ready(export) => {
+                let workspace_identity_hash = export.workspace_identity_hash();
+                return Ok(V5ActorBoundCanonicalInvocation::SourceExport {
+                    export,
+                    workspace_identity_hash,
+                    delivery: run_delivery.clone(),
+                });
+            }
+        }
+        match super::v13_artifact_build::prepare(&request) {
+            super::v13_artifact_build::Preparation::NotApplicable => {}
+            super::v13_artifact_build::Preparation::Rejected(result) => {
+                return Err(V5CanonicalPrepareError::Rejected(result))
+            }
+            super::v13_artifact_build::Preparation::Ready(build) => {
+                let workspace_identity_hash = build.workspace_identity_hash();
+                return Ok(V5ActorBoundCanonicalInvocation::ArtifactBuild {
+                    build,
+                    workspace_identity_hash,
+                    delivery: run_delivery.clone(),
+                });
+            }
+        }
+        match super::v13_documentation::prepare(&request, Arc::clone(&self.documentation_cursors)) {
+            super::v13_documentation::Preparation::NotApplicable => {}
+            super::v13_documentation::Preparation::Rejected(result) => {
+                return Err(V5CanonicalPrepareError::Rejected(result))
+            }
+            super::v13_documentation::Preparation::Ready(search) => {
+                let workspace_identity_hash = search.workspace_identity_hash();
+                return Ok(V5ActorBoundCanonicalInvocation::Documentation {
+                    search,
+                    workspace_identity_hash,
+                    response_deadline,
                 });
             }
         }
@@ -306,25 +835,7 @@ impl V5CanonicalInvocationRuntime {
             runtime_service,
             response_deadline,
         )
-        .map_err(|error| match error {
-            WorkspaceAdmissionError::Capacity => V5CanonicalPrepareError::WorkspaceCapacity,
-            WorkspaceAdmissionError::RegistryFailed => {
-                V5CanonicalPrepareError::WorkspaceRegistryFailed
-            }
-            WorkspaceAdmissionError::Invalid => {
-                if let Some(result) =
-                    super::v13_workspace_initialize::reject_unavailable_run_before_admission(
-                        &request,
-                    )
-                {
-                    V5CanonicalPrepareError::Direct(Box::new(result))
-                } else {
-                    V5CanonicalPrepareError::Rejected(Box::new(failed_domain_result(
-                        "workspace actor admission failed",
-                    )))
-                }
-            }
-        })?;
+        .map_err(|error| reject_workspace_admission(&request, error))?;
         Ok(V5ActorBoundCanonicalInvocation::Workspace {
             invocation: Box::new(invocation),
             service: Arc::clone(&self.service),
@@ -338,15 +849,69 @@ impl V5ActorBoundCanonicalInvocation {
     /// they are known-long by construction.
     pub(super) fn response_deadline(&self) -> Option<InvocationResponseDeadline> {
         match self {
+            Self::WorkspaceInspection { inspection, .. } => {
+                Some(inspection.response_deadline().clone())
+            }
             Self::Workspace { invocation, .. } => Some(invocation.response_deadline().clone()),
-            Self::InfobaseExport { .. } => None,
+            Self::ConfigurationTransition { .. }
+            | Self::Extensions { .. }
+            | Self::InfobaseExport { .. }
+            | Self::ClientRun { .. }
+            | Self::CfImport { .. }
+            | Self::InfobaseCreate { .. }
+            | Self::SourceImport { .. }
+            | Self::SourceExport { .. }
+            | Self::ArtifactBuild { .. } => None,
+            // Справка не известна длинной: локальное попадание отвечает
+            // сразу, сетевое доходит до седьмой секунды. Значит у неё тот же
+            // cutoff, что у чтений, — захваченный при bind.
+            Self::Documentation {
+                response_deadline, ..
+            } => Some(response_deadline.clone()),
         }
     }
 
     pub(super) fn workspace_identity_hash(&self) -> &crate::domain::invocation::SafeIdentityHash {
         match self {
             Self::Workspace { invocation, .. } => invocation.workspace_identity_hash(),
-            Self::InfobaseExport {
+            Self::WorkspaceInspection { inspection } => inspection.workspace_identity_hash(),
+            Self::ConfigurationTransition {
+                workspace_identity_hash,
+                ..
+            }
+            | Self::Extensions {
+                workspace_identity_hash,
+                ..
+            }
+            | Self::InfobaseExport {
+                workspace_identity_hash,
+                ..
+            }
+            | Self::ClientRun {
+                workspace_identity_hash,
+                ..
+            }
+            | Self::CfImport {
+                workspace_identity_hash,
+                ..
+            }
+            | Self::InfobaseCreate {
+                workspace_identity_hash,
+                ..
+            }
+            | Self::SourceImport {
+                workspace_identity_hash,
+                ..
+            }
+            | Self::SourceExport {
+                workspace_identity_hash,
+                ..
+            }
+            | Self::ArtifactBuild {
+                workspace_identity_hash,
+                ..
+            }
+            | Self::Documentation {
                 workspace_identity_hash,
                 ..
             } => workspace_identity_hash,
@@ -355,6 +920,9 @@ impl V5ActorBoundCanonicalInvocation {
 
     pub(super) fn prepare(self) -> Result<V5PreparedCanonicalInvocation, Box<DomainResult>> {
         match self {
+            Self::WorkspaceInspection { inspection, .. } => {
+                Ok(V5PreparedCanonicalInvocation::WorkspaceInspection { inspection })
+            }
             Self::Workspace {
                 invocation,
                 service,
@@ -366,8 +934,45 @@ impl V5ActorBoundCanonicalInvocation {
                     service,
                 })
             }
-            Self::InfobaseExport { export, .. } => {
-                Ok(V5PreparedCanonicalInvocation::InfobaseExport { export })
+            Self::ConfigurationTransition {
+                transition,
+                delivery,
+                ..
+            } => Ok(V5PreparedCanonicalInvocation::ConfigurationTransition {
+                transition,
+                delivery,
+            }),
+            Self::Extensions {
+                extensions,
+                delivery,
+                ..
+            } => Ok(V5PreparedCanonicalInvocation::Extensions {
+                extensions,
+                delivery,
+            }),
+            Self::InfobaseExport {
+                export, delivery, ..
+            } => Ok(V5PreparedCanonicalInvocation::InfobaseExport { export, delivery }),
+            Self::ClientRun {
+                launch, delivery, ..
+            } => Ok(V5PreparedCanonicalInvocation::ClientRun { launch, delivery }),
+            Self::CfImport {
+                import, delivery, ..
+            } => Ok(V5PreparedCanonicalInvocation::CfImport { import, delivery }),
+            Self::InfobaseCreate {
+                create, delivery, ..
+            } => Ok(V5PreparedCanonicalInvocation::InfobaseCreate { create, delivery }),
+            Self::SourceImport {
+                import, delivery, ..
+            } => Ok(V5PreparedCanonicalInvocation::SourceImport { import, delivery }),
+            Self::SourceExport {
+                export, delivery, ..
+            } => Ok(V5PreparedCanonicalInvocation::SourceExport { export, delivery }),
+            Self::ArtifactBuild {
+                build, delivery, ..
+            } => Ok(V5PreparedCanonicalInvocation::ArtifactBuild { build, delivery }),
+            Self::Documentation { search, .. } => {
+                Ok(V5PreparedCanonicalInvocation::Documentation { search })
             }
         }
     }
@@ -379,7 +984,18 @@ impl V5PreparedCanonicalInvocation {
             ExecutionClass::KnownLong(KnownLongReason::ExternalProcess);
         match self {
             Self::Workspace { class, .. } => class,
-            Self::InfobaseExport { .. } => &INFOBASE_EXPORT_CLASS,
+            Self::ConfigurationTransition { .. }
+            | Self::Extensions { .. }
+            | Self::InfobaseExport { .. }
+            | Self::ClientRun { .. }
+            | Self::CfImport { .. }
+            | Self::InfobaseCreate { .. }
+            | Self::SourceImport { .. }
+            | Self::SourceExport { .. }
+            | Self::ArtifactBuild { .. } => &INFOBASE_EXPORT_CLASS,
+            Self::WorkspaceInspection { .. } | Self::Documentation { .. } => {
+                &ExecutionClass::InlineCandidate
+            }
         }
     }
 
@@ -388,6 +1004,7 @@ impl V5PreparedCanonicalInvocation {
         cancellation: CancellationToken,
     ) -> Result<DomainResult, InvocationFailure> {
         match self {
+            Self::WorkspaceInspection { inspection } => inspection.execute(cancellation),
             Self::Workspace {
                 invocation,
                 service,
@@ -407,7 +1024,40 @@ impl V5PreparedCanonicalInvocation {
                     )
                 })?
             }
-            Self::InfobaseExport { export } => Ok(export.execute(cancellation)),
+            Self::ConfigurationTransition {
+                transition,
+                delivery,
+            } => Ok(delivery.execute(cancellation, |cancellation| {
+                transition.execute(cancellation)
+            })),
+            Self::Extensions {
+                extensions,
+                delivery,
+            } => Ok(delivery.execute(cancellation, |cancellation| {
+                extensions.execute(cancellation)
+            })),
+            Self::InfobaseExport { export, delivery } => {
+                Ok(delivery.execute(cancellation, |cancellation| export.execute(cancellation)))
+            }
+            Self::ClientRun { launch, delivery } => {
+                Ok(delivery.execute(cancellation, |cancellation| launch.execute(cancellation)))
+            }
+            Self::CfImport { import, delivery } => {
+                Ok(delivery.execute(cancellation, |cancellation| import.execute(cancellation)))
+            }
+            Self::InfobaseCreate { create, delivery } => {
+                Ok(delivery.execute(cancellation, |cancellation| create.execute(cancellation)))
+            }
+            Self::SourceImport { import, delivery } => {
+                Ok(delivery.execute(cancellation, |cancellation| import.execute(cancellation)))
+            }
+            Self::SourceExport { export, delivery } => {
+                Ok(delivery.execute(cancellation, |cancellation| export.execute(cancellation)))
+            }
+            Self::ArtifactBuild { build, delivery } => {
+                Ok(delivery.execute(cancellation, |cancellation| build.execute(cancellation)))
+            }
+            Self::Documentation { search } => Ok(search.execute(cancellation)),
         }
     }
 }
@@ -417,13 +1067,16 @@ pub(crate) struct DaemonServerConfig {
     pub(crate) state_root: std::path::PathBuf,
     pub(crate) core_identity: CoreIdentity,
     pub(crate) idle_grace: Duration,
+    pub(crate) capacity_observer:
+        Arc<crate::infrastructure::capacity_observation::CapacityObserver>,
     invocation_service: Arc<dyn CanonicalInvocationService>,
-    #[cfg(any(test, feature = "receipt-ledger-test-support"))]
+    /// Overrides installed by tests and the contract harness. Production
+    /// leaves every one of them empty; the fields exist unconditionally so
+    /// the runtime reads one configuration whatever the build.
     invocation_clock: Option<Arc<dyn Clock>>,
-    #[cfg(feature = "receipt-ledger-test-support")]
     v5_epoch_clock: Option<Arc<dyn crate::application::invocation_store::EpochMillisClock>>,
-    #[cfg(feature = "receipt-ledger-test-support")]
     skip_v5_startup_reconciliation: bool,
+    runtime_hooks: Option<Arc<dyn super::runtime_v5::V5RuntimeHooks>>,
     #[cfg(test)]
     canonical_runtime: Option<Arc<V5CanonicalInvocationRuntime>>,
 }
@@ -434,20 +1087,23 @@ impl DaemonServerConfig {
         core_identity: CoreIdentity,
         idle_grace: Duration,
     ) -> Self {
+        let capacity_observer =
+            Arc::new(crate::infrastructure::capacity_observation::CapacityObserver::default());
         let invocation_service: Arc<dyn CanonicalInvocationService> = Arc::new(
-            crate::infrastructure::daemon::v13_service::CanonicalV13ReadService::default(),
+            crate::infrastructure::daemon::v13_service::CanonicalV13ReadService::with_capacity_observer(
+                Arc::clone(&capacity_observer),
+            ),
         );
         Self {
             state_root,
             core_identity,
             idle_grace,
+            capacity_observer,
             invocation_service,
-            #[cfg(any(test, feature = "receipt-ledger-test-support"))]
             invocation_clock: None,
-            #[cfg(feature = "receipt-ledger-test-support")]
             v5_epoch_clock: None,
-            #[cfg(feature = "receipt-ledger-test-support")]
             skip_v5_startup_reconciliation: false,
+            runtime_hooks: None,
             #[cfg(test)]
             canonical_runtime: None,
         }
@@ -474,23 +1130,35 @@ impl DaemonServerConfig {
     }
 
     pub(super) fn invocation_clock_for_v5(&self) -> Arc<dyn Clock> {
-        #[cfg(any(test, feature = "receipt-ledger-test-support"))]
-        if let Some(clock) = &self.invocation_clock {
-            return Arc::clone(clock);
+        match &self.invocation_clock {
+            Some(clock) => Arc::clone(clock),
+            None => Arc::new(TokioClock),
         }
-        Arc::new(TokioClock)
     }
 
-    #[cfg(feature = "receipt-ledger-test-support")]
-    pub(super) fn epoch_clock_for_v5_test(
+    pub(super) fn epoch_clock_for_v5(
         &self,
     ) -> Option<Arc<dyn crate::application::invocation_store::EpochMillisClock>> {
         self.v5_epoch_clock.clone()
     }
 
-    #[cfg(feature = "receipt-ledger-test-support")]
-    pub(super) const fn skip_v5_startup_reconciliation_for_test(&self) -> bool {
+    pub(super) const fn skips_v5_startup_reconciliation(&self) -> bool {
         self.skip_v5_startup_reconciliation
+    }
+
+    pub(super) fn runtime_hooks_for_v5(
+        &self,
+    ) -> Option<Arc<dyn super::runtime_v5::V5RuntimeHooks>> {
+        self.runtime_hooks.clone()
+    }
+
+    #[cfg(any(test, feature = "receipt-ledger-test-support"))]
+    pub(crate) fn with_runtime_hooks_for_test(
+        mut self,
+        hooks: Arc<dyn super::runtime_v5::V5RuntimeHooks>,
+    ) -> Self {
+        self.runtime_hooks = Some(hooks);
+        self
     }
 
     #[cfg(feature = "receipt-ledger-test-support")]
@@ -514,7 +1182,7 @@ impl DaemonServerConfig {
         self
     }
 
-    #[cfg(feature = "receipt-ledger-test-support")]
+    #[cfg(any(test, feature = "receipt-ledger-test-support"))]
     pub(crate) fn with_v5_epoch_clock_for_test(
         mut self,
         clock: Arc<dyn crate::application::invocation_store::EpochMillisClock>,
@@ -531,6 +1199,7 @@ pub(crate) mod actor_capacity_tests {
     use super::super::protocol_v5::{
         V5DaemonTaskSnapshot, V5InvocationRequest, V5InvocationResponse, V5ServerResponse,
     };
+    use super::super::runner_011::VERSION as RUNNER_VERSION;
     use super::*;
     use crate::application::invocation::INVOCATION_HANDOFF_WINDOW;
     use crate::application::invocation_store::ToolIdentity;
@@ -568,8 +1237,512 @@ pub(crate) mod actor_capacity_tests {
         LOGICAL_READ_NOW.with(|current| *current.borrow_mut() = Some(now));
     }
 
-    fn canonical_v13_service() -> Arc<dyn CanonicalInvocationService> {
+    pub(crate) fn canonical_v13_service() -> Arc<dyn CanonicalInvocationService> {
         Arc::new(crate::infrastructure::daemon::v13_service::CanonicalV13ReadService::default())
+    }
+
+    fn subsystem_picture_workspace(picture: &str, has_ext: bool) -> tempfile::TempDir {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("src");
+        std::fs::create_dir_all(source.join("Subsystems")).unwrap();
+        if has_ext {
+            std::fs::create_dir_all(source.join("Subsystems/Sales/Ext")).unwrap();
+        }
+        std::fs::write(
+            workspace.path().join("v8project.yaml"),
+            "format: DESIGNER\nsource-set:\n  - name: main\n    type: CONFIGURATION\n    path: src\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("Configuration.xml"),
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Configuration><Properties><Name>Store</Name></Properties><ChildObjects><Subsystem>Sales</Subsystem></ChildObjects></Configuration></MetaDataObject>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("Subsystems/Sales.xml"),
+            format!(
+                "\u{feff}<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                <MetaDataObject xmlns=\"http://v8.1c.ru/8.3/MDClasses\" xmlns:v8=\"http://v8.1c.ru/8.1/data/core\" xmlns:xr=\"http://v8.1c.ru/8.3/xcf/readable\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" version=\"2.20\">\n\
+                <Subsystem uuid=\"55555555-5555-4555-8555-555555555555\"><Properties>\n\
+                <Name>Sales</Name>\n\
+                <Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>Продажи</v8:content></v8:item></Synonym>\n\
+                <Comment/>\n\
+                <IncludeHelpInContents>true</IncludeHelpInContents>\n\
+                <IncludeInCommandInterface>true</IncludeInCommandInterface>\n\
+                <UseOneCommand>false</UseOneCommand>\n\
+                <Explanation><v8:item><v8:lang>ru</v8:lang><v8:content>Описание</v8:content></v8:item></Explanation>\n\
+                <Picture>{picture}</Picture>\n\
+                <Content><xr:Item xsi:type=\"xr:MDObjectRef\">Catalog.Old</xr:Item></Content>\n\
+                </Properties><ChildObjects/></Subsystem></MetaDataObject>\n"
+            ),
+        )
+        .unwrap();
+        workspace
+    }
+
+    #[test]
+    fn canonical_subsystem_content_preserves_picture_and_preview_plan_without_entity_churn() {
+        for (reference, transparent) in [
+            (true, Some("true")),
+            (true, Some("false")),
+            (true, None),
+            (false, Some("true")),
+            (false, Some("false")),
+            (false, None),
+        ] {
+            let mut picture = String::new();
+            if reference {
+                picture.push_str("<xr:Ref>CommonPicture.Sales</xr:Ref>");
+            }
+            if let Some(value) = transparent {
+                picture.push_str(&format!("<xr:LoadTransparent>{value}</xr:LoadTransparent>"));
+            }
+            let workspace = subsystem_picture_workspace(&picture, true);
+            let descriptor = workspace.path().join("src/Subsystems/Sales.xml");
+            let runtime = V5CanonicalInvocationRuntime::new(
+                Arc::new(
+                    crate::infrastructure::daemon::v13_service::CanonicalV13ReadService::default(),
+                ),
+                Arc::new(TokioClock),
+            );
+            let workspace_hint = std::fs::canonicalize(workspace.path()).unwrap();
+            let call = |arguments| {
+                let request = InvocationRequest::new(
+                    ToolIdentity::Apply,
+                    arguments,
+                    workspace_hint.to_string_lossy(),
+                    7_000,
+                )
+                .unwrap();
+                direct_v5(&runtime, request).unwrap()
+            };
+            let arguments = serde_json::json!({
+                "at": "main:Subsystem.Sales",
+                "ops": [
+                    {"op": "content.add", "args": {"items": [{"object": "Catalog.Items"}]}},
+                    {"op": "content.remove", "args": {"items": [{"object": "Catalog.Old"}]}}
+                ]
+            });
+            let before = crate::test_support::tree_snapshot(workspace.path());
+            let preview = call(arguments.clone());
+            assert!(preview.ok, "{preview:?}");
+            assert_eq!(before, crate::test_support::tree_snapshot(workspace.path()));
+            let applied = call(
+                serde_json::json!({"executionToken": preview.data.as_ref().unwrap()["executionToken"]}),
+            );
+            assert!(applied.ok, "{applied:?}");
+            let preview_data = preview.data.as_ref().unwrap();
+            let applied_data = applied.data.as_ref().unwrap();
+            assert!(preview_data["planHash"].is_string(), "{preview_data}");
+            assert_eq!(preview_data["planHash"], applied_data["planHash"]);
+            assert_eq!(preview_data["effects"], applied_data["effects"]);
+            let edited = std::fs::read_to_string(&descriptor).unwrap();
+            assert!(!edited.contains("&#13;"), "{edited}");
+            assert!(!edited.contains("&#xD;"), "{edited}");
+            assert!(!edited.contains("\r"), "{edited}");
+            assert!(edited.contains("Catalog.Items"), "{edited}");
+            assert!(!edited.contains("Catalog.Old"), "{edited}");
+            assert!(edited.contains("Продажи"), "{edited}");
+            assert!(edited.contains("Описание"), "{edited}");
+            let doc = roxmltree::Document::parse(edited.trim_start_matches('\u{feff}')).unwrap();
+            let value = |name| {
+                doc.descendants()
+                    .find(|node| node.has_tag_name(("http://v8.1c.ru/8.3/xcf/readable", name)))
+                    .and_then(|node| node.text())
+            };
+            assert_eq!(value("LoadTransparent"), transparent);
+            assert_eq!(value("Ref"), reference.then_some("CommonPicture.Sales"));
+
+            let child = serde_json::json!({
+                "at": "main:Subsystem.Sales",
+                "ops": [{"op": "childSubsystem.add", "args": {"items": [{"name": "Orders"}]}}]
+            });
+            let before = crate::test_support::tree_snapshot(workspace.path());
+            let preview = call(child.clone());
+            assert!(preview.ok, "{preview:?}");
+            assert_eq!(before, crate::test_support::tree_snapshot(workspace.path()));
+            assert!(!workspace
+                .path()
+                .join("src/Subsystems/Sales/Subsystems")
+                .exists());
+            let applied = call(
+                serde_json::json!({"executionToken": preview.data.as_ref().unwrap()["executionToken"]}),
+            );
+            assert!(applied.ok, "{applied:?}");
+            assert_eq!(
+                preview.data.unwrap()["planHash"],
+                applied.data.unwrap()["planHash"]
+            );
+            let stub = std::fs::read_to_string(
+                workspace
+                    .path()
+                    .join("src/Subsystems/Sales/Subsystems/Orders.xml"),
+            )
+            .unwrap();
+            assert!(stub.contains("<Picture/>"), "{stub}");
+            assert!(!stub.contains("LoadTransparent"), "{stub}");
+            let parent = std::fs::read_to_string(&descriptor).unwrap();
+            assert!(parent.contains("<Subsystem>Orders</Subsystem>"), "{parent}");
+            assert!(!parent.contains("&#13;"), "{parent}");
+            let doc = roxmltree::Document::parse(parent.trim_start_matches('\u{feff}')).unwrap();
+            let transparency = doc
+                .descendants()
+                .find(|node| {
+                    node.has_tag_name(("http://v8.1c.ru/8.3/xcf/readable", "LoadTransparent"))
+                })
+                .and_then(|node| node.text());
+            assert_eq!(transparency, transparent);
+
+            let removal = serde_json::json!({
+                "at": "main:Subsystem.Sales",
+                "ops": [{"op": "childSubsystem.remove", "args": {"items": [{"name": "Orders"}]}}]
+            });
+            let before = crate::test_support::tree_snapshot(workspace.path());
+            let preview = call(removal.clone());
+            assert!(preview.ok, "{preview:?}");
+            assert_eq!(before, crate::test_support::tree_snapshot(workspace.path()));
+            let applied = call(
+                serde_json::json!({"executionToken": preview.data.as_ref().unwrap()["executionToken"]}),
+            );
+            assert!(applied.ok, "{applied:?}");
+            assert_eq!(
+                preview.data.unwrap()["planHash"],
+                applied.data.unwrap()["planHash"]
+            );
+            assert!(!workspace
+                .path()
+                .join("src/Subsystems/Sales/Subsystems/Orders.xml")
+                .exists());
+            let parent = std::fs::read_to_string(&descriptor).unwrap();
+            assert!(
+                !parent.contains("<Subsystem>Orders</Subsystem>"),
+                "{parent}"
+            );
+            assert!(!parent.contains("&#13;"), "{parent}");
+            let doc = roxmltree::Document::parse(parent.trim_start_matches('\u{feff}')).unwrap();
+            let value = |name| {
+                doc.descendants()
+                    .find(|node| node.has_tag_name(("http://v8.1c.ru/8.3/xcf/readable", name)))
+                    .and_then(|node| node.text())
+            };
+            assert_eq!(value("LoadTransparent"), transparent);
+            assert_eq!(value("Ref"), reference.then_some("CommonPicture.Sales"));
+        }
+    }
+
+    #[test]
+    fn canonical_subsystem_picture_property_refusal_never_mints_a_token_and_execution_cannot_override_ops(
+    ) {
+        let workspace =
+            subsystem_picture_workspace("<xr:LoadTransparent>true</xr:LoadTransparent>", false);
+        let runtime = V5CanonicalInvocationRuntime::new(
+            Arc::new(
+                crate::infrastructure::daemon::v13_service::CanonicalV13ReadService::default(),
+            ),
+            Arc::new(TokioClock),
+        );
+        let workspace_hint = std::fs::canonicalize(workspace.path()).unwrap();
+        let call = |arguments| {
+            let request = InvocationRequest::new(
+                ToolIdentity::Apply,
+                arguments,
+                workspace_hint.to_string_lossy(),
+                7_000,
+            )
+            .unwrap();
+            direct_v5(&runtime, request).unwrap()
+        };
+        let mut arguments = serde_json::json!({
+            "at": "main:Subsystem.Sales",
+            "ops": [{"op": "childSubsystem.add", "args": {"items": [{"name": "Orders"}]}}]
+        });
+        let before = crate::test_support::tree_snapshot(workspace.path());
+        let preview = call(arguments.clone());
+        assert!(preview.ok, "{preview:?}");
+        arguments["ops"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::Value::Null);
+        for property in ["LoadTransparent", "Picture.LoadTransparent"] {
+            arguments["ops"][1] = serde_json::json!({
+                "op": "props.set", "args": {"values": {property: true}}
+            });
+            let refused_preview = call(arguments.clone());
+            let refused_apply = call(serde_json::json!({
+                "executionToken": preview.data.as_ref().unwrap()["executionToken"],
+                "ops": arguments["ops"]
+            }));
+            assert!(!refused_preview.ok, "{refused_preview:?}");
+            assert!(!refused_apply.ok, "{refused_apply:?}");
+            assert_eq!(refused_preview.diagnostics[0]["code"], "bad_value");
+            assert!(refused_preview
+                .data
+                .as_ref()
+                .and_then(|data| data.get("executionToken"))
+                .is_none());
+            assert_eq!(refused_apply.diagnostics[0]["code"], "bad_value");
+            assert!(format!("{refused_preview:?}").contains(property));
+            assert_eq!(before, crate::test_support::tree_snapshot(workspace.path()));
+            assert!(!workspace
+                .path()
+                .join("src/Subsystems/Sales/Subsystems")
+                .exists());
+        }
+    }
+
+    fn dcs_check_workspace(kind: &str) -> (tempfile::TempDir, String, std::path::PathBuf) {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("src");
+        let external = kind != "Report";
+        let source_type = match kind {
+            "ExternalReport" => "EXTERNAL_REPORTS",
+            "ExternalDataProcessor" => "EXTERNAL_DATA_PROCESSORS",
+            "Report" => "CONFIGURATION",
+            _ => unreachable!(),
+        };
+        let owner = if external {
+            source.join("Sales")
+        } else {
+            source.join("Reports/Sales")
+        };
+        std::fs::create_dir_all(owner.join("Templates/Dcs/Ext")).unwrap();
+        std::fs::write(workspace.path().join("v8project.yaml"), format!(
+            "format: DESIGNER\nsource-set:\n  - name: main\n    type: {source_type}\n    path: src\n"
+        )).unwrap();
+        let descriptor = |body: String| {
+            format!(
+                r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">{body}</MetaDataObject>"#
+            )
+        };
+        if !external {
+            std::fs::write(source.join("Configuration.xml"), descriptor(
+                "<Configuration uuid=\"10000000-0000-4000-8000-000000000001\"><Properties><Name>Control</Name></Properties><ChildObjects><Report>Sales</Report></ChildObjects></Configuration>".into()
+            )).unwrap();
+        }
+        std::fs::write(owner.with_extension("xml"), descriptor(format!(
+            "<{kind} uuid=\"10000000-0000-4000-8000-000000000010\"><Properties><Name>Sales</Name></Properties><ChildObjects><Template>Dcs</Template></ChildObjects></{kind}>"
+        ))).unwrap();
+        std::fs::write(owner.join("Templates/Dcs.xml"), descriptor(
+            "<Template uuid=\"10000000-0000-4000-8000-000000000013\"><Properties><Name>Dcs</Name><TemplateType>DataCompositionSchema</TemplateType></Properties></Template>".into()
+        )).unwrap();
+        let body = owner.join("Templates/Dcs/Ext/Template.xml");
+        std::fs::write(
+            &body,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<DataCompositionSchema xmlns="http://v8.1c.ru/8.1/data-composition-system/schema"
+		xmlns:dcscom="http://v8.1c.ru/8.1/data-composition-system/common"
+		xmlns:dcscor="http://v8.1c.ru/8.1/data-composition-system/core"
+		xmlns:dcsset="http://v8.1c.ru/8.1/data-composition-system/settings"
+		xmlns:v8="http://v8.1c.ru/8.1/data/core"
+		xmlns:v8ui="http://v8.1c.ru/8.1/data/ui"
+		xmlns:xs="http://www.w3.org/2001/XMLSchema"
+		xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+	<dataSource>
+		<name>ИсточникДанных1</name>
+		<dataSourceType>Local</dataSourceType>
+	</dataSource>
+	<dataSet xsi:type="DataSetQuery">
+		<name>НаборДанных1</name>
+		<field xsi:type="DataSetFieldField">
+			<dataPath>Amount</dataPath>
+			<field>Amount</field>
+		</field>
+		<dataSource>ИсточникДанных1</dataSource>
+		<query>ВЫБРАТЬ Amount КАК Amount</query>
+	</dataSet>
+	<settingsVariant>
+		<dcsset:name>Основной</dcsset:name>
+		<dcsset:settings>
+			<dcsset:selection>
+			</dcsset:selection>
+			<dcsset:filter>
+			</dcsset:filter>
+			<dcsset:order>
+			</dcsset:order>
+			<dcsset:item xsi:type="dcsset:StructureItemGroup">
+				<dcsset:selection>
+					<dcsset:item xsi:type="dcsset:SelectedItemAuto"/>
+				</dcsset:selection>
+			</dcsset:item>
+		</dcsset:settings>
+	</settingsVariant>
+</DataCompositionSchema>
+"#,
+        )
+        .unwrap();
+        (workspace, format!("main:{kind}.Sales.Template.Dcs"), body)
+    }
+
+    fn call_dcs_check(workspace: &std::path::Path, tool: ToolIdentity, at: &str) -> DomainResult {
+        direct_v5(
+            &bootstrap_runtime(),
+            InvocationRequest::new(
+                tool,
+                serde_json::json!({"at": at}),
+                std::fs::canonicalize(workspace).unwrap().to_string_lossy(),
+                7_000,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn canonical_dcs_check_accepts_external_report_processor_and_configuration() {
+        for kind in ["ExternalReport", "ExternalDataProcessor", "Report"] {
+            let (workspace, at, _) = dcs_check_workspace(kind);
+            let before = crate::test_support::tree_snapshot(&workspace.path().join("src"));
+            let viewed = call_dcs_check(workspace.path(), ToolIdentity::View, &at);
+            assert!(viewed.ok, "{kind}: {viewed:?}");
+            let checked = call_dcs_check(workspace.path(), ToolIdentity::Check, &at);
+            assert!(checked.ok, "{kind}: {checked:?}");
+            let data = checked.data.as_ref().unwrap();
+            assert_eq!(data["status"], "passed", "{kind}: {checked:?}");
+            assert_eq!(data["validators"], serde_json::json!(["dcs"]));
+            assert_eq!(data["diagnosticCount"], 0);
+            assert_eq!(
+                before,
+                crate::test_support::tree_snapshot(&workspace.path().join("src"))
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_dcs_check_external_semantics_and_owner_isolation() {
+        for kind in ["ExternalReport", "ExternalDataProcessor"] {
+            let (workspace, at, body) = dcs_check_workspace(kind);
+            let valid = std::fs::read_to_string(&body).unwrap();
+            let invalid = valid.replace("<dcsset:order>",
+                "<dcsset:dataParameters><dcscor:item xsi:type=\"dcsset:SettingsParameterValue\"><dcscor:parameter/></dcscor:item></dcsset:dataParameters><dcsset:order>");
+            assert_ne!(valid, invalid);
+            std::fs::write(&body, invalid).unwrap();
+            // A second owner has the same template name and valid content.
+            let source = workspace.path().join("src");
+            std::fs::create_dir_all(source.join("Other/Templates/Dcs/Ext")).unwrap();
+            std::fs::write(
+                source.join("Other.xml"),
+                std::fs::read_to_string(source.join("Sales.xml"))
+                    .unwrap()
+                    .replace("Sales", "Other"),
+            )
+            .unwrap();
+            std::fs::copy(
+                source.join("Sales/Templates/Dcs.xml"),
+                source.join("Other/Templates/Dcs.xml"),
+            )
+            .unwrap();
+            std::fs::write(source.join("Other/Templates/Dcs/Ext/Template.xml"), valid).unwrap();
+            let before = crate::test_support::tree_snapshot(&source);
+            assert!(call_dcs_check(workspace.path(), ToolIdentity::View, &at).ok);
+            let checked = call_dcs_check(workspace.path(), ToolIdentity::Check, &at);
+            assert!(checked.ok, "{checked:?}");
+            let data = checked.data.as_ref().unwrap();
+            assert_eq!(data["status"], "failed", "{checked:?}");
+            assert!(
+                data["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["validator"] == "dcs"
+                        && item["message"]
+                            .as_str()
+                            .is_some_and(|text| text
+                                .contains("SettingsParameterValue has empty parameter name"))),
+                "{checked:?}"
+            );
+            let sibling = call_dcs_check(
+                workspace.path(),
+                ToolIdentity::Check,
+                &at.replace(".Sales.", ".Other."),
+            );
+            assert_eq!(
+                sibling.data.as_ref().unwrap()["status"],
+                "passed",
+                "{sibling:?}"
+            );
+            assert_eq!(before, crate::test_support::tree_snapshot(&source));
+        }
+    }
+
+    #[test]
+    fn canonical_dcs_check_refuses_unregistered_or_mismatched_external_template() {
+        for case in ["unregistered", "wrong-name", "wrong-kind", "missing"] {
+            let (workspace, at, body) = dcs_check_workspace("ExternalReport");
+            let source = workspace.path().join("src");
+            let descriptor = source.join("Sales/Templates/Dcs.xml");
+            match case {
+                "unregistered" => {
+                    let owner = source.join("Sales.xml");
+                    std::fs::write(
+                        &owner,
+                        std::fs::read_to_string(&owner)
+                            .unwrap()
+                            .replace("<Template>Dcs</Template>", ""),
+                    )
+                    .unwrap();
+                }
+                "wrong-name" => std::fs::write(
+                    &descriptor,
+                    std::fs::read_to_string(&descriptor)
+                        .unwrap()
+                        .replace("<Name>Dcs</Name>", "<Name>Other</Name>"),
+                )
+                .unwrap(),
+                "wrong-kind" => std::fs::write(
+                    &descriptor,
+                    std::fs::read_to_string(&descriptor)
+                        .unwrap()
+                        .replace("<Template ", "<Form ")
+                        .replace("</Template>", "</Form>"),
+                )
+                .unwrap(),
+                "missing" => std::fs::remove_file(body).unwrap(),
+                _ => unreachable!(),
+            }
+            let before = crate::test_support::tree_snapshot(&source);
+            let checked = call_dcs_check(workspace.path(), ToolIdentity::Check, &at);
+            assert!(!checked.ok, "{case}: {checked:?}");
+            assert_eq!(
+                checked.diagnostics[0]["code"],
+                if case == "unregistered" {
+                    "not_found"
+                } else {
+                    "provider_unavailable"
+                },
+                "{case}: {checked:?}"
+            );
+            assert_eq!(before, crate::test_support::tree_snapshot(&source));
+        }
+    }
+
+    #[test]
+    fn canonical_dcs_check_refuses_linked_external_payload() {
+        use crate::infrastructure::platform::testing::{
+            create_file_link_fixture_for_test, FileLinkFixtureOutcome,
+        };
+
+        let (workspace, at, body) = dcs_check_workspace("ExternalReport");
+        let outside = tempfile::tempdir().unwrap();
+        let external_body = outside.path().join("Template.xml");
+        std::fs::rename(&body, &external_body).unwrap();
+        let outcome = create_file_link_fixture_for_test(&external_body, &body)
+            .expect("unexpected file-link creation error must fail the fixture test");
+        if outcome != FileLinkFixtureOutcome::Created {
+            eprintln!("[SKIPPED FIXTURE] file-link fixture unavailable: {outcome:?}");
+            return;
+        }
+        let before = std::fs::read(&external_body).unwrap();
+        let checked = call_dcs_check(workspace.path(), ToolIdentity::Check, &at);
+        assert!(!checked.ok, "{checked:?}");
+        assert_eq!(
+            checked.diagnostics[0]["code"], "provider_unavailable",
+            "{checked:?}"
+        );
+        assert_eq!(before, std::fs::read(&external_body).unwrap());
+        assert!(std::fs::symlink_metadata(body)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     fn bootstrap_runtime() -> V5CanonicalInvocationRuntime {
@@ -607,14 +1780,36 @@ pub(crate) mod actor_capacity_tests {
         workspace: &std::path::Path,
         arguments: serde_json::Value,
     ) -> DomainResult {
+        submit_canonical(runtime, workspace, ToolIdentity::View, arguments)
+    }
+
+    /// Вердикт по корню: `check {}` отвечает до допуска наборов.
+    fn submit_root_verdict(
+        runtime: &V5CanonicalInvocationRuntime,
+        workspace: &std::path::Path,
+    ) -> DomainResult {
+        submit_canonical(
+            runtime,
+            workspace,
+            ToolIdentity::Check,
+            serde_json::json!({}),
+        )
+    }
+
+    fn submit_canonical(
+        runtime: &V5CanonicalInvocationRuntime,
+        workspace: &std::path::Path,
+        tool: ToolIdentity,
+        arguments: serde_json::Value,
+    ) -> DomainResult {
         let request = InvocationRequest::new(
-            ToolIdentity::View,
+            tool,
             arguments,
             std::fs::canonicalize(workspace).unwrap().to_string_lossy(),
             7_000,
         )
         .unwrap();
-        direct_v5(runtime, request).expect("workspace bootstrap must finish directly")
+        direct_v5(runtime, request).expect("a pre-admission answer must finish directly")
     }
 
     const LIVE_V5_IDLE_GRACE: Duration = Duration::from_millis(400);
@@ -625,7 +1820,7 @@ pub(crate) mod actor_capacity_tests {
         match tool {
             ToolIdentity::View => V5ToolIdentity::View,
             ToolIdentity::Apply => V5ToolIdentity::Apply,
-            ToolIdentity::Find => V5ToolIdentity::Find,
+            ToolIdentity::Resolve => V5ToolIdentity::Resolve,
             ToolIdentity::Search => V5ToolIdentity::Search,
             ToolIdentity::Check => V5ToolIdentity::Check,
             ToolIdentity::Diff => V5ToolIdentity::Diff,
@@ -874,6 +2069,635 @@ pub(crate) mod actor_capacity_tests {
     }
 
     #[test]
+    fn canonical_selected_engine_routes_request_delivery_before_provider_start() {
+        const CHILD: &str = "UNICA_RUN_DELIVERY_TEST_CHILD";
+        const ROOT: &str = "UNICA_RUN_DELIVERY_TEST_ROOT";
+        if std::env::var_os(CHILD).is_some() {
+            let root = std::path::PathBuf::from(std::env::var_os(ROOT).unwrap());
+            let workspace = root.join("workspace");
+            let runtime = bootstrap_runtime();
+            let request = InvocationRequest::new(
+                ToolIdentity::Run,
+                serde_json::json!({"op":"extensions.list","args":{},"dryRun":true}),
+                workspace.display().to_string(),
+                7_000,
+            )
+            .unwrap();
+            let result = runtime
+                .bind(request)
+                .unwrap()
+                .prepare()
+                .unwrap()
+                .execute(CancellationToken::new())
+                .unwrap();
+            assert!(!result.ok, "{result:?}");
+            assert_eq!(
+                result.data.as_ref().unwrap()["delivery"]["artifact"],
+                "v8-runner"
+            );
+            assert_eq!(
+                result.data.as_ref().unwrap()["delivery"]["status"],
+                "failed"
+            );
+            assert!(!serde_json::to_string(&result)
+                .unwrap()
+                .contains("bundled_tool_missing"));
+
+            for (role, artifact) in [("symbol", "bsl-analyzer"), ("semantic", "rlm-tools-bsl")] {
+                let result = submit_canonical(
+                    &runtime,
+                    &workspace,
+                    ToolIdentity::Search,
+                    serde_json::json!({"query":"Needle","role":role}),
+                );
+                assert!(!result.ok, "{role}: {result:?}");
+                assert_eq!(
+                    result.data.as_ref().unwrap()["delivery"]["artifact"],
+                    artifact,
+                    "{role}: {result:?}"
+                );
+            }
+            for arguments in [
+                serde_json::json!({"query":"Needle","role":"lexical"}),
+                serde_json::json!({"query":"Needle"}),
+            ] {
+                let result =
+                    submit_canonical(&runtime, &workspace, ToolIdentity::Search, arguments);
+                assert!(
+                    result
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("delivery"))
+                        .is_none(),
+                    "lexical search must not order an external engine: {result:?}"
+                );
+            }
+            return;
+        }
+
+        // A one-test child owns its environment. Other Rust tests never see
+        // the temporary package or its intentionally absent release manifest.
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let plugin = root.path().join("plugin");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(plugin.join("third-party")).unwrap();
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(workspace.join("v8project.yaml"), "format: DESIGNER\nsource-set:\n  - name: main\n    type: CONFIGURATION\n    path: src\ninfobase:\n  connection: 'File=base'\n").unwrap();
+        std::fs::write(workspace.join("src/Configuration.xml"), r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Configuration><Properties><Name>Test</Name></Properties><ChildObjects/></Configuration></MetaDataObject>"#).unwrap();
+        let target = crate::infrastructure::platform::current_target_id().unwrap();
+        let exe = std::env::consts::EXE_SUFFIX;
+        std::fs::write(
+            plugin.join("third-party/manifest.json"),
+            serde_json::json!({
+                "schemaVersion": 2,
+                "tools": [
+                    {
+                        "name": "v8-runner",
+                        "version": RUNNER_VERSION,
+                        "binaryPath": format!("bin/{target}/v8-runner{exe}"),
+                        "sha256": "0".repeat(64),
+                    },
+                    {
+                        "name": "bsl-analyzer",
+                        "version": "0.2.67",
+                        "binaryPath": format!("bin/{target}/bsl-analyzer{exe}"),
+                        "sha256": "0".repeat(64),
+                    },
+                    {
+                        "name": "rlm-bsl-mcp",
+                        "artifact": "rlm-tools-bsl",
+                        "version": "1.33.0",
+                        "binaryPath": format!("bin/{target}/rlm-bsl-mcp{exe}"),
+                        "sha256": "0".repeat(64),
+                    }
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "infrastructure::daemon::server::actor_capacity_tests::canonical_selected_engine_routes_request_delivery_before_provider_start",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(ROOT, root.path())
+            .env("UNICA_PLUGIN_ROOT", &plugin)
+            .env("UNICA_ARTIFACT_CACHE", root.path().join("cache"))
+            .env("UNICA_RUNTIME_MANIFEST", root.path().join("missing-release.json"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stdout.contains("running 1 test"), "{stdout}\n{stderr}");
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+    }
+
+    #[test]
+    fn canonical_run_and_role_search_deliver_engines_and_run_supported_providers() {
+        const CHILD: &str = "UNICA_CANONICAL_DELIVERY_SUCCESS_CHILD";
+        const ROOT: &str = "UNICA_CANONICAL_DELIVERY_SUCCESS_ROOT";
+        if std::env::var_os(CHILD).is_some() {
+            use sha2::{Digest, Sha256};
+            use unica_bootstrap::{BootstrapError, DownloadObserver, Downloader, HostTarget};
+
+            struct PublishedFixture(
+                std::collections::BTreeMap<String, Vec<u8>>,
+                std::sync::atomic::AtomicUsize,
+            );
+            impl Downloader for PublishedFixture {
+                fn download(
+                    &self,
+                    _url: &str,
+                    destination: &std::path::Path,
+                    observer: &dyn DownloadObserver,
+                ) -> Result<(), BootstrapError> {
+                    let name = _url.rsplit('/').next().unwrap();
+                    let bytes = &self.0[name];
+                    std::fs::write(destination, bytes)?;
+                    observer.transferred(bytes.len() as u64, Some(bytes.len() as u64));
+                    self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+
+            let root = std::path::PathBuf::from(std::env::var_os(ROOT).unwrap());
+            let workspace = root.join("workspace");
+            let plugin = root.join("plugin");
+            let cache = root.join("cache");
+            std::fs::create_dir_all(workspace.join("src")).unwrap();
+            std::fs::create_dir_all(plugin.join("third-party")).unwrap();
+            std::fs::write(workspace.join("v8project.yaml"), "format: DESIGNER\nsource-set:\n  - name: main\n    type: CONFIGURATION\n    path: src\ninfobase:\n  connection: 'File=base'\n").unwrap();
+            std::fs::write(workspace.join("src/Configuration.xml"), r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Configuration><Properties><Name>Test</Name></Properties><ChildObjects/></Configuration></MetaDataObject>"#).unwrap();
+            std::fs::write(workspace.join("sample.cfe"), b"fixture-extension").unwrap();
+            let fixture_source = root.join("fake-engine.rs");
+            std::fs::write(&fixture_source, r###"
+use std::io::{self, BufRead, Write};
+fn main() {
+    let marker = std::path::PathBuf::from(std::env::var("UNICA_TEST_PROVIDER_MARKER_DIR").unwrap());
+    let args = std::env::args().collect::<Vec<_>>();
+    if args.iter().any(|argument| argument == "load") {
+        assert!(args.iter().any(|argument| argument == "--dry-run"));
+        let input = args.windows(2).find(|pair| pair[0] == "--path").unwrap()[1].clone();
+        assert!(input.ends_with("sample.cfe"));
+        std::fs::write(marker.join("upload"), "v8-runner load preview invoked").unwrap();
+        let envelope = r#"{"ok":true,"command":"load","data":{"ok":true,"provider_dispatched":false,"mode":"load","artifact_path":$PATH$,"artifact_type":"extension_cfe","target_kind":"extension","extension":"Sample","execution":{"status":"succeeded","payload":{"applied":false}}}}"#.replace("$PATH$", &format!("{input:?}"));
+        println!("{envelope}");
+        return;
+    }
+    if args.iter().any(|argument| argument == "extensions") {
+        std::fs::write(marker.join("run"), "v8-runner invoked").unwrap();
+        println!("{}", r#"{"ok":true,"command":"extensions","data":{"ok":true,"provider_dispatched":false,"provider":{"selected":"ibcmd","origin":{"kind":"default"}},"requested":{"kind":"all"},"extensions":[],"plan":"fixture"}}"#);
+        return;
+    }
+    if args.get(1).is_some_and(|argument| argument == "index") {
+        let db = std::path::PathBuf::from(std::env::var("RLM_INDEX_DIR").unwrap()).join("bsl_index.db");
+        if args.get(2).is_some_and(|argument| argument == "info") {
+            if db.is_file() {
+                println!("Index: {}\nStatus: fresh", db.display());
+            } else {
+                println!("Index not found");
+            }
+        } else {
+            std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+            std::fs::write(db, "fixture-index").unwrap();
+            std::fs::write(marker.join("index"), "rlm-bsl-index invoked").unwrap();
+        }
+        return;
+    }
+    for line in io::stdin().lock().lines() {
+        let line = line.unwrap();
+        if line.contains("\"method\":\"initialize\"") {
+            println!("{}", r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}"#);
+            io::stdout().flush().unwrap();
+        } else if line.contains("\"name\":\"search\"") {
+            assert!(line.contains("search_code"), "wrong analyzer action: {line}");
+            std::fs::write(marker.join("search"), "bsl-analyzer invoked").unwrap();
+            println!("{}", r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"No results found."}]}}"#);
+            io::stdout().flush().unwrap();
+        } else if line.contains("\"name\":\"rlm_start\"") {
+            println!("{}", r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"session_id\":\"fixture\",\"index\":{\"index_status\":\"ready\"}}"}]}}"#);
+            io::stdout().flush().unwrap();
+        } else if line.contains("\"name\":\"rlm_execute\"") {
+            std::fs::write(marker.join("semantic"), "rlm-bsl-mcp invoked").unwrap();
+            println!("{}", r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"stdout\":\"[]\"}"}]}}"#);
+            io::stdout().flush().unwrap();
+        } else if line.contains("\"name\":\"rlm_end\"") {
+            println!("{}", r#"{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"{}"}]}}"#);
+            io::stdout().flush().unwrap();
+        }
+    }
+}
+"###).unwrap();
+            let fixture_binary = root.join(format!("fake-engine{}", std::env::consts::EXE_SUFFIX));
+            let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+            let compilation = std::process::Command::new(rustc)
+                .args(["--edition=2021", "-o"])
+                .arg(&fixture_binary)
+                .arg(&fixture_source)
+                .output()
+                .unwrap();
+            assert!(
+                compilation.status.success(),
+                "{}",
+                String::from_utf8_lossy(&compilation.stderr)
+            );
+            let bytes = std::fs::read(&fixture_binary).unwrap();
+            let digest = format!("{:x}", Sha256::digest(&bytes));
+            let mut assets = std::collections::BTreeMap::new();
+            let mut core_targets = serde_json::Map::new();
+            let mut runner_targets = serde_json::Map::new();
+            let mut analyzer_targets = serde_json::Map::new();
+            let mut rlm_targets = serde_json::Map::new();
+            for host in HostTarget::ALL {
+                let target = host.as_str();
+                let suffix = if target == "win-x64" { ".exe" } else { "" };
+                let archive_name = format!("rlm-tools-bsl-{target}.tar.gz");
+                let archive = {
+                    let encoder =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                    let mut builder = tar::Builder::new(encoder);
+                    for name in [
+                        format!("rlm-bsl-mcp{suffix}"),
+                        format!("rlm-bsl-index{suffix}"),
+                    ] {
+                        let mut header = tar::Header::new_gnu();
+                        header.set_size(bytes.len() as u64);
+                        header.set_mode(0o755);
+                        header.set_cksum();
+                        builder
+                            .append_data(&mut header, name, bytes.as_slice())
+                            .unwrap();
+                    }
+                    builder.into_inner().unwrap().finish().unwrap()
+                };
+                let archive_digest = format!("{:x}", Sha256::digest(&archive));
+                assets.insert(archive_name.clone(), archive);
+                rlm_targets.insert(target.to_owned(), serde_json::json!({
+                    "asset": {"name": archive_name, "url": format!("https://github.com/IngvarConsulting/unica-toolchain/releases/download/rlm-tools-bsl-v1.33.0-build.3/{archive_name}"), "mediaType": "application/gzip", "sha256": archive_digest},
+                    "files": [
+                        {"path": format!("rlm-bsl-mcp{suffix}"), "sha256": digest, "executable": true},
+                        {"path": format!("rlm-bsl-index{suffix}"), "sha256": digest, "executable": true}
+                    ],
+                }));
+                let core_asset = format!("unica-runtime-{target}.tar.gz");
+                let core_path = format!("bin/{target}/unica{suffix}");
+                core_targets.insert(target.to_owned(), serde_json::json!({
+                    "asset": {"name": core_asset, "url": format!("https://github.com/IngvarConsulting/unica/releases/download/v{}/{core_asset}", env!("CARGO_PKG_VERSION")), "mediaType": "application/gzip", "sha256": "0".repeat(64)},
+                    "files": [{"path": core_path, "sha256": "0".repeat(64), "executable": true}],
+                    "entrypoint": core_path,
+                }));
+                for (name, targets, origin, version) in [
+                    (
+                        "v8-runner",
+                        &mut runner_targets,
+                        "https://github.com/IngvarConsulting/v8-runner-rust/releases/download",
+                        RUNNER_VERSION,
+                    ),
+                    (
+                        "bsl-analyzer",
+                        &mut analyzer_targets,
+                        "https://github.com/IngvarConsulting/unica-toolchain/releases/download",
+                        "0.2.67",
+                    ),
+                ] {
+                    let asset = format!("{name}-{target}{suffix}");
+                    assets.insert(asset.clone(), bytes.clone());
+                    targets.insert(target.to_owned(), serde_json::json!({
+                        "asset": {"name": asset, "url": format!("{origin}/{name}-v{version}-build.1/{asset}"), "mediaType": "application/octet-stream", "sha256": digest},
+                        "files": [{"path": format!("bin/{target}/{name}{suffix}"), "sha256": digest, "executable": true}],
+                    }));
+                }
+            }
+            let release = serde_json::json!({
+                "schemaVersion": 2,
+                "pluginVersion": env!("CARGO_PKG_VERSION"),
+                "source": {"repository": "https://github.com/IngvarConsulting/unica", "commit": "0".repeat(40)},
+                "release": {"repository": "https://github.com/IngvarConsulting/unica", "tag": format!("v{}", env!("CARGO_PKG_VERSION"))},
+                "artifacts": {
+                    "unica": {"version": env!("CARGO_PKG_VERSION"), "role": "core", "targets": core_targets},
+                    "v8-runner": {"version": RUNNER_VERSION, "role": "engine", "targets": runner_targets},
+                    "bsl-analyzer": {"version": "0.2.67", "role": "engine", "targets": analyzer_targets},
+                    "rlm-tools-bsl": {"version": "1.33.0", "role": "engine", "targets": rlm_targets},
+                }
+            });
+            let release_path = root.join("runtime-manifest.json");
+            std::fs::write(&release_path, release.to_string()).unwrap();
+            let target = crate::infrastructure::platform::current_target_id().unwrap();
+            let suffix = std::env::consts::EXE_SUFFIX;
+            let rlm_archive = format!("rlm-tools-bsl-{target}.tar.gz");
+            let rlm_digest = format!("{:x}", Sha256::digest(&assets[&rlm_archive]));
+            std::fs::write(plugin.join("third-party/manifest.json"), serde_json::json!({
+                "schemaVersion": 2,
+                "artifactAssets": {
+                    "v8-runner": {"sha256": digest},
+                    "bsl-analyzer": {"sha256": digest},
+                    "rlm-tools-bsl": {"sha256": rlm_digest},
+                },
+                "tools": [
+                    {"name": "v8-runner", "version": RUNNER_VERSION, "binaryPath": format!("bin/{target}/v8-runner{suffix}"), "deliveredPath": format!("bin/{target}/v8-runner{suffix}"), "sha256": digest},
+                    {"name": "bsl-analyzer", "version": "0.2.67", "binaryPath": format!("bin/{target}/bsl-analyzer{suffix}"), "deliveredPath": format!("bin/{target}/bsl-analyzer{suffix}"), "sha256": digest},
+                    {"name": "rlm-bsl-mcp", "artifact": "rlm-tools-bsl", "version": "1.33.0", "binaryPath": format!("bin/{target}/rlm-bsl-mcp{suffix}"), "deliveredPath": format!("rlm-bsl-mcp{suffix}"), "sha256": digest},
+                    {"name": "rlm-bsl-index", "artifact": "rlm-tools-bsl", "version": "1.33.0", "binaryPath": format!("bin/{target}/rlm-bsl-index{suffix}"), "deliveredPath": format!("rlm-bsl-index{suffix}"), "sha256": digest},
+                ],
+            }).to_string()).unwrap();
+            std::env::set_var("UNICA_PLUGIN_ROOT", &plugin);
+            std::env::set_var("UNICA_ARTIFACT_CACHE", &cache);
+            std::env::set_var("UNICA_RUNTIME_MANIFEST", &release_path);
+            std::env::set_var("UNICA_TEST_PROVIDER_MARKER_DIR", &root);
+            std::env::set_var("UNICA_WORKSPACE_SERVICE_IDLE_SECS", "1");
+            let server = std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(format!("unica{}", std::env::consts::EXE_SUFFIX));
+            assert!(
+                server.is_file(),
+                "build the Unica binary for workspace service: {}",
+                server.display()
+            );
+            std::env::set_var("UNICA_TEST_WORKSPACE_SERVICE_EXE", server);
+            let downloader = Arc::new(PublishedFixture(
+                assets,
+                std::sync::atomic::AtomicUsize::new(0),
+            ));
+            let runtime = V5CanonicalInvocationRuntime::new(
+                Arc::new(super::super::v13_service::CanonicalV13ReadService::default()),
+                Arc::new(TokioClock),
+            )
+            .with_delivery_downloader_for_test(downloader.clone());
+            assert!(!cache.join("v8-runner").exists());
+            assert!(!cache.join("bsl-analyzer").exists());
+
+            let request = InvocationRequest::new(
+                ToolIdentity::Run,
+                serde_json::json!({"op":"upload","args":{"input":"sample.cfe","extension":"Sample"},"dryRun":true}),
+                workspace.display().to_string(),
+                7_000,
+            )
+            .unwrap();
+            let upload = runtime
+                .bind(request)
+                .unwrap()
+                .prepare()
+                .unwrap()
+                .execute(CancellationToken::new())
+                .unwrap();
+            assert!(upload.ok, "{upload:?}");
+            assert_eq!(upload.data.as_ref().unwrap()["op"], "upload");
+            assert_eq!(upload.data.as_ref().unwrap()["dryRun"], true);
+            assert_eq!(
+                std::fs::read_to_string(root.join("upload")).unwrap(),
+                "v8-runner load preview invoked"
+            );
+
+            let request = InvocationRequest::new(
+                ToolIdentity::Run,
+                serde_json::json!({"op":"extensions.list","args":{},"dryRun":true}),
+                workspace.display().to_string(),
+                7_000,
+            )
+            .unwrap();
+            let run = runtime
+                .bind(request)
+                .unwrap()
+                .prepare()
+                .unwrap()
+                .execute(CancellationToken::new())
+                .unwrap();
+            assert!(run.ok, "{run:?}");
+            assert_eq!(
+                std::fs::read_to_string(root.join("run")).unwrap(),
+                "v8-runner invoked"
+            );
+            let search = submit_canonical(
+                &runtime,
+                &workspace,
+                ToolIdentity::Search,
+                serde_json::json!({"query":"Needle","role":"symbol"}),
+            );
+            assert!(
+                search.ok,
+                "{search:?}; marker={:?}; analyzer_cache_sha_verified={}",
+                std::fs::read_to_string(root.join("search")).ok(),
+                crate::infrastructure::bundled_tools::resolve_bundled_tool(
+                    &plugin,
+                    "bsl-analyzer",
+                    true
+                )
+                .ok()
+                .and_then(|resolved| std::fs::read(resolved.program).ok())
+                .is_some_and(|bytes| format!("{:x}", Sha256::digest(bytes)) == digest)
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("search")).unwrap(),
+                "bsl-analyzer invoked"
+            );
+            assert_eq!(
+                search.data.as_ref().unwrap()["matches"][0]["provider"],
+                "bsl-analyzer"
+            );
+            assert_eq!(
+                search.data.as_ref().unwrap()["matches"][0]["status"],
+                "empty"
+            );
+            assert_eq!(
+                search.data.as_ref().unwrap()["matches"][0]["hits"],
+                serde_json::json!([])
+            );
+            let mut semantic = submit_canonical(
+                &runtime,
+                &workspace,
+                ToolIdentity::Search,
+                serde_json::json!({"query":"Needle","role":"semantic"}),
+            );
+            for _ in 0..5 {
+                if semantic.ok {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                semantic = submit_canonical(
+                    &runtime,
+                    &workspace,
+                    ToolIdentity::Search,
+                    serde_json::json!({"query":"Needle","role":"semantic"}),
+                );
+            }
+            assert!(
+                semantic.ok,
+                "{semantic:?}; index={:?}; rlm={:?}",
+                std::fs::read_to_string(root.join("index")),
+                std::fs::read_to_string(root.join("semantic"))
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("index")).unwrap(),
+                "rlm-bsl-index invoked"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("semantic")).unwrap(),
+                "rlm-bsl-mcp invoked"
+            );
+            assert_eq!(
+                semantic.data.as_ref().unwrap()["matches"][0]["provider"],
+                "rlm"
+            );
+            for (name, version) in [("v8-runner", RUNNER_VERSION), ("bsl-analyzer", "0.2.67")] {
+                assert!(cache
+                    .join(name)
+                    .join(format!("{version}--{digest}"))
+                    .join(target)
+                    .is_dir());
+            }
+            assert!(cache
+                .join("rlm-tools-bsl")
+                .join(format!("1.33.0--{rlm_digest}"))
+                .join(target)
+                .is_dir());
+            for tool in ["rlm-bsl-index", "rlm-bsl-mcp"] {
+                let resolved =
+                    crate::infrastructure::bundled_tools::resolve_bundled_tool(&plugin, tool, true)
+                        .unwrap();
+                assert_eq!(
+                    format!(
+                        "{:x}",
+                        Sha256::digest(std::fs::read(resolved.program).unwrap())
+                    ),
+                    digest,
+                    "{tool} must resolve to the checked delivery"
+                );
+            }
+            assert_eq!(downloader.1.load(std::sync::atomic::Ordering::SeqCst), 3);
+            // The real service normally lives for hours. Wait for its short
+            // idle shutdown before the parent removes this isolated tempdir.
+            let services = workspace.join(".build/unica/services");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let live_record = std::fs::read_dir(&services)
+                    .unwrap()
+                    .flatten()
+                    .any(|entry| entry.path().join("service.json").is_file());
+                if !live_record {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "workspace service did not stop after idle timeout"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let test_executable = std::env::current_exe().unwrap();
+        let profile_dir = test_executable.parent().unwrap().parent().unwrap();
+        let server = profile_dir.join(format!("unica{}", std::env::consts::EXE_SUFFIX));
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let stdout = std::fs::File::create(root.path().join("cargo-build.stdout")).unwrap();
+        let stderr = std::fs::File::create(root.path().join("cargo-build.stderr")).unwrap();
+        let mut command = std::process::Command::new(cargo);
+        command
+            .current_dir(&workspace)
+            .args([
+                "build",
+                "--offline",
+                "--locked",
+                "-p",
+                "unica-coder",
+                "--bin",
+                "unica",
+            ])
+            .stdout(stdout)
+            .stderr(stderr);
+        if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") {
+            command.env("CARGO_TARGET_DIR", target_dir);
+        }
+        let mut child = command.spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("offline Unica binary build exceeded 180 seconds");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        assert!(
+            status.success(),
+            "offline Unica binary build failed: {}",
+            std::fs::read_to_string(root.path().join("cargo-build.stderr")).unwrap()
+        );
+        assert!(
+            server.is_file(),
+            "offline build did not create {}",
+            server.display()
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "infrastructure::daemon::server::actor_capacity_tests::canonical_run_and_role_search_deliver_engines_and_run_supported_providers",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(ROOT, root.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stdout.contains("running 1 test"), "{stdout}\n{stderr}");
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+    }
+
+    #[test]
+    fn extension_operations_bind_before_source_admission_as_known_long_tasks() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("v8project.yaml"),
+            "format: DESIGNER\ninfobase:\n  connection: 'File=base'\n",
+        )
+        .unwrap();
+        for (op, args) in [
+            ("extensions.list", serde_json::json!({})),
+            ("push", serde_json::json!({"delete":"Test"})),
+            (
+                "extensions.set",
+                serde_json::json!({"name":"Test","active":true}),
+            ),
+        ] {
+            let runtime = bootstrap_runtime();
+            let request = InvocationRequest::new(
+                ToolIdentity::Run,
+                serde_json::json!({"op":op,"args":args,"dryRun":true}),
+                workspace.path().display().to_string(),
+                7_000,
+            )
+            .unwrap();
+            let bound = runtime
+                .bind(request)
+                .expect("extension admission without a source set");
+            assert!(matches!(
+                bound,
+                V5ActorBoundCanonicalInvocation::Extensions { .. }
+            ));
+            assert_eq!(
+                bound.prepare().unwrap().execution_class(),
+                &ExecutionClass::KnownLong(KnownLongReason::ExternalProcess)
+            );
+        }
+    }
+
+    #[test]
     fn canonical_view_bootstrap_recognizes_an_infobase_only_workspace() {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -894,15 +2718,24 @@ pub(crate) mod actor_capacity_tests {
         assert_eq!(data["config"]["state"], "configured");
         assert_eq!(data["sourceSets"], serde_json::json!([]));
         assert_eq!(data["infobase"]["configured"], true);
-        assert_eq!(data["ready"], true);
         assert_eq!(data["sourceSelectionError"], serde_json::Value::Null);
-        assert_eq!(data["diagnostics"], serde_json::json!([]));
         assert_eq!(data["setup"], serde_json::Value::Null);
-        assert_eq!(result.next.len(), 2, "{result:?}");
+        // Факты не несут вердикта: ни готовности, ни проверок, ни диагностик.
+        for verdict in [
+            "ready",
+            "discoveredReady",
+            "repositoryReady",
+            "readinessState",
+            "checks",
+            "diagnostics",
+        ] {
+            assert_eq!(data.get(verdict), None, "{verdict} принадлежит check {{}}");
+        }
+        assert_eq!(result.next.len(), 3, "{result:?}");
         assert_eq!(
             result.next[0]["args"],
             serde_json::json!({
-                "op": "infobase.configuration.export",
+                "op": "download",
                 "args": {"state": "working", "output": "dist/main.cf"},
                 "dryRun": true
             })
@@ -915,6 +2748,15 @@ pub(crate) mod actor_capacity_tests {
                 "dryRun": true
             })
         );
+        assert_eq!(result.next[2]["tool"], "unica.check", "{result:?}");
+
+        let verdict = submit_root_verdict(&runtime, workspace.path());
+
+        assert!(verdict.ok, "{verdict:?}");
+        let verdict_data = verdict.data.as_ref().expect("verdict data");
+        assert_eq!(verdict_data["status"], "passed");
+        assert_eq!(verdict_data["ready"], true);
+        assert_eq!(verdict_data["diagnostics"], serde_json::json!([]));
     }
 
     #[test]
@@ -929,17 +2771,56 @@ pub(crate) mod actor_capacity_tests {
         let data = result.data.as_ref().expect("bootstrap data");
         assert_eq!(data["config"]["state"], "missing");
         assert_eq!(data["config"]["path"], "v8project.yaml");
-        assert_eq!(data["ready"], false);
         assert_eq!(data["sourceSets"], serde_json::json!([]));
         assert_eq!(data["setup"]["path"], "v8project.yaml");
         assert_eq!(data["setup"]["content"], serde_json::Value::Null);
-        assert_eq!(data["checks"], serde_json::json!([]));
-        assert_eq!(data["diagnostics"].as_array().unwrap().len(), 1);
-        assert_eq!(data["diagnostics"][0]["code"], "source_roots_missing");
+        for verdict in [
+            "ready",
+            "discoveredReady",
+            "repositoryReady",
+            "readinessState",
+            "checks",
+            "diagnostics",
+        ] {
+            assert_eq!(data.get(verdict), None, "{verdict} belongs to check {{}}");
+        }
         let wire = serde_json::to_string(data).unwrap();
         assert!(
             !wire.contains("unica.project."),
             "bootstrap must not recommend retired project tools: {wire}"
+        );
+
+        // Ненастроенное пространство — как раз тот случай, где вопрос «что не
+        // так» главный, поэтому маршрут к вердикту здесь обязателен.
+        assert!(
+            result
+                .next
+                .iter()
+                .any(|action| action["tool"] == "unica.check"),
+            "{result:?}"
+        );
+        let verdict = submit_root_verdict(&runtime, workspace.path());
+
+        assert!(verdict.ok, "{verdict:?}");
+        let verdict_data = verdict.data.as_ref().expect("verdict data");
+        assert_eq!(verdict_data["status"], "failed");
+        assert_eq!(verdict_data["ready"], false);
+        assert!(
+            verdict.rev.is_none(),
+            "root check has no source revision lease"
+        );
+        for sources in ["sources", "sourceSets"] {
+            assert_eq!(
+                verdict_data.get(sources),
+                None,
+                "{sources} belongs to view {{}}"
+            );
+        }
+        assert_eq!(verdict_data["checks"], serde_json::json!([]));
+        assert_eq!(verdict_data["diagnostics"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            verdict_data["diagnostics"][0]["code"],
+            "source_roots_missing"
         );
         assert_eq!(before, crate::test_support::tree_snapshot(workspace.path()));
     }
@@ -966,11 +2847,16 @@ pub(crate) mod actor_capacity_tests {
         assert!(result.ok, "{result:?}");
         let data = result.data.as_ref().expect("bootstrap data");
         assert_eq!(data["config"]["state"], "configured");
-        assert_eq!(data["ready"], true);
-        assert_eq!(data["repositoryReady"], false);
         assert_eq!(data["effectiveSourceSet"], "main");
         assert_eq!(result.next[0]["tool"], "unica.view");
         assert_eq!(result.next[0]["args"]["at"], "main:Configuration");
+
+        let verdict = submit_root_verdict(&runtime, workspace.path());
+
+        assert!(verdict.ok, "{verdict:?}");
+        let verdict_data = verdict.data.as_ref().expect("verdict data");
+        assert_eq!(verdict_data["ready"], true);
+        assert_eq!(verdict_data["repositoryReady"], false);
     }
 
     #[test]
@@ -1027,9 +2913,145 @@ pub(crate) mod actor_capacity_tests {
             result.data.as_ref().unwrap()["sourceSets"][0]["sourceFormat"],
             "edt"
         );
+        // Единственный оставшийся маршрут — вопрос о вердикте: адрес узла
+        // предлагать нечего, EDT в допуск не входит.
+        assert_eq!(result.next.len(), 1, "{result:?}");
+        assert_eq!(result.next[0]["tool"], "unica.check", "{result:?}");
+    }
+
+    /// Отказ допуска называет причину и следующий шаг.
+    ///
+    /// Из каталога без набора исходников `unica.view {}` отвечает фактами и
+    /// маршрутом, а актор-связанные инструменты отвечали безымянным
+    /// `workspace actor admission failed`: ни кода из закрытого словаря, ни
+    /// причины, ни продолжения. Причина известна ровно в точке отказа — вторым
+    /// обходом снаружи её пришлось бы восстанавливать по уже другому дереву.
+    #[test]
+    pub(crate) fn canonical_admission_names_why_no_source_set_was_admitted() {
+        fn routes(result: &DomainResult) -> Vec<&str> {
+            result
+                .next
+                .iter()
+                .map(|action| action["tool"].as_str().expect("next names a tool"))
+                .collect()
+        }
+
+        let runtime = bootstrap_runtime();
+
+        // Рабочая область не заведена: ни `v8project.yaml`, ни автоопределяемых
+        // корней 1С. Среду правит человек, поэтому исход — `needsHuman`.
+        let bare = tempfile::tempdir().unwrap();
+        let uninitialized = submit_canonical(
+            &runtime,
+            bare.path(),
+            ToolIdentity::Search,
+            serde_json::json!({"query": "Справочник"}),
+        );
+
+        assert!(!uninitialized.ok, "{uninitialized:?}");
+        assert_eq!(uninitialized.diagnostics.len(), 1, "{uninitialized:?}");
+        assert_eq!(
+            uninitialized.diagnostics[0]["code"], "invalid_state",
+            "{uninitialized:?}"
+        );
+        assert_eq!(
+            uninitialized.diagnostics[0]["outcome"], "needsHuman",
+            "{uninitialized:?}"
+        );
         assert!(
-            result.next.is_empty(),
-            "EDT cannot enter canonical actor admission: {result:?}"
+            uninitialized.summary.contains("workspace is uninitialized"),
+            "{uninitialized:?}"
+        );
+        assert_eq!(
+            routes(&uninitialized),
+            vec!["unica.view", "unica.check", "unica.run"],
+            "{uninitialized:?}"
+        );
+        assert_eq!(
+            uninitialized.data.as_ref().expect("refusal data")["workspaceRoot"],
+            serde_json::Value::String(
+                std::fs::canonicalize(bare.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            "{uninitialized:?}"
+        );
+
+        // Наборы объявлены, но ни один не в формате выгрузки конфигуратора:
+        // менять надо исходники, а не вызов.
+        let edt = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(edt.path().join("src/Configuration")).unwrap();
+        std::fs::write(
+            edt.path().join("v8project.yaml"),
+            "format: EDT\nsource-set:\n  - name: main\n    type: CONFIGURATION\n    path: src\n",
+        )
+        .unwrap();
+        std::fs::write(edt.path().join("src/.project"), "<projectDescription/>").unwrap();
+        std::fs::write(
+            edt.path().join("src/Configuration/Configuration.mdo"),
+            "<mdclass:Configuration/>",
+        )
+        .unwrap();
+        let unreadable_format = submit_canonical(
+            &runtime,
+            edt.path(),
+            ToolIdentity::Resolve,
+            serde_json::json!({"at": "main:Configuration"}),
+        );
+
+        assert!(!unreadable_format.ok, "{unreadable_format:?}");
+        assert_eq!(
+            unreadable_format.diagnostics[0]["code"], "invalid_source",
+            "{unreadable_format:?}"
+        );
+        assert_eq!(
+            unreadable_format.diagnostics[0]["outcome"], "fixSource",
+            "{unreadable_format:?}"
+        );
+        let declared = unreadable_format.data.as_ref().expect("refusal data");
+        assert_eq!(declared["sourceSets"][0]["name"], "main", "{declared}");
+        assert_eq!(
+            declared["sourceSets"][0]["sourceFormat"], "edt",
+            "{declared}"
+        );
+        assert_eq!(
+            routes(&unreadable_format),
+            vec!["unica.view", "unica.check", "unica.run"],
+            "{unreadable_format:?}"
+        );
+
+        // Настройка на месте, но её нельзя прочитать. Допуск отвечает теми же
+        // словами, что `unica.view {}`: причина одна, и разойтись им нельзя.
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(broken.path().join("v8project.yaml"), "format: [DESIGNER\n").unwrap();
+        let invalid_config = submit_canonical(
+            &runtime,
+            broken.path(),
+            ToolIdentity::Diff,
+            serde_json::json!({"left": "main:Configuration", "right": "main:Configuration"}),
+        );
+
+        assert!(!invalid_config.ok, "{invalid_config:?}");
+        assert_eq!(
+            invalid_config.diagnostics[0]["code"], "invalid_state",
+            "{invalid_config:?}"
+        );
+        assert!(
+            invalid_config
+                .summary
+                .starts_with("v8project.yaml is present but invalid: "),
+            "{invalid_config:?}"
+        );
+        assert_eq!(
+            submit_bootstrap(&runtime, broken.path(), serde_json::json!({})).summary,
+            invalid_config.summary,
+            "the root and the admission name one cause with one sentence"
+        );
+        assert_eq!(
+            routes(&invalid_config),
+            vec!["unica.view", "unica.check"],
+            "{invalid_config:?}"
         );
     }
 
@@ -1053,9 +3075,14 @@ pub(crate) mod actor_capacity_tests {
         let result = submit_bootstrap(&runtime, workspace.path(), serde_json::json!({}));
 
         assert!(result.ok, "{result:?}");
-        let data = result.data.as_ref().unwrap();
+        assert_eq!(result.next.len(), 1, "{result:?}");
+        assert_eq!(result.next[0]["tool"], "unica.check", "{result:?}");
+
+        let verdict = submit_root_verdict(&runtime, workspace.path());
+
+        assert!(verdict.ok, "{verdict:?}");
+        let data = verdict.data.as_ref().unwrap();
         assert_eq!(data["ready"], false, "{data}");
-        assert!(result.next.is_empty(), "{result:?}");
         assert!(
             data["diagnostics"]
                 .as_array()
@@ -1165,17 +3192,15 @@ pub(crate) mod actor_capacity_tests {
         assert!(result.ok, "{result:?}");
         let data = result.data.as_ref().expect("bootstrap data");
         assert_eq!(data["config"]["state"], "configured");
-        assert_eq!(data["ready"], false);
         assert_eq!(data["setup"]["path"], "v8project.yaml");
         assert_eq!(data["setup"]["content"], serde_json::Value::Null, "{data}");
         assert_eq!(data["setup"]["sourceSetExample"]["name"], "main");
         assert_eq!(data["setup"]["sourceSetExample"]["type"], "CONFIGURATION");
         assert_eq!(data["setup"]["sourceSetExample"]["path"], "src");
         assert!(workspace.path().join("v8project.yaml").is_file());
-        assert!(
-            std::fs::read_to_string(workspace.path().join("v8project.yaml"))
-                .unwrap()
-                .contains("workPath: .work")
+        assert_eq!(
+            std::fs::read(workspace.path().join("v8project.yaml")).unwrap(),
+            b"workPath: .work\nformat: DESIGNER\n"
         );
     }
 
@@ -1202,10 +3227,10 @@ pub(crate) mod actor_capacity_tests {
         assert!(git.success());
         let runtime = bootstrap_runtime();
 
-        let result = submit_bootstrap(&runtime, workspace.path(), serde_json::json!({}));
+        let result = submit_root_verdict(&runtime, workspace.path());
 
         assert!(result.ok, "{result:?}");
-        let data = result.data.as_ref().expect("bootstrap data");
+        let data = result.data.as_ref().expect("verdict data");
         assert_eq!(data["repositoryReady"], false, "{data}");
         assert!(data["checks"].is_array(), "{data}");
         assert!(data["diagnostics"].is_array(), "{data}");
@@ -1405,14 +3430,14 @@ pub(crate) mod actor_capacity_tests {
             let read = local_initializer(&method.block.stmts[2], "read")?;
             let read_args = call_arguments(
                 read,
-                "crate::infrastructure::v13_read_port::ProviderReadAuthority::new_with_revision_lease",
+                "crate::infrastructure::v13_read_port::ProviderReadAuthority::new_local_snapshot",
             )?;
             let expected_read_args = [
                 "self.binding.source_set_name()",
                 "self.identity.clone()",
                 "self.binding.source_kind()",
                 "self.binding.retained_root()",
-                "self.fence.revision()",
+                "self.read_identity.clone()",
             ];
             if read_args.len() != expected_read_args.len()
                 || read_args
@@ -1437,10 +3462,15 @@ pub(crate) mod actor_capacity_tests {
             };
             let authority_args = call_arguments(
                 authority,
-                "crate::infrastructure::v13_read::LogicalViewReadAuthority::with_read_authority",
+                "crate::infrastructure::v13_read::LogicalViewReadAuthority::with_read_authority_and_registration_cache",
             )?;
-            let expected_authority_args =
-                ["cancellation", "read", "platform_profile", "self.deadline"];
+            let expected_authority_args = [
+                "cancellation",
+                "read",
+                "platform_profile",
+                "self.deadline",
+                "Arc::clone(&self.registration_cache)",
+            ];
             if authority_args.len() != expected_authority_args.len()
                 || authority_args
                     .iter()
@@ -1448,7 +3478,7 @@ pub(crate) mod actor_capacity_tests {
                     .any(|(actual, expected)| !expression_is(actual, expected))
             {
                 return Err(format!(
-                    "logical authority must preserve cancellation/read/profile/deadline exactly; found `{}`",
+                    "logical authority must preserve cancellation/read/profile/deadline/actor-cache exactly; found `{}`",
                     tokens(authority)
                 ));
             }
@@ -1475,7 +3505,7 @@ pub(crate) mod actor_capacity_tests {
                 "validate_named_identity",
                 "read_immediate_names_bounded",
                 "retain_immediate_child_nofollow",
-                "read_bounded",
+                "open_named_identity_for_read",
                 "remaining",
                 "is_cancelled",
                 "match_starts",
@@ -1505,8 +3535,8 @@ pub(crate) mod actor_capacity_tests {
             for bound in [
                 "CANONICAL_SEARCH_MAX_ENTRIES",
                 "CANONICAL_SEARCH_MAX_DEPTH",
-                "CANONICAL_SEARCH_MAX_FILE_BYTES",
-                "CANONICAL_SEARCH_MAX_TOTAL_BYTES",
+                "CANONICAL_SEARCH_MAX_LINE_BYTES",
+                "read_search_line_bounded",
             ] {
                 if !body.contains(bound) {
                     return Err(format!("literal search must preserve the `{bound}` bound"));
@@ -2104,7 +4134,11 @@ pub(crate) mod actor_capacity_tests {
         let expected_construction_fields = std::collections::BTreeMap::from([
             ("binding", "source.binding.clone()"),
             ("deadline", "lease.deadline"),
-            ("fence", "source.fence.clone()"),
+            ("read_identity", "source.read_identity.clone()"),
+            (
+                "registration_cache",
+                "Arc::clone(&source.registration_cache)",
+            ),
             (
                 "identity",
                 "format!(\"{}:{}\", self.invocation.workspace_identity_hash.as_str(), source.binding.source_set_name())",
@@ -2118,7 +4152,7 @@ pub(crate) mod actor_capacity_tests {
             })
         {
             return Err(format!(
-                "actor capability construction must use exact binding/identity/fence/deadline dataflow; found `{}`",
+                "actor capability construction must use exact binding/identity/fence/deadline/actor-cache dataflow; found `{}`",
                 tokens(expression)
             ));
         }
@@ -2136,7 +4170,7 @@ pub(crate) mod actor_capacity_tests {
             return Err("actor read capability declaration must be exact daemon-visible with no derives or generics".to_string());
         }
         let syn::Fields::Named(named) = &declaration.fields else {
-            return Err("actor read capability must have four named private fields".to_string());
+            return Err("actor read capability must have five named private fields".to_string());
         };
         let mut actual_fields = std::collections::BTreeMap::new();
         for field in &named.named {
@@ -2153,8 +4187,12 @@ pub(crate) mod actor_capacity_tests {
         let expected_fields = std::collections::BTreeMap::from([
             ("binding".to_string(), "ProviderRootBinding".to_string()),
             ("deadline".to_string(), "ProviderDeadline".to_string()),
-            ("fence".to_string(), "WorkspaceLogicalReadFence".to_string()),
+            ("read_identity".to_string(), "String".to_string()),
             ("identity".to_string(), "String".to_string()),
+            (
+                "registration_cache".to_string(),
+                "Arc < RegistrationCache >".to_string(),
+            ),
         ]);
         if actual_fields != expected_fields {
             return Err(format!(
@@ -2190,9 +4228,21 @@ pub(crate) mod actor_capacity_tests {
             (
                 "source_kind",
                 (
-                    false,
+                    true,
                     "const fn source_kind(&self) -> SourceSetKind",
                     "self.binding.source_kind()",
+                ),
+            ),
+            // Аварийный мост строит справочник раскладки на том же корне, что
+            // читает `view`, поэтому корень стал видим соседям вместе с видом
+            // набора. Ни то, ни другое не даёт обойти учёт: это те же
+            // доказанные допуском значения.
+            (
+                "retained_root",
+                (
+                    true,
+                    "fn retained_root(&self,) -> Arc<RetainedDirectoryCapability>",
+                    "self.binding.retained_root()",
                 ),
             ),
             (
@@ -2232,14 +4282,14 @@ pub(crate) mod actor_capacity_tests {
                 (
                     true,
                     "fn revision_identity(&self) -> String",
-                    "self.fence.revision().revision_identity()",
+                    "self.read_identity.clone()",
                 ),
             ),
             (
                 "search_bsl_literal",
                 (
                     true,
-                    "fn search_bsl_literal(&self, matcher: &super::super::v13_read_modes::SearchMatcher, limit: usize, scope_prefix: Option<&str>, scope_at: &QualifiedAddress, cancellation: &CancellationToken,) -> Result<Vec<serde_json::Value>, String>",
+                    "fn search_bsl_literal(&self, matcher: &super::super::v13_read_modes::SearchMatcher, skip: &mut usize, limit: usize, scope_prefix: Option<&str>, scope_at: &QualifiedAddress, cancellation: &CancellationToken,) -> Result<LiteralSearchScan, String>",
                     "",
                 ),
             ),
@@ -3257,12 +5307,16 @@ struct ActorLogicalReadLease {"#,
                 "identity: String::from(\"caller-supplied\"),",
             ),
             (
-                "fence: source.fence.clone(),",
-                "fence: lease.sources[0].fence.clone(),",
+                "read_identity: source.read_identity.clone(),",
+                "read_identity: lease.sources[0].read_identity.clone(),",
             ),
             (
                 "deadline: lease.deadline,",
                 "deadline: ProviderDeadline::from_budget(LOGICAL_READ_OPERATION_BUDGET),",
+            ),
+            (
+                "registration_cache: Arc::clone(&source.registration_cache),",
+                "registration_cache: Arc::new(RegistrationCache::default()),",
             ),
         ];
         let mut accepted = Vec::new();
@@ -3334,9 +5388,13 @@ struct ActorLogicalReadLease {"#,
     fn actor_read_source_capability_ast_audit_rejects_hardcoded_source_kind() {
         let source = include_str!("invocation_service.rs");
         let hardcoded_kind = source.replacen(
-            "self.binding.source_kind(),\n                self.binding.retained_root(),",
-            "SourceSetKind::Configuration,\n                self.binding.retained_root(),",
+            "self.binding.source_kind(),\n            self.binding.retained_root(),",
+            "SourceSetKind::Configuration,\n            self.binding.retained_root(),",
             1,
+        );
+        assert_ne!(
+            hardcoded_kind, source,
+            "the hostile fixture must alter the local snapshot constructor"
         );
         assert!(
             audit_actor_read_source_capability_api(&hardcoded_kind).is_err(),
@@ -3461,85 +5519,6 @@ struct ActorLogicalReadLease {"#,
             Duration::from_secs(19),
             "the authority builder replenished the captured operation deadline"
         );
-    }
-
-    #[test]
-    pub(crate) fn actor_authenticated_source_architecture_names_complete_witnesses() {
-        // Запись называет сами проверки, а не агрегат над ними. Раньше здесь
-        // разбирался Rust: свидетель обязан был звать перечисленное. Звал он
-        // это вторым заходом, потому что харнесс уже прогнал каждую проверку
-        // отдельным тестом. Требование прежнее и проверяется там, где живёт
-        // обещание.
-        // Имя, встреченное в прозе записи, проверкой не является: смотрим
-        // только список под ключом во фронт-маттере.
-        fn declarations(record: &str, key: &str) -> Vec<String> {
-            // Запись читается с диска как есть, а на Windows `checkout` отдаёт
-            // её с CRLF. Разбор идёт построчно с обрезанным `\r`, иначе на
-            // одной из трёх ОС фронт-маттер просто не находится.
-            let mut lines = record.lines().map(str::trim_end);
-            assert_eq!(
-                lines.next(),
-                Some("---"),
-                "architecture record has front matter"
-            );
-            let front: Vec<&str> = lines.take_while(|line| *line != "---").collect();
-            let mut collecting = false;
-            let mut named = Vec::new();
-            for line in front {
-                if let Some(inline) = line.strip_prefix(key) {
-                    collecting = inline.trim().is_empty();
-                    if !collecting {
-                        named.push(inline.trim().to_owned());
-                    }
-                    continue;
-                }
-                match line.trim_start().strip_prefix("- ") {
-                    Some(entry) if collecting => named.push(entry.trim().to_owned()),
-                    _ => collecting = false,
-                }
-            }
-            named
-                .into_iter()
-                .filter_map(|entry| entry.rsplit_once("::").map(|(_, name)| name.to_owned()))
-                .collect()
-        }
-
-        let capability = declarations(
-            include_str!(
-                "../../../../../arch/invariants/INV.APP.ACTOR-AUTHENTICATED-SOURCE-CAPABILITIES.md"
-            ),
-            "check:",
-        );
-        for named in [
-            "actor_read_source_capability_is_sealed_after_binding",
-            "actor_read_authority_builder_rejects_actor_bound_unsupported_profile",
-            "actor_read_authority_builder_preserves_actor_bound_source_kind",
-            "actor_read_authority_builder_preserves_non_replenishing_deadline",
-            "provider_binding_and_actor_bound_invocation_cannot_substitute_kind_or_profile",
-        ] {
-            assert!(
-                capability.iter().any(|entry| entry == named),
-                "capability invariant omits the witness {named}"
-            );
-        }
-
-        let decision = declarations(
-            include_str!(
-                "../../../../../arch/decisions/2026-08-26-actor-authenticated-source-profile-slice.md"
-            ),
-            "realized:",
-        );
-        for named in [
-            "provider_binding_and_actor_bound_invocation_cannot_substitute_kind_or_profile",
-            "remapped_names_and_profiles_do_not_share_revision_index_or_coordination_state",
-            "duplicate_source_set_names_with_distinct_roots_are_rejected",
-            "actor_read_source_capability_is_sealed_after_binding",
-        ] {
-            assert!(
-                decision.iter().any(|entry| entry == named),
-                "decision omits the witness {named}"
-            );
-        }
     }
 
     #[test]
@@ -3710,9 +5689,9 @@ struct ActorLogicalReadLease {"#,
                 "props",
             ),
             (
-                ToolIdentity::Find,
-                serde_json::json!({"query": "Items"}),
-                "candidates",
+                ToolIdentity::Resolve,
+                serde_json::json!({"at": "main:Catalog.Items"}),
+                "path",
             ),
             (
                 ToolIdentity::Search,
@@ -3730,11 +5709,16 @@ struct ActorLogicalReadLease {"#,
                 }),
                 "matches",
             ),
-            (ToolIdentity::Check, serde_json::json!({}), "sources"),
+            (ToolIdentity::Check, serde_json::json!({}), "readinessState"),
             (
                 ToolIdentity::Check,
                 serde_json::json!({"at": "main:Catalog.Items"}),
                 "validators",
+            ),
+            (
+                ToolIdentity::Check,
+                serde_json::json!({"at": "main:Catalog.Items", "limit": 1}),
+                "diagnosticCount",
             ),
             (
                 ToolIdentity::Diff,
@@ -3759,7 +5743,6 @@ struct ActorLogicalReadLease {"#,
                 serde_json::json!({
                     "at": "main:Catalog.Items",
                     "ops": [{"op": "props.set", "args": {"values": {"Comment": "Preview"}}}],
-                    "dryRun": true
                 }),
                 "validated",
             ),
@@ -3791,17 +5774,18 @@ struct ActorLogicalReadLease {"#,
             .and_then(|data| data.get("operations"))
             .and_then(serde_json::Value::as_array)
             .expect("run dictionary has operations");
-        assert_eq!(
+        // Проектный файл заводит человек, поэтому операции с таким именем в
+        // словаре нет вовсе — ни реализованной, ни объявленной.
+        assert!(
             operations
                 .iter()
-                .find(|operation| operation["op"] == "workspace.initialize")
-                .and_then(|operation| operation["implemented"].as_bool()),
-            Some(true)
+                .all(|operation| operation["op"] != "workspace.initialize"),
+            "{operations:?}"
         );
         assert!(
             operations.iter().all(|operation| !matches!(
                 operation["op"].as_str(),
-                Some("syntax.check" | "test.run" | "query.execute")
+                Some("syntax.check" | "test.run" | "query.execute" | "source.create")
             )),
             "v0.13 Run discovery must omit deferred check/test/query execution: {operations:?}"
         );
@@ -3822,7 +5806,56 @@ struct ActorLogicalReadLease {"#,
                 .contains("<Comment>Preview</Comment>"),
             "dryRun must use the real planner without publishing its postimage"
         );
-        let published_apply = call(
+        // Второй свод того же вопроса: имена и синонимы метаданных. Ответ
+        // несёт `at`, `kind`, `title` — доказательство совпадения по имени, —
+        // и по-прежнему ни одного пути.
+        let by_name = call(
+            ToolIdentity::Search,
+            serde_json::json!({"query": "Items", "corpus": "names"}),
+        );
+        assert!(by_name.ok, "{by_name:?}");
+        let named = &by_name.data.as_ref().unwrap()["matches"][0];
+        assert_eq!(named["at"], "main:Catalog.Items");
+        assert!(named.get("kind").is_some(), "{named}");
+        assert!(
+            named.get("path").is_none() && named.get("file").is_none(),
+            "путь в частом ответе зовёт обойти адресное пространство: {named}"
+        );
+        assert_eq!(
+            by_name.data.as_ref().unwrap()["approximate"],
+            serde_json::json!(false),
+            "точное совпадение догадкой не является: {by_name:?}"
+        );
+
+        // Терпимость к опечатке переехала сюда из локатора и названа явно:
+        // читатель обязан отличать «нашлось» от «похоже на».
+        let mistyped = call(
+            ToolIdentity::Search,
+            serde_json::json!({"query": "Itmes", "corpus": "names"}),
+        );
+        assert!(mistyped.ok, "{mistyped:?}");
+        assert_eq!(
+            mistyped.data.as_ref().unwrap()["approximate"],
+            serde_json::json!(true),
+            "совпадение по близости обязано называться догадкой: {mistyped:?}"
+        );
+
+        let unknown_corpus = call(
+            ToolIdentity::Search,
+            serde_json::json!({"query": "Items", "corpus": "paths"}),
+        );
+        assert_eq!(unknown_corpus.diagnostics[0]["code"], "bad_value");
+        assert!(
+            unknown_corpus
+                .next
+                .iter()
+                .any(|entry| entry["args"]["corpus"] == "names"),
+            "отказ обязан назвать доступный свод: {unknown_corpus:?}"
+        );
+
+        // Применение связано с предпросмотром забором ревизии, поэтому путь
+        // через провод всегда двухшаговый.
+        let previewed_apply = call(
             ToolIdentity::Apply,
             serde_json::json!({
                 "at": "main:Catalog.Items",
@@ -3830,8 +5863,12 @@ struct ActorLogicalReadLease {"#,
                     "op": "props.set",
                     "args": {"values": {"Comment": "Published through v0.13"}}
                 }],
-                "dryRun": false
             }),
+        );
+        assert!(previewed_apply.ok, "{previewed_apply:?}");
+        let published_apply = call(
+            ToolIdentity::Apply,
+            serde_json::json!({"executionToken": previewed_apply.data.as_ref().unwrap()["executionToken"]}),
         );
         assert!(
             published_apply.ok,
@@ -3859,7 +5896,6 @@ struct ActorLogicalReadLease {"#,
                     },
                     {"op": "object.create", "args": {"values": {"kind": "Catalog", "name": "Ghost"}}}
                 ],
-                "dryRun": false
             }),
         );
         // `object.create` addresses the configuration root, so naming it on
@@ -3876,10 +5912,18 @@ struct ActorLogicalReadLease {"#,
                 serde_json::json!({"op": "syntax.check", "args": {"mode": "shell"}}),
                 "unsupported_operation",
             ),
+            // `launch` реализован: пустые аргументы — ошибка вызова, а не
+            // нереализованная операция.
             (
                 ToolIdentity::Run,
-                serde_json::json!({"op": "client.run", "args": {}}),
-                "unsupported_operation",
+                serde_json::json!({"op": "launch", "args": {}}),
+                "bad_value",
+            ),
+            // `make` реализован: пустые аргументы — ошибка вызова.
+            (
+                ToolIdentity::Run,
+                serde_json::json!({"op": "make", "args": {}}),
+                "bad_value",
             ),
             (
                 ToolIdentity::Run,
@@ -3899,8 +5943,7 @@ struct ActorLogicalReadLease {"#,
                 }),
                 "unsupported_scope",
             ),
-            // `check` takes only `at`: the validators of a node follow from
-            // its kind, so any filter is an unknown argument.
+            // Validator selection follows the node kind, not a caller filter.
             (
                 ToolIdentity::Check,
                 serde_json::json!({"filter": {"severity": "warning"}}),
@@ -3970,7 +6013,7 @@ struct ActorLogicalReadLease {"#,
 
     /// INV.WIRE.V13-REFUSAL-CHANNEL: every canonical refusal answers through
     /// `diagnostics[0]` with a code from the closed set and a message; a stale
-    /// `ifRev` has its own conflict code instead of `provider_unavailable`;
+    /// saved apply plan has its own conflict code instead of `provider_unavailable`;
     /// and an admitted logical scope without a source subtree is an empty
     /// result rather than a refusal or a raw OS error.
     #[test]
@@ -4043,19 +6086,16 @@ struct ActorLogicalReadLease {"#,
                 ToolIdentity::Apply,
                 serde_json::json!({
                     "at": "main:Catalog.Bare",
-                    "ops": [{"op": "frobnicate"}]
+                    "ops": [{"op": "frobnicate"}],
                 }),
                 "unsupported_operation",
             ),
             (
                 ToolIdentity::Apply,
                 serde_json::json!({
-                    "at": "main:Catalog.Bare",
-                    "ops": [{"op": "props.set", "args": {"values": {"Comment": "x"}}}],
-                    "dryRun": true,
-                    "ifRev": "unica-source-sha256-v1:0:stale"
+                    "executionToken": "unknown-plan"
                 }),
-                "stale_revision",
+                "bad_value",
             ),
             (
                 ToolIdentity::Run,
@@ -4084,7 +6124,6 @@ struct ActorLogicalReadLease {"#,
                 serde_json::json!({
                     "at": "main:Catalog.Bare",
                     "ops": [{"op": "props.set", "args": {"props": {"Comment": "x"}}}],
-                    "dryRun": true
                 }),
                 "bad_value",
             ),
@@ -4129,20 +6168,40 @@ struct ActorLogicalReadLease {"#,
             );
         }
 
-        let stale = call(
+        let current = call(
+            ToolIdentity::View,
+            serde_json::json!({"at": "main:Catalog.Bare"}),
+        );
+        assert!(current.ok, "{current:?}");
+        assert!(current.rev.is_none(), "reads do not carry an apply fence");
+        let planned = call(
             ToolIdentity::Apply,
             serde_json::json!({
                 "at": "main:Catalog.Bare",
-                "ops": [{"op": "props.set", "args": {"values": {"Comment": "x"}}}],
-                "dryRun": true,
-                "ifRev": "unica-source-sha256-v1:0:stale"
+                "ops": [{"op": "props.set", "args": {"values": {"Comment": "x"}}}]
             }),
         );
-        let stale_message = stale.diagnostics[0]["message"].as_str().unwrap();
-        assert!(
-            stale_message.contains("expected") && stale_message.contains("admitted"),
-            "the conflict names both revisions for recovery: {stale_message}"
+        assert!(planned.ok, "{planned:?}");
+        let bare_path = source.join("Catalogs/Bare.xml");
+        let previous = std::fs::read_to_string(&bare_path).unwrap();
+        std::fs::write(
+            &bare_path,
+            previous.replace("<Comment/>", "<Comment>external change</Comment>"),
+        )
+        .unwrap();
+        let updated = call(
+            ToolIdentity::View,
+            serde_json::json!({"at": "main:Catalog.Bare"}),
         );
+        let stale = call(
+            ToolIdentity::Apply,
+            serde_json::json!({"executionToken": planned.data.as_ref().unwrap()["executionToken"]}),
+        );
+        assert!(!stale.ok, "{stale:?}");
+        assert_eq!(stale.diagnostics[0]["code"], "stale_revision");
+        let stale_message = stale.diagnostics[0]["message"].as_str().unwrap();
+        assert!(!stale_message.is_empty());
+        assert!(updated.ok && updated.rev.is_none(), "{updated:?}");
 
         let bare_scope = call(
             ToolIdentity::Search,
@@ -4218,7 +6277,6 @@ struct ActorLogicalReadLease {"#,
             serde_json::json!({
                 "at": "main:Catalog.Bare",
                 "ops": [{"op": "props.set", "args": {"props": {"Comment": "x"}}}],
-                "dryRun": true
             }),
         );
         assert!(
@@ -4247,7 +6305,6 @@ struct ActorLogicalReadLease {"#,
             serde_json::json!({
                 "at": "main:Catalog.Bare",
                 "ops": [{"op": "object.levitate", "args": {"values": {}}}],
-                "dryRun": true
             }),
         );
         assert_eq!(
@@ -4271,7 +6328,6 @@ struct ActorLogicalReadLease {"#,
             serde_json::json!({
                 "at": "main:Catalog.Bare",
                 "ops": [{"op": "enumValue.add", "args": {"items": []}}],
-                "dryRun": true
             }),
         );
         assert!(
@@ -4366,6 +6422,331 @@ struct ActorLogicalReadLease {"#,
         (workspace, source)
     }
 
+    fn v13_runtime_for_borrowing_test() -> V5CanonicalInvocationRuntime {
+        V5CanonicalInvocationRuntime::new(canonical_v13_service(), Arc::new(TokioClock))
+    }
+
+    fn borrowing_view_fixture(parent_state: &str) -> tempfile::TempDir {
+        let (workspace, source) = source_selection_read_fixture();
+        let extension = workspace.path().join("ext");
+        std::fs::create_dir_all(extension.join("Catalogs")).unwrap();
+        let config = std::fs::read_to_string(source.join("Configuration.xml")).unwrap();
+        std::fs::write(extension.join("Configuration.xml"), config.replace("<Name>Store</Name>", "<ObjectBelonging>Adopted</ObjectBelonging><Name>Extension</Name><NamePrefix>Ext_</NamePrefix>")).unwrap();
+        std::fs::write(extension.join("Catalogs/Items.xml"), r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Catalog uuid="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"><Properties><ObjectBelonging>Adopted</ObjectBelonging><Name>Items</Name><ExtendedConfigurationObject>aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa</ExtendedConfigurationObject></Properties><ChildObjects/></Catalog></MetaDataObject>"#).unwrap();
+        let mut yaml = "format: DESIGNER\nsource-set:\n  - name: parent\n    type: CONFIGURATION\n    path: src\n  - name: ext\n    type: EXTENSION\n    path: ext\n".to_string();
+        if parent_state == "duplicate" {
+            std::fs::create_dir_all(workspace.path().join("copy/Catalogs")).unwrap();
+            std::fs::copy(
+                source.join("Configuration.xml"),
+                workspace.path().join("copy/Configuration.xml"),
+            )
+            .unwrap();
+            std::fs::copy(
+                source.join("Catalogs/Items.xml"),
+                workspace.path().join("copy/Catalogs/Items.xml"),
+            )
+            .unwrap();
+            yaml.push_str("  - name: copy\n    type: CONFIGURATION\n    path: copy\n");
+        } else if parent_state == "missing_second" {
+            yaml.push_str("  - name: missing\n    type: CONFIGURATION\n    path: absent\n");
+        } else if parent_state == "unregistered" {
+            std::fs::write(
+                source.join("Configuration.xml"),
+                config.replace("<Catalog>Items</Catalog>", ""),
+            )
+            .unwrap();
+        } else if parent_state == "different_uuid" {
+            let path = source.join("Catalogs/Items.xml");
+            let text = std::fs::read_to_string(&path).unwrap().replace(
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            );
+            std::fs::write(path, text).unwrap();
+        }
+        std::fs::write(workspace.path().join("v8project.yaml"), yaml).unwrap();
+        workspace
+    }
+
+    #[test]
+    fn borrowing_view_resolves_registered_parent_and_preserves_unresolved_extension_facts() {
+        for (case, expected) in [
+            ("normal", "resolved"),
+            ("duplicate", "ambiguous"),
+            ("missing_second", "unavailable"),
+            ("unregistered", "not_found"),
+            ("different_uuid", "not_found"),
+        ] {
+            let workspace = borrowing_view_fixture(case);
+            let runtime = v13_runtime_for_borrowing_test();
+            let result = submit_canonical(
+                &runtime,
+                workspace.path(),
+                ToolIdentity::View,
+                serde_json::json!({"at":"ext:Catalog.Items"}),
+            );
+            assert!(result.ok, "{case}: {result:?}");
+            let props = &result.data.as_ref().unwrap()["props"];
+            assert_eq!(props["belonging"], "borrowed", "{case}");
+            assert_eq!(props["parentStatus"], expected, "{case}: {result:?}");
+            if expected == "resolved" {
+                assert_eq!(props["extends"], "parent:Catalog.Items");
+                let filtered = submit_canonical(
+                    &runtime,
+                    workspace.path(),
+                    ToolIdentity::View,
+                    serde_json::json!({"at":"ext:Catalog.Items","filter":{"sections":["props"]}}),
+                );
+                assert!(filtered.ok, "filtered borrowed view: {filtered:?}");
+                assert_eq!(
+                    filtered.data.as_ref().unwrap()["props"]["extends"],
+                    "parent:Catalog.Items",
+                );
+                let parent = submit_canonical(
+                    &runtime,
+                    workspace.path(),
+                    ToolIdentity::View,
+                    serde_json::json!({"at":props["extends"]}),
+                );
+                assert!(parent.ok, "parent must be readable: {parent:?}");
+            } else {
+                assert!(
+                    props.get("extends").is_none(),
+                    "{case}: never guess a parent"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn borrowing_view_bounds_override_props_for_metadata_and_specialized_readers() {
+        for (kind, directory) in [("Catalog", "Catalogs"), ("CommonModule", "CommonModules")] {
+            let workspace = borrowing_view_fixture("normal");
+            let states = (0..300).map(|index| format!("<xr:PropertyState><xr:Property>Property{index:04}</xr:Property><xr:State>Notify</xr:State></xr:PropertyState>")).collect::<String>();
+            for source in ["src", "ext"] {
+                let root = workspace.path().join(source);
+                let owner = root.join("Configuration.xml");
+                let config = std::fs::read_to_string(&owner)
+                    .unwrap()
+                    .replace("Catalog>", &format!("{kind}>"));
+                std::fs::write(owner, config).unwrap();
+                let original = root.join("Catalogs/Items.xml");
+                let mut xml = std::fs::read_to_string(&original)
+                    .unwrap()
+                    .replace("Catalog ", &format!("{kind} "))
+                    .replace("</Catalog>", &format!("</{kind}>"));
+                if kind == "CommonModule" {
+                    std::fs::create_dir_all(root.join("CommonModules/Items/Ext")).unwrap();
+                    std::fs::write(root.join("CommonModules/Items/Ext/Module.bsl"), "").unwrap();
+                    let privileged = if source == "src" {
+                        "<Privileged>false</Privileged>"
+                    } else {
+                        ""
+                    };
+                    xml = xml.replace("</Properties>", &format!("<Global>false</Global><ClientManagedApplication>false</ClientManagedApplication><Server>true</Server><ExternalConnection>false</ExternalConnection><ClientOrdinaryApplication>false</ClientOrdinaryApplication><ServerCall>false</ServerCall>{privileged}<ReturnValuesReuse>DontUse</ReturnValuesReuse></Properties>"));
+                }
+                if source == "ext" {
+                    xml = xml
+                        .replace(
+                            "<MetaDataObject ",
+                            "<MetaDataObject xmlns:xr=\"http://v8.1c.ru/8.3/xcf/readable\" ",
+                        )
+                        .replace(
+                            "<Properties>",
+                            &format!("<InternalInfo>{states}</InternalInfo><Properties>"),
+                        );
+                }
+                std::fs::create_dir_all(root.join(directory)).unwrap();
+                std::fs::write(root.join(directory).join("Items.xml"), xml).unwrap();
+            }
+            let runtime = v13_runtime_for_borrowing_test();
+            let result = submit_canonical(
+                &runtime,
+                workspace.path(),
+                ToolIdentity::View,
+                serde_json::json!({"at":format!("ext:{kind}.Items")}),
+            );
+            assert!(result.ok, "{kind}: {result:?}");
+            let props = &result.data.as_ref().unwrap()["props"];
+            assert_eq!(props["overridesCount"], 300, "{kind}: {result:?}");
+            assert_eq!(props["overridesComplete"], false, "{kind}: {result:?}");
+            assert!(
+                props.get("overrides").is_none(),
+                "oversized scalar must not escape: {kind}"
+            );
+            assert_eq!(
+                props["extends"],
+                format!("parent:{kind}.Items"),
+                "{result:?}"
+            );
+            if kind == "CommonModule" {
+                assert_eq!(props["commonModule"]["privileged"], serde_json::Value::Null);
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_object_borrow_previews_publishes_and_rejects_changed_parent_revision() {
+        let workspace = borrowing_view_fixture("normal");
+        let owner = workspace.path().join("ext/Configuration.xml");
+        let config = std::fs::read_to_string(&owner).unwrap();
+        std::fs::write(&owner, config.replace("<Catalog>Items</Catalog>", "")).unwrap();
+        std::fs::remove_file(workspace.path().join("ext/Catalogs/Items.xml")).unwrap();
+        let runtime = v13_runtime_for_borrowing_test();
+        let skill = include_str!("../../../../../plugins/unica/skills/cfe-borrow/SKILL.md");
+        let parse_examples = |source: &str| {
+            source
+                .split("```json")
+                .skip(1)
+                .map(|block| {
+                    serde_json::from_str::<serde_json::Value>(block.split("```").next().unwrap())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let examples = parse_examples(skill);
+        let windows_skill = skill.replace("\r\n", "\n").replace('\n', "\r\n");
+        assert_eq!(examples, parse_examples(&windows_skill));
+        assert_eq!(
+            examples.len(),
+            2,
+            "the skill must keep both public examples"
+        );
+        let preview_args = examples[0]["params"]["arguments"].clone();
+        let preview = submit_canonical(
+            &runtime,
+            workspace.path(),
+            ToolIdentity::Apply,
+            preview_args.clone(),
+        );
+        assert!(preview.ok, "{preview:?}");
+        assert!(!workspace.path().join("ext/Catalogs/Items.xml").exists());
+        let mut apply_args =
+            serde_json::json!({"executionToken": preview.data.as_ref().unwrap()["executionToken"]});
+        let parent = workspace.path().join("src/Catalogs/Items.xml");
+        let text = std::fs::read_to_string(&parent).unwrap();
+        std::fs::write(
+            &parent,
+            text.replace(
+                "<Name>Items</Name>",
+                "<Name>Items</Name><Comment>changed</Comment>",
+            ),
+        )
+        .unwrap();
+        let stale = submit_canonical(
+            &runtime,
+            workspace.path(),
+            ToolIdentity::Apply,
+            apply_args.clone(),
+        );
+        assert!(!stale.ok, "parent change must invalidate preview");
+        assert!(
+            stale
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "stale_revision"),
+            "{stale:?}"
+        );
+        assert!(!workspace.path().join("ext/Catalogs/Items.xml").exists());
+        let preview = submit_canonical(
+            &runtime,
+            workspace.path(),
+            ToolIdentity::Apply,
+            preview_args.clone(),
+        );
+        assert!(preview.ok, "{preview:?}");
+        apply_args["executionToken"] = preview.data.as_ref().unwrap()["executionToken"].clone();
+        let applied = submit_canonical(&runtime, workspace.path(), ToolIdentity::Apply, apply_args);
+        assert!(applied.ok, "{applied:?}");
+        let read = submit_canonical(
+            &runtime,
+            workspace.path(),
+            ToolIdentity::View,
+            examples[1]["params"]["arguments"].clone(),
+        );
+        assert!(read.ok, "{read:?}");
+        assert_eq!(
+            read.data.as_ref().unwrap()["props"]["extends"],
+            "parent:Catalog.Items"
+        );
+        let repeat = submit_canonical(
+            &runtime,
+            workspace.path(),
+            ToolIdentity::Apply,
+            preview_args,
+        );
+        assert!(repeat.ok, "{repeat:?}");
+        assert!(
+            repeat.changed.is_empty(),
+            "unchanged repeat is not an update"
+        );
+    }
+
+    #[test]
+    fn borrowing_view_publishes_saved_parent_facts_and_new_read_rechecks_parent() {
+        let workspace = borrowing_view_fixture("normal");
+        let runtime = v13_runtime_for_borrowing_test();
+        let request = InvocationRequest::new(
+            ToolIdentity::View,
+            serde_json::json!({"at":"ext:Catalog.Items"}),
+            std::fs::canonicalize(workspace.path())
+                .unwrap()
+                .to_string_lossy(),
+            7_000,
+        )
+        .unwrap();
+        let invocation = bind_workspace_invocation(
+            &request,
+            &runtime.workspace_actors,
+            Arc::clone(&runtime.deliveries),
+            Arc::clone(&runtime.provider_hosts),
+            Arc::clone(&runtime.runtime_resources),
+            None,
+            runtime.capture_response_deadline_for_test(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let execution = invocation.begin_execution(&cancellation).unwrap();
+        let result = canonical_v13_service()
+            .execute(&execution, cancellation.clone())
+            .unwrap();
+        assert_eq!(
+            result.data.as_ref().unwrap()["props"]["parentStatus"],
+            "resolved"
+        );
+        let parent = workspace.path().join("src/Catalogs/Items.xml");
+        let text = std::fs::read_to_string(&parent).unwrap().replace(
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        );
+        std::fs::write(parent, text).unwrap();
+        let published = execution
+            .publish(Ok(result), &cancellation)
+            .unwrap()
+            .unwrap();
+        assert!(published.ok, "{published:?}");
+        assert_eq!(
+            published.data.as_ref().unwrap()["props"]["parentStatus"],
+            "resolved"
+        );
+        assert_eq!(
+            published.data.as_ref().unwrap()["props"]["extends"],
+            "parent:Catalog.Items"
+        );
+        let current = submit_canonical(
+            &runtime,
+            workspace.path(),
+            ToolIdentity::View,
+            serde_json::json!({"at":"ext:Catalog.Items"}),
+        );
+        assert!(current.ok, "{current:?}");
+        let props = &current.data.as_ref().unwrap()["props"];
+        assert_eq!(props["parentStatus"], "not_found", "{current:?}");
+        assert!(
+            props.get("extends").is_none(),
+            "a new read must not reuse the old parent proof"
+        );
+    }
+
     #[test]
     pub(crate) fn view_find_admitted_snapshot_may_finish_after_map_change() {
         let (workspace, source) = source_selection_read_fixture();
@@ -4402,7 +6783,10 @@ struct ActorLogicalReadLease {"#,
             ToolIdentity::View,
             serde_json::json!({"at": "main:Catalog.Items"}),
         );
-        let find_request = request(ToolIdentity::Find, serde_json::json!({"query": "Items"}));
+        let find_request = request(
+            ToolIdentity::Resolve,
+            serde_json::json!({"path": "src/Catalogs/Items.xml"}),
+        );
         let view = bind(&view_request);
         let find = bind(&find_request);
         assert!(Arc::ptr_eq(view.actor_for_test(), find.actor_for_test()));
@@ -4537,7 +6921,6 @@ struct ActorLogicalReadLease {"#,
             serde_json::json!({
                 "at": "main:Configuration",
                 "ops": [{"op": "object.create", "args": {}}],
-                "dryRun": false,
             }),
             std::fs::canonicalize(workspace.path())
                 .unwrap()
@@ -4630,6 +7013,7 @@ struct ActorLogicalReadLease {"#,
             "at": "main:Document.Order",
             "ops": [{"op": "props.set", "args": {"values": {"Comment": "forbidden"}}}],
             "dryRun": false,
+            "ifRev": "unica-source-sha256-v1:1:ignored-before-admission",
         });
         let request = crate::application::v13::apply::parse_request(
             apply_arguments.as_object().unwrap(),
@@ -4694,14 +7078,16 @@ struct ActorLogicalReadLease {"#,
             Arc::new(TokioClock),
         );
         let workspace_hint = std::fs::canonicalize(workspace.path()).unwrap();
-        let call = |dry_run: bool| {
+        let call = |token: Option<&str>| {
+            let arguments = match token {
+                None => {
+                    serde_json::json!({"at": "main:Document.Order", "ops": [{"op": "object.remove", "args": {}}]})
+                }
+                Some(token) => serde_json::json!({"executionToken": token}),
+            };
             let request = InvocationRequest::new(
                 ToolIdentity::Apply,
-                serde_json::json!({
-                    "at": "main:Document.Order",
-                    "ops": [{"op": "object.remove", "args": {}}],
-                    "dryRun": dry_run,
-                }),
+                arguments,
                 workspace_hint.to_string_lossy(),
                 7_000,
             )
@@ -4726,15 +7112,353 @@ struct ActorLogicalReadLease {"#,
                 change.get("at").and_then(serde_json::Value::as_str) == Some("main:Document.Order")
             }));
         };
-        let preview = call(true);
+        let preview = call(None);
         assert!(
             descriptor.is_file(),
             "preview must not remove the descriptor"
         );
         assert_cache_impact(&preview, "preview");
-        let published = call(false);
+        let published = call(Some(
+            preview.data.as_ref().unwrap()["executionToken"]
+                .as_str()
+                .unwrap(),
+        ));
         assert!(!descriptor.exists(), "publication removes the descriptor");
         assert_cache_impact(&published, "published");
+    }
+
+    #[test]
+    fn saved_apply_more_than_256_plans_keep_earlier_tokens_without_writes() {
+        let workspace = subsystem_picture_workspace("", true);
+        let source = workspace.path().join("src");
+        let before = crate::test_support::tree_snapshot(&source);
+        let runtime = bootstrap_runtime();
+        let arguments = serde_json::json!({
+            "at": "main:Subsystem.Sales",
+            "ops": [{"op": "props.set", "args": {"values": {"Comment": "capacity probe"}}}]
+        });
+        let mut first_token = None;
+        for _ in 0..256 {
+            let plan = submit_canonical(
+                &runtime,
+                workspace.path(),
+                ToolIdentity::Apply,
+                arguments.clone(),
+            );
+            assert!(plan.ok, "{plan:?}");
+            first_token
+                .get_or_insert_with(|| plan.data.as_ref().unwrap()["executionToken"].clone());
+        }
+        let additional =
+            submit_canonical(&runtime, workspace.path(), ToolIdentity::Apply, arguments);
+        assert!(additional.ok, "{additional:?}");
+        assert!(additional
+            .data
+            .as_ref()
+            .and_then(|data| data.get("executionToken"))
+            .is_some());
+        assert_eq!(crate::test_support::tree_snapshot(&source), before);
+        let executed = submit_canonical(
+            &runtime,
+            workspace.path(),
+            ToolIdentity::Apply,
+            serde_json::json!({"executionToken": first_token.unwrap()}),
+        );
+        assert!(executed.ok, "{executed:?}");
+        assert!(std::fs::read_to_string(source.join("Subsystems/Sales.xml"))
+            .unwrap()
+            .contains("capacity probe"));
+    }
+
+    /// Два плана на одной ревизии: второй не должен уничтожить первый.
+    ///
+    /// Это единственное место контракта, где ошибка невидима. Замер до правки:
+    /// оба применения проходили, и запись первого агента исчезала без единой
+    /// диагностики — потерянное обновление в чистом виде. Пример на один план
+    /// такого не показывает, поэтому сценарий строится на двух.
+    #[test]
+    fn conflicting_preview_plans_cannot_both_publish() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("src");
+        std::fs::create_dir_all(source.join("Documents")).unwrap();
+        std::fs::write(
+            workspace.path().join("v8project.yaml"),
+            "format: DESIGNER\nsource-set:\n  - name: main\n    type: CONFIGURATION\n    path: src\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("Configuration.xml"),
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Configuration><Properties><Name>Store</Name></Properties><ChildObjects><Document>Order</Document></ChildObjects></Configuration></MetaDataObject>"#,
+        )
+        .unwrap();
+        let descriptor = source.join("Documents/Order.xml");
+        std::fs::write(
+            &descriptor,
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:app="http://v8.1c.ru/8.2/managed-application/core" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.20"><Document uuid="11111111-1111-4111-8111-111111111111"><Properties><Name>Order</Name><Synonym/><Comment/></Properties><ChildObjects/></Document></MetaDataObject>"#,
+        )
+        .unwrap();
+        let runtime = V5CanonicalInvocationRuntime::new(
+            Arc::new(
+                crate::infrastructure::daemon::v13_service::CanonicalV13ReadService::default(),
+            ),
+            Arc::new(TokioClock),
+        );
+        let workspace_hint = std::fs::canonicalize(workspace.path()).unwrap();
+        let call = |arguments| {
+            let request = InvocationRequest::new(
+                ToolIdentity::Apply,
+                arguments,
+                workspace_hint.to_string_lossy(),
+                7_000,
+            )
+            .unwrap();
+            direct_v5(&runtime, request).unwrap()
+        };
+        let plan = |comment: &str| {
+            serde_json::json!({
+                "at": "main:Document.Order",
+                "ops": [{"op": "props.set", "args": {"values": {"Comment": comment}}}],
+            })
+        };
+        let preview = |comment: &str| {
+            let result = call(plan(comment));
+            assert!(result.ok, "{result:?}");
+            (
+                result.rev.unwrap(),
+                result.data.as_ref().unwrap()["executionToken"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            )
+        };
+        let publish = |token: &str| call(serde_json::json!({"executionToken": token}));
+
+        // Оба агента планируют по одному и тому же состоянию исходников.
+        let first_fence = preview("от первого");
+        let second_fence = preview("от второго");
+        assert_ne!(
+            first_fence.0, second_fence.0,
+            "distinct plans bind distinct postimages"
+        );
+        // Changes outside the plan inputs do not invalidate its preview.
+        std::fs::write(source.join("unrelated.bsl"), "unrelated change").unwrap();
+        let mixed = call(
+            serde_json::json!({"executionToken": first_fence.1, "at": "main:Document.Order", "ops": plan("подмена операции")["ops"]}),
+        );
+        assert!(
+            !mixed.ok && mixed.diagnostics[0]["code"] == "bad_value",
+            "{mixed:?}"
+        );
+
+        let first = publish(&first_fence.1);
+        assert!(first.ok, "{first:?}");
+        assert!(std::fs::read_to_string(&descriptor)
+            .unwrap()
+            .contains("от первого"));
+
+        // Второй план опоздал. До правки он публиковался и уничтожал первую
+        // запись; теперь он назван устаревшим, и правка первого цела.
+        let second = publish(&second_fence.1);
+        assert!(!second.ok, "{second:?}");
+        assert_eq!(second.diagnostics[0]["code"], "stale_revision");
+        let published = std::fs::read_to_string(&descriptor).unwrap();
+        assert!(published.contains("от первого"), "{published}");
+        assert!(!published.contains("от второго"), "{published}");
+
+        // Забор не бывает необязательным: применение без него отказывает до
+        // всякой записи, а не полагается на дисциплину вызывающего.
+        let mut unfenced = plan("без забора");
+        unfenced["dryRun"] = serde_json::Value::Bool(false);
+        let refused = call(unfenced);
+        assert!(!refused.ok, "{refused:?}");
+        assert_eq!(refused.diagnostics[0]["code"], "bad_value");
+        assert!(refused.diagnostics[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("dryRun"));
+        assert_eq!(std::fs::read_to_string(&descriptor).unwrap(), published);
+
+        // Второй агент перечитывает ревизию и повторяет план — это и есть
+        // названный путь восстановления.
+        let retry_fence = preview("от второго");
+        assert_ne!(retry_fence, second_fence);
+        let retry = publish(&retry_fence.1);
+        assert!(retry.ok, "{retry:?}");
+        assert!(std::fs::read_to_string(&descriptor)
+            .unwrap()
+            .contains("от второго"));
+
+        let committed = crate::test_support::tree_snapshot(&source);
+        let replay = publish(&retry_fence.1);
+        assert_eq!(
+            serde_json::to_value(&retry).unwrap(),
+            serde_json::to_value(&replay).unwrap()
+        );
+        assert_eq!(crate::test_support::tree_snapshot(&source), committed);
+
+        let pending = preview("после перезапуска");
+        let restarted = V5CanonicalInvocationRuntime::new(
+            Arc::new(
+                crate::infrastructure::daemon::v13_service::CanonicalV13ReadService::default(),
+            ),
+            Arc::new(TokioClock),
+        );
+        let unavailable = submit_canonical(
+            &restarted,
+            workspace.path(),
+            ToolIdentity::Apply,
+            serde_json::json!({"executionToken": pending.1}),
+        );
+        assert!(
+            !unavailable.ok,
+            "another actor must not reconstruct a lost plan"
+        );
+        assert_eq!(crate::test_support::tree_snapshot(&source), committed);
+        let fresh = submit_canonical(
+            &restarted,
+            workspace.path(),
+            ToolIdentity::Apply,
+            plan("после перезапуска"),
+        );
+        assert!(fresh.ok, "{fresh:?}");
+        assert_ne!(
+            fresh.data.as_ref().unwrap()["executionToken"],
+            serde_json::json!(pending.1)
+        );
+        let executed = submit_canonical(
+            &restarted,
+            workspace.path(),
+            ToolIdentity::Apply,
+            serde_json::json!({"executionToken": fresh.data.as_ref().unwrap()["executionToken"]}),
+        );
+        assert!(executed.ok, "{executed:?}");
+        assert!(std::fs::read_to_string(&descriptor)
+            .unwrap()
+            .contains("после перезапуска"));
+    }
+
+    #[test]
+    fn canonical_apply_view_round_trip_common_module_ordinary_client() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("src");
+        std::fs::create_dir_all(source.join("CommonModules/OrdinaryClient/Ext")).unwrap();
+        std::fs::create_dir_all(source.join("Documents")).unwrap();
+        std::fs::write(
+            workspace.path().join("v8project.yaml"),
+            "format: DESIGNER\nsource-set:\n  - name: main\n    type: CONFIGURATION\n    path: src\n",
+        ).unwrap();
+        std::fs::write(
+            source.join("Configuration.xml"),
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Configuration><Properties><Name>Store</Name></Properties><ChildObjects><CommonModule>OrdinaryClient</CommonModule><Document>Order</Document></ChildObjects></Configuration></MetaDataObject>"#,
+        ).unwrap();
+        let descriptor = source.join("CommonModules/OrdinaryClient.xml");
+        std::fs::write(
+            &descriptor,
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><CommonModule uuid="11111111-1111-4111-8111-111111111111"><Properties><Name>OrdinaryClient</Name><Synonym/><Comment/><Global>false</Global><ClientManagedApplication>false</ClientManagedApplication><Server>true</Server><ExternalConnection>false</ExternalConnection><ClientOrdinaryApplication>false</ClientOrdinaryApplication><ServerCall>true</ServerCall><Privileged>false</Privileged><ReturnValuesReuse>DontUse</ReturnValuesReuse></Properties></CommonModule></MetaDataObject>"#,
+        ).unwrap();
+        std::fs::write(
+            source.join("CommonModules/OrdinaryClient/Ext/Module.bsl"),
+            "",
+        )
+        .unwrap();
+        let document = source.join("Documents/Order.xml");
+        std::fs::write(
+            &document,
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Document uuid="22222222-2222-4222-8222-222222222222"><Properties><Name>Order</Name><Synonym/><Comment/></Properties><ChildObjects/></Document></MetaDataObject>"#,
+        ).unwrap();
+        let runtime = V5CanonicalInvocationRuntime::new(
+            Arc::new(
+                crate::infrastructure::daemon::v13_service::CanonicalV13ReadService::default(),
+            ),
+            Arc::new(TokioClock),
+        );
+        let workspace_hint = std::fs::canonicalize(workspace.path()).unwrap();
+        let call = |tool, arguments| {
+            let request =
+                InvocationRequest::new(tool, arguments, workspace_hint.to_string_lossy(), 7_000)
+                    .unwrap();
+            direct_v5(&runtime, request).unwrap()
+        };
+        let view = |at| {
+            let result = call(ToolIdentity::View, serde_json::json!({"at": at}));
+            assert!(result.ok, "{result:?}");
+            result
+        };
+        let at = "main:CommonModule.OrdinaryClient";
+        let plan = |at: &str, value: serde_json::Value| {
+            serde_json::json!({
+                "at": at,
+                "ops": [{"op": "props.set", "args": {"values": {"ClientOrdinaryApplication": value}}}],
+            })
+        };
+        assert_eq!(
+            view(at).data.as_ref().unwrap()["props"]["commonModule"]["clientOrdinaryApplication"],
+            false
+        );
+        for value in [true, false] {
+            let before = std::fs::read(&descriptor).unwrap();
+            let observed = view(at);
+            let mut args = plan(at, serde_json::json!(value));
+            let preview = call(ToolIdentity::Apply, args.clone());
+            assert!(preview.ok, "props.set preview failed: {preview:?}");
+            assert_eq!(std::fs::read(&descriptor).unwrap(), before);
+            let after_preview = view(at);
+            assert!(after_preview.rev.is_none());
+            assert_eq!(after_preview.data, observed.data);
+            args = serde_json::json!({"executionToken": preview.data.as_ref().unwrap()["executionToken"]});
+            let applied = call(ToolIdentity::Apply, args);
+            assert!(applied.ok, "props.set apply failed: {applied:?}");
+            assert_eq!(
+                preview.data.as_ref().unwrap()["planHash"],
+                applied.data.as_ref().unwrap()["planHash"]
+            );
+            let xml = std::fs::read_to_string(&descriptor).unwrap();
+            let parsed = roxmltree::Document::parse(xml.trim_start_matches('\u{feff}')).unwrap();
+            let properties: Vec<_> = parsed
+                .descendants()
+                .filter(|node| node.has_tag_name("ClientOrdinaryApplication"))
+                .collect();
+            assert_eq!(properties.len(), 1, "{xml}");
+            assert_eq!(
+                properties[0].text(),
+                Some(if value { "true" } else { "false" })
+            );
+            assert_eq!(
+                view(at).data.as_ref().unwrap()["props"]["commonModule"]
+                    ["clientOrdinaryApplication"],
+                value
+            );
+        }
+        for (target, value, reason) in [
+            (at, serde_json::json!("true"), "boolean"),
+            (
+                "main:Document.Order",
+                serde_json::json!(true),
+                "not supported for Document",
+            ),
+        ] {
+            let before_module = std::fs::read(&descriptor).unwrap();
+            let before_document = std::fs::read(&document).unwrap();
+            let before_view = view(target);
+            {
+                let args = plan(target, value.clone());
+                let refused = call(ToolIdentity::Apply, args);
+                assert!(!refused.ok, "{refused:?}");
+                assert_eq!(refused.diagnostics[0]["code"], "bad_value", "{refused:?}");
+                assert!(
+                    refused.diagnostics[0]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains(reason),
+                    "{refused:?}"
+                );
+                assert_eq!(std::fs::read(&descriptor).unwrap(), before_module);
+                assert_eq!(std::fs::read(&document).unwrap(), before_document);
+                let unchanged = view(target);
+                assert!(unchanged.rev.is_none());
+                assert_eq!(unchanged.data, before_view.data);
+            }
+        }
     }
 
     #[test]
@@ -4780,25 +7504,21 @@ struct ActorLogicalReadLease {"#,
             let dry = call(serde_json::json!({
                 "at": "main:Document.Order",
                 "ops": [operation.clone()],
-                "dryRun": true,
             }));
             assert!(dry.ok, "dry-run failed: {dry:?}");
             assert_eq!(std::fs::read(&descriptor).unwrap(), before);
             let repeated_dry = call(serde_json::json!({
                 "at": "main:Document.Order",
                 "ops": [operation.clone()],
-                "dryRun": true,
             }));
             assert_eq!(
                 dry.data.as_ref().unwrap()["planHash"],
                 repeated_dry.data.as_ref().unwrap()["planHash"],
                 "dry-run planning must be deterministic"
             );
-            let real = call(serde_json::json!({
-                "at": "main:Document.Order",
-                "ops": [operation],
-                "dryRun": false,
-            }));
+            let real = call(
+                serde_json::json!({"executionToken": dry.data.as_ref().unwrap()["executionToken"]}),
+            );
             assert!(real.ok, "real apply failed: {real:?}");
             assert_ne!(std::fs::read(&descriptor).unwrap(), before);
             assert_eq!(
@@ -4843,21 +7563,23 @@ struct ActorLogicalReadLease {"#,
                 {"op": "props.set", "args": {"values": {"Comment": "must not publish"}}},
                 {"op": "object.create", "args": {"values": {"kind": "Catalog", "name": "Ghost"}}}
             ],
-            "dryRun": false,
         }));
         assert!(!rejected.ok);
         assert_eq!(rejected.diagnostics[0]["code"], "bad_value");
         assert_eq!(std::fs::read(&descriptor).unwrap(), before_rejected);
 
         let before_reverted = std::fs::read(&descriptor).unwrap();
-        let reverted = call(serde_json::json!({
+        let net_zero_preview = call(serde_json::json!({
             "at": "main:Document.Order",
             "ops": [
                 {"op": "props.set", "args": {"values": {"Comment": "transient"}}},
                 {"op": "props.set", "args": {"values": {"Comment": "planned"}}}
             ],
-            "dryRun": false,
         }));
+        assert!(net_zero_preview.ok, "{net_zero_preview:?}");
+        let reverted = call(
+            serde_json::json!({"executionToken": net_zero_preview.data.as_ref().unwrap()["executionToken"]}),
+        );
         assert!(reverted.ok, "net-zero apply failed: {reverted:?}");
         assert!(reverted.changed.is_empty());
         assert_eq!(reverted.data.as_ref().unwrap()["effects"], 0);
@@ -5027,6 +7749,198 @@ struct ActorLogicalReadLease {"#,
         );
     }
 
+    #[test]
+    fn logical_read_admission_deadline_returns_canonical_rejection() {
+        assert_logical_read_deadline_case(LogicalReadDeadlineCase::Admission);
+    }
+
+    #[test]
+    fn logical_read_publication_deadline_discards_staged_source_data() {
+        assert_logical_read_deadline_case(LogicalReadDeadlineCase::Publication);
+    }
+
+    #[test]
+    fn logical_read_admission_does_not_scan_source_revisions() {
+        assert_logical_read_deadline_case(LogicalReadDeadlineCase::AdmissionNoScan);
+    }
+
+    #[test]
+    fn logical_read_publication_does_not_scan_source_revisions() {
+        assert_logical_read_deadline_case(LogicalReadDeadlineCase::PublicationNoScan);
+    }
+
+    #[test]
+    fn logical_read_expired_clock_does_not_reclassify_execution_failure() {
+        assert_logical_read_deadline_case(LogicalReadDeadlineCase::ExecutionFailure);
+    }
+
+    #[test]
+    fn logical_read_parent_publication_deadline_discards_staged_extension_data() {
+        assert_logical_read_deadline_case(LogicalReadDeadlineCase::ParentPublication);
+    }
+
+    #[test]
+    fn logical_read_admission_deadline_is_preserved_by_every_read_tool() {
+        for tool in [
+            ToolIdentity::Resolve,
+            ToolIdentity::Search,
+            ToolIdentity::Check,
+            ToolIdentity::Diff,
+        ] {
+            assert_logical_read_deadline_for_tool(LogicalReadDeadlineCase::Admission, tool);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum LogicalReadDeadlineCase {
+        Admission,
+        AdmissionNoScan,
+        Publication,
+        PublicationNoScan,
+        ExecutionFailure,
+        ParentPublication,
+    }
+
+    fn assert_logical_read_deadline_case(case: LogicalReadDeadlineCase) {
+        assert_logical_read_deadline_for_tool(case, ToolIdentity::View);
+    }
+
+    fn assert_logical_read_deadline_for_tool(case: LogicalReadDeadlineCase, tool: ToolIdentity) {
+        let parent_publication = matches!(case, LogicalReadDeadlineCase::ParentPublication);
+        let workspace = if parent_publication {
+            borrowing_view_fixture("normal")
+        } else {
+            source_selection_read_fixture().0
+        };
+        let runtime = bootstrap_runtime();
+        let arguments = match tool {
+            ToolIdentity::Search => {
+                serde_json::json!({"query": "Items", "scope": "main:Configuration"})
+            }
+            ToolIdentity::Diff => {
+                serde_json::json!({"left": "main:Catalog.Items", "right": "main:Catalog.Items"})
+            }
+            _ => {
+                serde_json::json!({"at": if parent_publication { "ext:Catalog.Items" } else { "main:Catalog.Items" }})
+            }
+        };
+        let request = InvocationRequest::new(
+            tool,
+            arguments,
+            std::fs::canonicalize(workspace.path())
+                .unwrap()
+                .to_string_lossy(),
+            7_000,
+        )
+        .unwrap();
+        let invocation = bind_workspace_invocation(
+            &request,
+            &runtime.workspace_actors,
+            Arc::clone(&runtime.deliveries),
+            Arc::clone(&runtime.provider_hosts),
+            Arc::clone(&runtime.runtime_resources),
+            None,
+            runtime.capture_response_deadline_for_test(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let expires = started + LOGICAL_READ_OPERATION_BUDGET;
+        set_logical_read_now(if matches!(case, LogicalReadDeadlineCase::Admission) {
+            expires
+        } else {
+            started
+        });
+        let deadline = ProviderDeadline::with_clock(expires, logical_read_now);
+        let cancellation = CancellationToken::new();
+        let _admission_scan = matches!(
+            case,
+            LogicalReadDeadlineCase::AdmissionNoScan | LogicalReadDeadlineCase::ParentPublication
+        )
+        .then(|| {
+            crate::infrastructure::source_revision::set_retained_scan_test_mutation(
+                crate::infrastructure::source_revision::RetainedScanTestMutationPoint::ScanStart,
+                move || set_logical_read_now(expires),
+            )
+        });
+        let execution = invocation
+            .begin_execution_with_logical_deadline_for_test(&cancellation, deadline)
+            .unwrap_or_else(|error| {
+                panic!("deadline must remain a domain rejection at admission: {error}")
+            });
+        let service =
+            crate::infrastructure::daemon::v13_service::CanonicalV13ReadService::default();
+        let staged = service.execute(&execution, cancellation.clone()).unwrap();
+        if parent_publication {
+            assert_eq!(
+                logical_read_now(),
+                started,
+                "parent read must not run the old revision scan"
+            );
+            assert_eq!(
+                staged.data.as_ref().unwrap()["props"]["parentStatus"],
+                "resolved"
+            );
+        }
+        if !matches!(
+            case,
+            LogicalReadDeadlineCase::Admission | LogicalReadDeadlineCase::AdmissionNoScan
+        ) {
+            assert!(staged.ok, "{staged:?}");
+            assert!(
+                staged.data.is_some(),
+                "the reader must stage actual source data"
+            );
+            if !matches!(case, LogicalReadDeadlineCase::PublicationNoScan) {
+                set_logical_read_now(expires);
+            }
+        }
+        if matches!(case, LogicalReadDeadlineCase::ExecutionFailure) {
+            let failure = InvocationFailure::new("reader_failed", "unrelated provider failure");
+            let published = execution
+                .publish(Err(failure.clone()), &cancellation)
+                .unwrap();
+            assert_eq!(published, Err(failure));
+            return;
+        }
+        let _publication_scan =
+            matches!(case, LogicalReadDeadlineCase::PublicationNoScan).then(|| {
+                crate::infrastructure::source_revision::set_retained_scan_test_mutation(
+                crate::infrastructure::source_revision::RetainedScanTestMutationPoint::ScanStart,
+                move || set_logical_read_now(expires),
+            )
+            });
+        let result = execution
+            .publish(Ok(staged), &cancellation)
+            .unwrap_or_else(|error| {
+                panic!("deadline must remain a domain rejection at publication: {error}")
+            })
+            .expect("deadline must not become an invocation failure");
+        if matches!(
+            case,
+            LogicalReadDeadlineCase::AdmissionNoScan | LogicalReadDeadlineCase::PublicationNoScan
+        ) {
+            assert_eq!(
+                logical_read_now(),
+                started,
+                "logical read invoked a global source revision scan"
+            );
+            assert!(result.ok, "{result:?}");
+            assert!(
+                result.data.is_some(),
+                "successful read must keep source data"
+            );
+            return;
+        }
+        assert!(!result.ok);
+        assert_eq!(result.diagnostics[0]["code"], "deadline_exceeded");
+        assert_eq!(result.diagnostics[0]["outcome"], "retry");
+        assert!(
+            result.data.is_none(),
+            "expired source data escaped: {result:?}"
+        );
+        assert!(result.rev.is_none(), "expired revision escaped: {result:?}");
+    }
+
     struct ManualInvocationClock(Mutex<Instant>);
 
     impl ManualInvocationClock {
@@ -5047,7 +7961,7 @@ struct ActorLogicalReadLease {"#,
     }
 
     #[test]
-    pub(crate) fn hidden_v13_logical_lease_survives_the_handoff_window_and_confirms_once() {
+    pub(crate) fn logical_reads_preserve_deadline_without_source_scans_or_mutation_lane_wait() {
         let workspace = tempfile::tempdir().unwrap();
         let source = workspace.path().join("src");
         let sibling = workspace.path().join("dep");
@@ -5106,6 +8020,10 @@ struct ActorLogicalReadLease {"#,
             .actor_for_test()
             .source_revision_service(&sibling_binding)
             .unwrap();
+        let selected_revisions = invocation
+            .actor_for_test()
+            .source_revision_service(invocation.read_source_binding_for_test("main").unwrap())
+            .unwrap();
         let started = Instant::now();
         set_logical_read_now(started);
         let deadline =
@@ -5139,6 +8057,76 @@ struct ActorLogicalReadLease {"#,
             .execute(&execution, cancellation.clone())
             .expect("canonical v0.13 execution");
         assert!(result.ok, "canonical v0.13 execution must succeed");
+        assert!(result.rev.is_none());
+        assert_eq!(
+            selected_revisions.retained_scan_count(),
+            0,
+            "view admission and execution must not scan even the selected source tree"
+        );
+        for (tool, arguments) in [
+            (
+                ToolIdentity::Resolve,
+                serde_json::json!({"at":"main:Catalog.Items"}),
+            ),
+            (
+                ToolIdentity::Search,
+                serde_json::json!({"query":"Items","scope":"main:Configuration"}),
+            ),
+            (
+                ToolIdentity::Check,
+                serde_json::json!({"at":"main:Catalog.Items"}),
+            ),
+            (
+                ToolIdentity::Diff,
+                serde_json::json!({"left":"main:Catalog.Items","right":"main:Catalog.Items"}),
+            ),
+        ] {
+            let read_request = InvocationRequest::new(
+                tool,
+                arguments,
+                std::fs::canonicalize(workspace.path())
+                    .unwrap()
+                    .to_string_lossy(),
+                7_000,
+            )
+            .unwrap();
+            let read_invocation = bind_workspace_invocation(
+                &read_request,
+                &runtime.workspace_actors,
+                Arc::clone(&runtime.deliveries),
+                Arc::clone(&runtime.provider_hosts),
+                Arc::clone(&runtime.runtime_resources),
+                None,
+                runtime.capture_response_deadline_for_test(),
+            )
+            .unwrap();
+            let read_execution = read_invocation
+                .begin_execution_with_logical_deadline_for_test(&cancellation, deadline)
+                .unwrap();
+            let read_result = service
+                .execute(&read_execution, cancellation.clone())
+                .unwrap();
+            assert!(read_result.ok, "{tool:?}: {read_result:?}");
+            assert!(
+                read_result.rev.is_none(),
+                "{tool:?} must not expose a source revision"
+            );
+            let published = read_execution
+                .publish(Ok(read_result), &cancellation)
+                .unwrap()
+                .unwrap();
+            assert!(published.ok);
+            assert_eq!(
+                selected_revisions.retained_scan_count(),
+                0,
+                "{tool:?} must not scan the selected source tree"
+            );
+            assert_eq!(
+                sibling_revisions.retained_scan_count(),
+                0,
+                "{tool:?} must not scan the unrelated source tree"
+            );
+        }
         let actor = Arc::clone(execution.actor_for_test());
         let legacy_fence = actor
             .capture_revision(execution.provider_root_for_test(), deadline, &cancellation)
@@ -5146,6 +8134,7 @@ struct ActorLogicalReadLease {"#,
         let held_publication = actor
             .begin_publication(&legacy_fence, deadline, &cancellation)
             .expect("hold the actor mutation lane");
+        let scans_before_publish = selected_revisions.retained_scan_count();
         let (published_tx, published_rx) = mpsc::channel();
         let publish_cancellation = cancellation.clone();
         std::thread::spawn(move || {
@@ -5154,20 +8143,19 @@ struct ActorLogicalReadLease {"#,
                 .send(execution.publish(Ok(result), &publish_cancellation))
                 .unwrap();
         });
-        assert!(
-            matches!(
-                published_rx.recv_timeout(Duration::from_millis(100)),
-                Err(mpsc::RecvTimeoutError::Timeout)
-            ),
-            "logical read publication must wait on the actor mutation lane"
-        );
-        drop(held_publication);
         let published = published_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("logical publication resumes after mutation lane release")
+            .expect("logical publication must not wait on the mutation lane")
             .unwrap()
             .unwrap();
+        drop(held_publication);
         assert!(published.ok);
+        assert!(published.rev.is_none());
+        assert_eq!(
+            selected_revisions.retained_scan_count(),
+            scans_before_publish,
+            "read publication must not scan the selected source tree"
+        );
         assert_eq!(
             sibling_revisions.retained_scan_count(),
             0,
@@ -5175,8 +8163,8 @@ struct ActorLogicalReadLease {"#,
         );
 
         let find_request = InvocationRequest::new(
-            ToolIdentity::Find,
-            serde_json::json!({"query": "Items"}),
+            ToolIdentity::Resolve,
+            serde_json::json!({"path": "src/Catalogs/Items.xml"}),
             std::fs::canonicalize(workspace.path())
                 .unwrap()
                 .to_string_lossy(),
@@ -5287,8 +8275,8 @@ struct ActorLogicalReadLease {"#,
         )
         .unwrap();
         assert!(
-            execution.publish(Ok(result), &cancellation).is_err(),
-            "a selected-source mutation must fail final retained confirmation"
+            execution.publish(Ok(result), &cancellation).is_ok(),
+            "a completed read remains usable after source content changes"
         );
     }
 
@@ -5528,7 +8516,7 @@ struct ActorLogicalReadLease {"#,
             self.release.lock().unwrap().recv().unwrap();
             if operation.remaining().is_zero() {
                 return Err(InvocationFailure::new(
-                    "provider_deadline",
+                    "deadline_exceeded",
                     "operation budget elapsed at Task handoff",
                 ));
             }
@@ -5567,7 +8555,7 @@ struct ActorLogicalReadLease {"#,
         let owner = daemon.owner();
         let request = InvocationRequest::new(
             ToolIdentity::Run,
-            serde_json::json!({"op": "infobase.build", "args": {}}),
+            serde_json::json!({"op": "test.long-work", "args": {}}),
             root.to_string_lossy(),
             7_000,
         )
@@ -5643,7 +8631,7 @@ struct ActorLogicalReadLease {"#,
         release: Arc<(Mutex<bool>, Condvar)>,
     }
 
-    struct RevisionChangingIndexService {
+    struct GenerationChangingIndexService {
         producers: Arc<AtomicUsize>,
         producer_entered: mpsc::Sender<()>,
         joined: mpsc::Sender<IndexWorkIdentity>,
@@ -5773,7 +8761,7 @@ struct ActorLogicalReadLease {"#,
     }
 
     #[test]
-    fn v5_view_without_at_returns_the_workspace_bootstrap_before_actor_admission() {
+    fn v5_view_without_at_prepares_root_inspection_without_source_actor_admission() {
         let workspace = tempfile::tempdir().expect("temporary empty workspace");
         let preparations = Arc::new(AtomicUsize::new(0));
         let runtime = V5CanonicalInvocationRuntime::new(
@@ -5792,15 +8780,23 @@ struct ActorLogicalReadLease {"#,
         )
         .expect("valid bootstrap request");
 
-        let result = match runtime.bind(request) {
-            Err(V5CanonicalPrepareError::Direct(result)) => result,
-            Ok(_) => panic!("workspace bootstrap must not enter actor admission"),
-            Err(other) => panic!("workspace bootstrap returned infrastructure failure: {other:?}"),
-        };
+        let bound = runtime.bind(request).expect("prepare root inspection");
+        assert!(matches!(
+            bound,
+            V5ActorBoundCanonicalInvocation::WorkspaceInspection { .. }
+        ));
+        assert_eq!(runtime.workspace_actors.entry_len_for_test().unwrap(), 0);
+        assert_eq!(preparations.load(Ordering::SeqCst), 0);
+        let prepared = bound.prepare().expect("prepare actor-free root operation");
+        assert_eq!(prepared.execution_class(), &ExecutionClass::InlineCandidate);
+        let result = prepared
+            .execute(CancellationToken::new())
+            .expect("execute root inspection");
 
         assert!(result.ok, "v5 bootstrap was misclassified: {result:?}");
         assert_eq!(result.data.as_ref().unwrap()["config"]["state"], "missing");
         assert_eq!(preparations.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.workspace_actors.entry_len_for_test().unwrap(), 0);
     }
 
     #[test]
@@ -5830,15 +8826,89 @@ struct ActorLogicalReadLease {"#,
         };
 
         assert!(result.ok, "v5 run dictionary was misclassified: {result:?}");
-        assert!(!result.data.as_ref().unwrap()["operations"]
+        let catalog = crate::application::v13::tool_catalog::catalog_for(SurfaceRelease::V13)
+            .expect("canonical catalog");
+        let operations = result.data.as_ref().unwrap()["operations"]
             .as_array()
-            .unwrap()
-            .is_empty());
+            .expect("published operations");
+        let mut published = std::collections::BTreeMap::new();
+        for operation in operations {
+            let name = operation["op"].as_str().expect("operation name");
+            assert!(
+                published.insert(name, operation).is_none(),
+                "duplicate operation {name}"
+            );
+        }
+        assert_eq!(published.len(), catalog.run_dictionary.len());
+        for operation in &catalog.run_dictionary {
+            let name = operation.name();
+            let entry = published.get(name).expect("catalog operation is published");
+            assert_eq!(entry["description"], operation.description(), "{name}");
+            assert_eq!(
+                entry["argsSchema"],
+                serde_json::json!(operation.args_schema()),
+                "{name}"
+            );
+            assert_eq!(entry["execution"], operation.execution(), "{name}");
+            assert_eq!(
+                entry["effects"],
+                serde_json::json!(operation.effects()),
+                "{name}"
+            );
+            assert_eq!(entry["implemented"], operation.implemented, "{name}");
+            let preview_apply = operation.execution() == "previewApply";
+            assert_eq!(entry["dryRunRequired"], preview_apply, "{name}");
+            assert_eq!(entry["previewRequired"], false, "{name}");
+            assert!(entry.get("ifRevRequiredOnApply").is_none(), "{name}");
+        }
         assert_eq!(preparations.load(Ordering::SeqCst), 0);
     }
 
     #[test]
-    fn v5_infobase_exports_prepare_before_source_admission_and_keep_the_revision_gate() {
+    fn v5_run_rejects_if_rev_before_workspace_or_provider_admission() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("v8project.yaml"), "not: [valid yaml").unwrap();
+        let preparations = Arc::new(AtomicUsize::new(0));
+        let runtime = V5CanonicalInvocationRuntime::new(
+            Arc::new(CountingPrepareService {
+                preparations: Arc::clone(&preparations),
+            }),
+            Arc::new(TokioClock),
+        );
+        let catalog =
+            crate::application::v13::tool_catalog::catalog_for(SurfaceRelease::V13).unwrap();
+        let contract = catalog
+            .tools
+            .iter()
+            .find(|tool| tool.name == "run")
+            .unwrap();
+        assert!(contract.input_schema["properties"].get("ifRev").is_none());
+        assert_eq!(contract.input_schema["additionalProperties"], false);
+        for operation in &catalog.run_dictionary {
+            let request = InvocationRequest::new(
+                ToolIdentity::Run,
+                serde_json::json!({
+                    "op": operation.name(), "args": {}, "dryRun": false, "ifRev": "old-preview"
+                }),
+                workspace.path().display().to_string(),
+                7_000,
+            )
+            .unwrap();
+            let result = match runtime.bind(request) {
+                Err(V5CanonicalPrepareError::Rejected(result)) => result,
+                Ok(_) => panic!("{} accepted the removed ifRev argument", operation.name()),
+                Err(other) => panic!("request reached workspace admission: {other:?}"),
+            };
+            assert_eq!(result.diagnostics[0]["code"], "bad_value", "{result:?}");
+            assert!(result.rev.is_none());
+        }
+        assert_eq!(preparations.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.workspace_actors.entry_len_for_test().unwrap(), 0);
+        assert!(!workspace.path().join(".build").exists());
+    }
+
+    #[test]
+    fn v5_infobase_exports_prepare_before_source_admission_and_run_without_a_revision_gate() {
         let workspace = tempfile::tempdir().expect("temporary infobase workspace");
         std::fs::write(
             workspace.path().join("v8project.yaml"),
@@ -5858,15 +8928,12 @@ struct ActorLogicalReadLease {"#,
             }),
             Arc::new(TokioClock),
         );
-        let request = |op: &str, args: serde_json::Value, dry_run: bool, if_rev: Option<&str>| {
-            let mut arguments = serde_json::json!({
+        let request = |op: &str, args: serde_json::Value, dry_run: bool| {
+            let arguments = serde_json::json!({
                 "op": op,
                 "args": args,
                 "dryRun": dry_run,
             });
-            if let Some(if_rev) = if_rev {
-                arguments["ifRev"] = serde_json::json!(if_rev);
-            }
             InvocationRequest::new(
                 ToolIdentity::Run,
                 arguments,
@@ -5880,7 +8947,7 @@ struct ActorLogicalReadLease {"#,
 
         for (op, args) in [
             (
-                "infobase.configuration.export",
+                "download",
                 serde_json::json!({"state": "working", "output": "dist/main.cf"}),
             ),
             (
@@ -5889,7 +8956,7 @@ struct ActorLogicalReadLease {"#,
             ),
         ] {
             let preview = runtime
-                .bind(request(op, args.clone(), true, None))
+                .bind(request(op, args.clone(), true))
                 .expect("preview binds without a PlatformXml source set")
                 .prepare()
                 .expect("preview preparation");
@@ -5899,13 +8966,8 @@ struct ActorLogicalReadLease {"#,
             );
 
             let apply = runtime
-                .bind(request(
-                    op,
-                    args,
-                    false,
-                    Some("unica-infobase-export-sha256-v1:test"),
-                ))
-                .expect("revision-bound apply binds without a PlatformXml source set")
+                .bind(request(op, args, false))
+                .expect("execution binds without a prior preview or revision")
                 .prepare()
                 .expect("apply preparation");
             assert_eq!(
@@ -5914,25 +8976,263 @@ struct ActorLogicalReadLease {"#,
             );
         }
 
-        let missing_revision = match runtime.bind(request(
-            "infobase.configuration.export",
-            serde_json::json!({"state": "working", "output": "dist/main.cf"}),
-            false,
-            None,
-        )) {
-            Err(V5CanonicalPrepareError::Rejected(result)) => result,
-            Ok(_) => panic!("apply without ifRev passed the revision gate"),
-            Err(other) => panic!("apply revision gate returned infrastructure failure: {other:?}"),
-        };
-        assert_eq!(missing_revision.diagnostics[0]["code"], "bad_value");
-        assert!(missing_revision.diagnostics[0]["message"]
-            .as_str()
-            .unwrap()
-            .contains("requires ifRev"));
         assert_eq!(
             preparations.load(Ordering::SeqCst),
             0,
             "infobase exports must not enter the PlatformXml service"
+        );
+    }
+
+    #[test]
+    fn v5_client_run_binds_before_source_admission_without_a_revision_gate() {
+        // Вариант А развилки A-1 (#871): терминальная операция запускается
+        // сразу, превью необязательно, `ifRev` не принимается.
+        let workspace = tempfile::tempdir().expect("temporary infobase workspace");
+        std::fs::write(
+            workspace.path().join("v8project.yaml"),
+            "format: DESIGNER\ninfobase:\n  connection: \"File=.build/infobase\"\n",
+        )
+        .expect("write infobase-only workspace descriptor");
+        let preparations = Arc::new(AtomicUsize::new(0));
+        let runtime = V5CanonicalInvocationRuntime::new(
+            Arc::new(CountingPrepareService {
+                preparations: Arc::clone(&preparations),
+            }),
+            Arc::new(TokioClock),
+        );
+        let request = |arguments: serde_json::Value| {
+            InvocationRequest::new(
+                ToolIdentity::Run,
+                arguments,
+                std::fs::canonicalize(workspace.path())
+                    .expect("canonical workspace")
+                    .to_string_lossy(),
+                7_000,
+            )
+            .expect("valid launch request")
+        };
+
+        for arguments in [
+            serde_json::json!({"op": "launch", "args": {"clientMode": "designer"}, "dryRun": true}),
+            serde_json::json!({"op": "launch", "args": {"clientMode": "thin"}}),
+        ] {
+            let bound = runtime
+                .bind(request(arguments))
+                .expect("launch binds without a PlatformXml source set");
+            assert!(matches!(
+                bound,
+                V5ActorBoundCanonicalInvocation::ClientRun { .. }
+            ));
+            let prepared = bound.prepare().expect("launch preparation");
+            assert_eq!(
+                prepared.execution_class(),
+                &ExecutionClass::KnownLong(KnownLongReason::ExternalProcess)
+            );
+        }
+
+        let fenced = match runtime.bind(request(serde_json::json!({
+            "op": "launch",
+            "args": {"clientMode": "thin"},
+            "ifRev": "unica-infobase-export-sha256-v1:test",
+        }))) {
+            Err(V5CanonicalPrepareError::Rejected(result)) => result,
+            Ok(_) => panic!("a terminal operation accepted ifRev"),
+            Err(other) => panic!("ifRev on launch returned infrastructure failure: {other:?}"),
+        };
+        assert_eq!(fenced.diagnostics[0]["code"], "bad_value");
+        assert!(runtime.workspace_actors.entry_len_for_test().unwrap() == 0);
+        assert_eq!(
+            preparations.load(Ordering::SeqCst),
+            0,
+            "launch must not enter the PlatformXml service"
+        );
+    }
+
+    fn assert_development_cycle_admission(selected: &str) {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("v8project.yaml"),
+            "format: DESIGNER\ninfobase:\n  connection: 'File=base'\nsource-set:\n  - name: main\n    type: CONFIGURATION\n    path: src\n").unwrap();
+        std::fs::create_dir(workspace.path().join("src")).unwrap();
+        std::fs::write(workspace.path().join("main.cf"), b"fixture").unwrap();
+        let preparations = Arc::new(AtomicUsize::new(0));
+        let runtime = V5CanonicalInvocationRuntime::new(
+            Arc::new(CountingPrepareService {
+                preparations: Arc::clone(&preparations),
+            }),
+            Arc::new(TokioClock),
+        );
+        for (op, args) in [
+            ("upload", serde_json::json!({"input":"main.cf"})),
+            ("infobase.create", serde_json::json!({})),
+            ("push", serde_json::json!({"sourceSet":"main","force":true})),
+            ("pull", serde_json::json!({"sourceSet":"main","force":true})),
+            ("apply", serde_json::json!({})),
+            ("reset", serde_json::json!({"force":true})),
+        ] {
+            if op != selected {
+                continue;
+            }
+            for dry_run in [false, true] {
+                let arguments = serde_json::json!({"op":op,"args":args,"dryRun":dry_run});
+                let request = InvocationRequest::new(
+                    ToolIdentity::Run,
+                    arguments,
+                    workspace.path().display().to_string(),
+                    7000,
+                )
+                .unwrap();
+                let bound = runtime
+                    .bind(request)
+                    .unwrap_or_else(|e| panic!("{op}: {e:?}"));
+                let prepared = bound.prepare().unwrap_or_else(|e| panic!("{op}: {e:?}"));
+                assert_eq!(
+                    prepared.execution_class(),
+                    &ExecutionClass::KnownLong(KnownLongReason::ExternalProcess)
+                );
+            }
+        }
+        assert_eq!(preparations.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn v5_cf_import_prepares_before_source_admission_and_runs_without_a_revision_gate() {
+        assert_development_cycle_admission("upload");
+    }
+
+    #[test]
+    fn v5_infobase_create_prepares_before_source_admission_and_runs_without_a_revision_gate() {
+        assert_development_cycle_admission("infobase.create");
+    }
+
+    #[test]
+    fn v5_source_import_prepares_before_source_admission_and_runs_without_a_revision_gate() {
+        assert_development_cycle_admission("push");
+    }
+
+    #[test]
+    fn v5_source_export_prepares_before_source_admission_and_runs_without_a_revision_gate() {
+        assert_development_cycle_admission("pull");
+    }
+
+    #[test]
+    fn v5_development_cycle_prepares_before_source_admission_and_runs_without_a_revision_gate() {
+        assert_development_cycle_admission("apply");
+        assert_development_cycle_admission("reset");
+    }
+
+    #[test]
+    fn v5_artifact_build_prepares_before_source_admission_and_runs_without_a_revision_gate() {
+        let workspace = tempfile::tempdir().expect("temporary make workspace");
+        std::fs::write(
+            workspace.path().join("v8project.yaml"),
+            "format: DESIGNER\ninfobase:\n  connection: \"File=.build/infobase\"\nsource-set:\n  - name: main\n    type: CONFIGURATION\n    path: src\n",
+        )
+        .expect("write a workspace descriptor with one source set");
+        let preparations = Arc::new(AtomicUsize::new(0));
+        let runtime = V5CanonicalInvocationRuntime::new(
+            Arc::new(CountingPrepareService {
+                preparations: Arc::clone(&preparations),
+            }),
+            Arc::new(TokioClock),
+        );
+        let request = |arguments: serde_json::Value| {
+            InvocationRequest::new(
+                ToolIdentity::Run,
+                arguments,
+                std::fs::canonicalize(workspace.path())
+                    .expect("canonical workspace")
+                    .to_string_lossy(),
+                7_000,
+            )
+            .expect("valid make request")
+        };
+
+        for arguments in [
+            serde_json::json!({"op": "make", "args": {"output": "dist/main.cf"}, "dryRun": true}),
+            serde_json::json!({"op": "make", "args": {"output": "dist/main.cf", "sourceSet": "main"}, "dryRun": false}),
+        ] {
+            let bound = runtime
+                .bind(request(arguments))
+                .expect("make binds without a PlatformXml source set");
+            assert!(matches!(
+                bound,
+                V5ActorBoundCanonicalInvocation::ArtifactBuild { .. }
+            ));
+            let prepared = bound.prepare().expect("make preparation");
+            assert_eq!(
+                prepared.execution_class(),
+                &ExecutionClass::KnownLong(KnownLongReason::ExternalProcess)
+            );
+        }
+
+        let external = match runtime.bind(request(serde_json::json!({
+            "op": "make",
+            "args": {"output": "dist/report.epf"},
+            "dryRun": true,
+        }))) {
+            Err(V5CanonicalPrepareError::Rejected(result)) => result,
+            Ok(_) => panic!("an .epf output was accepted"),
+            Err(other) => {
+                panic!(".epf on make returned infrastructure failure: {other:?}")
+            }
+        };
+        assert_eq!(external.diagnostics[0]["code"], "unsupported_operation");
+        assert_eq!(
+            preparations.load(Ordering::SeqCst),
+            0,
+            "make must not enter the PlatformXml service"
+        );
+    }
+
+    #[test]
+    fn v5_documentation_answers_before_source_admission_without_an_actor_lease() {
+        // Каталог без `v8project.yaml` и без корней 1С — тот, из которого
+        // новичок и спрашивает, как рабочее пространство завести.
+        let workspace = tempfile::tempdir().expect("temporary bare workspace");
+        std::fs::write(workspace.path().join("README.md"), "not a 1C workspace\n")
+            .expect("write a file that is not a 1C source root");
+        let preparations = Arc::new(AtomicUsize::new(0));
+        let runtime = V5CanonicalInvocationRuntime::new(
+            Arc::new(CountingPrepareService {
+                preparations: Arc::clone(&preparations),
+            }),
+            Arc::new(TokioClock),
+        );
+        let request = |arguments: serde_json::Value| {
+            InvocationRequest::new(
+                ToolIdentity::Docs,
+                arguments,
+                std::fs::canonicalize(workspace.path())
+                    .expect("canonical workspace")
+                    .to_string_lossy(),
+                7_000,
+            )
+            .expect("valid docs request")
+        };
+
+        let prepared = runtime
+            .bind(request(serde_json::json!({
+                "query": "как завести рабочее пространство",
+                "source": "configuration-documentation"
+            })))
+            .expect("docs binds without a PlatformXml source set")
+            .prepare()
+            .expect("docs preparation");
+        // Справка не длинная по построению: локальное попадание отвечает
+        // сразу, а сетевое уходит в Task на общем cutoff.
+        assert_eq!(prepared.execution_class(), &ExecutionClass::InlineCandidate);
+
+        // Единственный свод, которому рабочее пространство нужно, отвечает
+        // своим типизированным отказом, а не общим отказом допуска.
+        let result = prepared
+            .execute(CancellationToken::new())
+            .expect("docs executes without an actor");
+        assert!(!result.ok, "docs must refuse the workspace corpus honestly");
+        assert_eq!(result.diagnostics[0]["code"], "unsupported_source");
+        assert_eq!(
+            preparations.load(Ordering::SeqCst),
+            0,
+            "docs must not enter the PlatformXml service"
         );
     }
 
@@ -6010,7 +9310,7 @@ struct ActorLogicalReadLease {"#,
             };
             let (key, lease) = match &self.kind {
                 LongCapabilityKind::Index => invocation
-                    .join_index_work("rlm", "bsl-1", make_work())
+                    .join_index_work("rlm", "bsl-1", "test-build-1", make_work())
                     .map(|(key, lease)| (JoinedCapabilityIdentity::Index(key), lease))
                     .map_err(|_| InvocationFailure::new("index_failed", "index unavailable"))?,
                 LongCapabilityKind::Provider(key) => (
@@ -6039,7 +9339,7 @@ struct ActorLogicalReadLease {"#,
         }
     }
 
-    impl CanonicalInvocationService for RevisionChangingIndexService {
+    impl CanonicalInvocationService for GenerationChangingIndexService {
         fn prepare(
             &self,
             _invocation: &ActorBoundInvocation,
@@ -6056,18 +9356,27 @@ struct ActorLogicalReadLease {"#,
             let producer_entered = self.producer_entered.clone();
             let release = Arc::clone(&self.release);
             let (key, lease) = invocation
-                .join_index_work("rlm", "bsl-1", move |_| {
-                    producers.fetch_add(1, Ordering::SeqCst);
-                    producer_entered
-                        .send(())
-                        .expect("index producer observation");
-                    let (released, wake) = &*release;
-                    let mut released = released.lock().expect("index release");
-                    while !*released {
-                        released = wake.wait(released).expect("index release wait");
-                    }
-                    Ok(())
-                })
+                .join_index_work(
+                    "rlm",
+                    "bsl-1",
+                    if self.first_execution.load(Ordering::SeqCst) {
+                        "test-build-2"
+                    } else {
+                        "test-build-1"
+                    },
+                    move |_| {
+                        producers.fetch_add(1, Ordering::SeqCst);
+                        producer_entered
+                            .send(())
+                            .expect("index producer observation");
+                        let (released, wake) = &*release;
+                        let mut released = released.lock().expect("index release");
+                        while !*released {
+                            released = wake.wait(released).expect("index release wait");
+                        }
+                        Ok(())
+                    },
+                )
                 .map_err(|_| InvocationFailure::new("index_failed", "index unavailable"))?;
             self.joined.send(key).expect("index join observation");
             if !self.first_execution.swap(true, Ordering::SeqCst) {
@@ -6139,6 +9448,200 @@ struct ActorLogicalReadLease {"#,
         .unwrap();
     }
 
+    /// A real executable stands in for the pinned runner. Its apply call waits
+    /// after entering the mutating step, so the test cancels at a known point.
+    /// Compiling it in the test keeps the same path on Unix and Windows.
+    pub(crate) fn install_cancellable_create_runner(root: &std::path::Path) {
+        use sha2::{Digest, Sha256};
+
+        for name in ["UNICA_PLUGIN_ROOT", "UNICA_ARTIFACT_CACHE"] {
+            assert!(
+                std::env::var_os(name).is_none(),
+                "the runner fixture must not resolve a binary from {name}"
+            );
+        }
+
+        let plugin = root.join("plugins/unica");
+        let target = crate::infrastructure::platform::current_target_id().unwrap();
+        let binary_name = format!("v8-runner{}", std::env::consts::EXE_SUFFIX);
+        let relative = format!("bin/{target}/{binary_name}");
+        let binary = plugin.join(&relative);
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(plugin.join("third-party")).unwrap();
+        std::fs::create_dir_all(plugin.join("skills")).unwrap();
+        let source = root.join("runner-probe.rs");
+        std::fs::write(
+            &source,
+            r##"
+use std::{env, fs, thread, time::{Duration, Instant}};
+fn main() {
+    let cwd = env::current_dir().unwrap();
+    let dry_run = env::args().any(|arg| arg == "--dry-run");
+    let created = cwd.join("created.marker");
+    if !dry_run {
+        fs::write(cwd.join("entered.marker"), "runner entered mutation").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !cwd.join("release.marker").exists() {
+            if Instant::now() >= deadline { panic!("runner was never released"); }
+            thread::sleep(Duration::from_millis(5));
+        }
+        fs::write(&created, "provider created infobase").unwrap();
+    }
+    let status = if !dry_run { "ok" } else if created.exists() { "skipped" } else { "planned" };
+    println!(r#"{{"ok":true,"command":"init","duration_ms":0,"data":{{"ok":true,"provider_dispatched":{},"steps":[{{"target":"infobase","action":"create","status":"{}","message":"probe","duration_ms":0}},{{"target":"edt_workspace","action":"import","status":"skipped","message":"probe","duration_ms":0}}],"duration_ms":0}},"warnings":[],"steps":[]}}"#, !dry_run, status);
+}
+"##,
+        )
+        .unwrap();
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let compiled = std::process::Command::new(rustc)
+            .arg("--edition=2021")
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .expect("compile runner probe");
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let digest = format!("{:x}", Sha256::digest(std::fs::read(&binary).unwrap()));
+        std::fs::write(
+            plugin.join("third-party/manifest.json"),
+            serde_json::json!({
+                "sourceManifest": true,
+                "tools": [{
+                    "name": "v8-runner",
+                    "version": RUNNER_VERSION,
+                    "binaries": {target: {"binaryPath": relative, "sha256": digest}}
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn mutating_runner_cancel_keeps_the_factual_receipt_over_the_v5_daemon_wire() {
+        let root = tempfile::tempdir().unwrap();
+        install_cancellable_create_runner(root.path());
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("v8project.yaml"),
+            "format: DESIGNER\ninfobase:\n  connection: 'File=build/ib'\n",
+        )
+        .unwrap();
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let daemon = LiveV5Daemon::start(canonical_v13_service());
+        let owner = daemon.owner();
+        // A separate workspace executes its first public call directly. The
+        // provider's internal preflight and factual receipt remain required.
+        let direct_workspace = root.path().join("direct-workspace");
+        std::fs::create_dir(&direct_workspace).unwrap();
+        std::fs::copy(
+            workspace.join("v8project.yaml"),
+            direct_workspace.join("v8project.yaml"),
+        )
+        .unwrap();
+        std::fs::write(
+            direct_workspace.join("release.marker"),
+            "allow direct execution",
+        )
+        .unwrap();
+        let direct_request = InvocationRequest::new(
+            ToolIdentity::Run,
+            serde_json::json!({"op":"infobase.create", "args":{}, "dryRun":false}),
+            std::fs::canonicalize(&direct_workspace)
+                .unwrap()
+                .to_string_lossy(),
+            7_000,
+        )
+        .unwrap();
+        let direct_task = daemon.task_id(&owner, &direct_request);
+        match daemon.wait_terminal(&owner, direct_task, Duration::from_secs(20)) {
+            V5DaemonTaskSnapshot::Completed { result, .. } => {
+                assert!(result.ok, "{result:?}");
+                assert!(result.rev.is_none());
+                assert_eq!(result.data.as_ref().unwrap()["state"], "created");
+            }
+            other => panic!("execution without a prior preview did not complete: {other:?}"),
+        }
+        assert!(direct_workspace.join("created.marker").exists());
+        let request = |dry_run: bool| {
+            let args = serde_json::json!({"op":"infobase.create","args":{},"dryRun":dry_run});
+            InvocationRequest::new(ToolIdentity::Run, args, workspace.to_string_lossy(), 7_000)
+                .unwrap()
+        };
+        let preview = daemon.task_id(&owner, &request(true));
+        match daemon.wait_terminal(&owner, preview, Duration::from_secs(20)) {
+            V5DaemonTaskSnapshot::Completed { result, .. } => {
+                assert!(result.ok, "{result:?}");
+                assert!(result.rev.is_none());
+                let next = result
+                    .next
+                    .iter()
+                    .find(|next| next["tool"] == "unica.run")
+                    .unwrap();
+                assert_eq!(next["args"]["dryRun"], false);
+                assert!(next["args"].get("ifRev").is_none());
+            }
+            other => panic!("preview did not complete: {other:?}"),
+        };
+
+        assert!(!workspace.join("entered.marker").exists());
+        let task_id = daemon.task_id(&owner, &request(false));
+        let entered = workspace.join("entered.marker");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !entered.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "mutating runner did not start: {:?}",
+                daemon.get(&owner, task_id)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let cancelled = daemon.cancel(&owner, task_id);
+        assert!(
+            matches!(
+                cancelled,
+                V5DaemonTaskSnapshot::Working {
+                    cancel_requested: true,
+                    ..
+                }
+            ),
+            "{cancelled:?}"
+        );
+        assert!(!workspace.join("created.marker").exists());
+        std::fs::write(workspace.join("release.marker"), "finish mutation").unwrap();
+        let terminal = daemon.wait_terminal(&owner, task_id, Duration::from_secs(20));
+        match terminal {
+            V5DaemonTaskSnapshot::Completed {
+                cancel_requested: true,
+                result,
+                ..
+            } => {
+                assert!(result.ok, "{result:?}");
+                assert_eq!(result.data.as_ref().unwrap()["state"], "created");
+                assert_eq!(
+                    result.data.as_ref().unwrap()["receipt"],
+                    "repeated preview reports nothing left to create"
+                );
+            }
+            other => panic!("late cancellation hid the provider receipt: {other:?}"),
+        }
+        assert!(workspace.join("created.marker").exists());
+        assert!(matches!(
+            daemon.get(&owner, task_id),
+            V5DaemonTaskSnapshot::Completed {
+                cancel_requested: true,
+                ..
+            }
+        ));
+        daemon.finish(owner);
+    }
+
     #[test]
     fn daemon_shared_delivery_releases_request_admission_before_wait_and_shares_across_worktrees() {
         let workspace_parent = tempfile::tempdir().unwrap();
@@ -6177,7 +9680,7 @@ struct ActorLogicalReadLease {"#,
         let request = |root: &std::path::Path| {
             InvocationRequest::new(
                 ToolIdentity::Run,
-                serde_json::json!({"op": "infobase.build", "args": {}}),
+                serde_json::json!({"op": "test.long-work", "args": {}}),
                 root.to_string_lossy(),
                 7_000,
             )
@@ -6313,7 +9816,7 @@ struct ActorLogicalReadLease {"#,
             let request = |root: &std::path::Path| {
                 InvocationRequest::new(
                     ToolIdentity::Run,
-                    serde_json::json!({"op": "infobase.build", "args": {}}),
+                    serde_json::json!({"op": "test.long-work", "args": {}}),
                     root.to_string_lossy(),
                     7_000,
                 )
@@ -6385,7 +9888,7 @@ struct ActorLogicalReadLease {"#,
     }
 
     #[test]
-    fn daemon_index_work_separates_worktrees_and_rejects_stale_revision_publication() {
+    fn daemon_index_work_separates_worktrees_and_build_generations() {
         // Distinct actor identities intentionally cannot join one Index key.
         let workspace_parent = tempfile::tempdir().unwrap();
         let roots = (0..2)
@@ -6405,7 +9908,7 @@ struct ActorLogicalReadLease {"#,
         let request = |root: &std::path::Path| {
             InvocationRequest::new(
                 ToolIdentity::Run,
-                serde_json::json!({"op": "infobase.build", "args": {}}),
+                serde_json::json!({"op": "test.long-work", "args": {}}),
                 root.to_string_lossy(),
                 7_000,
             )
@@ -6448,8 +9951,8 @@ struct ActorLogicalReadLease {"#,
         );
         daemon.finish(owner);
 
-        // A new trusted source revision starts a new producer, and the result
-        // staged under the prior revision cannot cross the actor publication fence.
+        // A new build generation starts a separate producer; source edits do not
+        // invalidate an already admitted build result.
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("marker.txt"), "old").unwrap();
         std::fs::write(
@@ -6465,7 +9968,7 @@ struct ActorLogicalReadLease {"#,
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let (mark_dirty, dirty_request) = mpsc::channel();
         let (dirty_done, dirty_wait) = mpsc::channel();
-        let service = Arc::new(RevisionChangingIndexService {
+        let service = Arc::new(GenerationChangingIndexService {
             producers: Arc::clone(&producers),
             producer_entered,
             joined,
@@ -6499,7 +10002,7 @@ struct ActorLogicalReadLease {"#,
                     Duration::from_millis(OWNERSHIP_CONTRACT_WAIT_MS)
                 )
                 .status(),
-            InvocationStatus::Failed
+            InvocationStatus::Completed
         );
         let second = daemon.wait_terminal(
             &owner,
@@ -6526,7 +10029,7 @@ struct ActorLogicalReadLease {"#,
         let request = || {
             InvocationRequest::new(
                 ToolIdentity::Run,
-                serde_json::json!({"op": "infobase.build", "args": {}}),
+                serde_json::json!({"op": "test.long-work", "args": {}}),
                 root.to_string_lossy(),
                 7_000,
             )
@@ -6600,7 +10103,7 @@ struct ActorLogicalReadLease {"#,
             "infrastructure::daemon::server::actor_capacity_tests::daemon_long_work_capabilities_handoff_before_wait_and_preserve_exact_ownership",
         );
         run_long_work_contract_obligation(
-            "infrastructure::daemon::server::actor_capacity_tests::daemon_index_work_separates_worktrees_and_rejects_stale_revision_publication",
+            "infrastructure::daemon::server::actor_capacity_tests::daemon_index_work_separates_worktrees_and_build_generations",
         );
         run_long_work_contract_obligation(
             "infrastructure::daemon::server::actor_capacity_tests::daemon_long_work_rejects_replaced_actor_root_before_reuse_or_publication",
@@ -6630,7 +10133,7 @@ struct ActorLogicalReadLease {"#,
         let request = |root: &std::path::Path| {
             InvocationRequest::new(
                 ToolIdentity::Run,
-                serde_json::json!({"op": "infobase.build", "args": {}}),
+                serde_json::json!({"op": "test.long-work", "args": {}}),
                 root.to_string_lossy(),
                 7_000,
             )
@@ -6717,7 +10220,7 @@ struct ActorLogicalReadLease {"#,
             .bind(
                 InvocationRequest::new(
                     ToolIdentity::Run,
-                    serde_json::json!({"op": "infobase.build", "args": {}}),
+                    serde_json::json!({"op": "test.long-work", "args": {}}),
                     root.to_string_lossy(),
                     7_000,
                 )
@@ -6742,7 +10245,7 @@ struct ActorLogicalReadLease {"#,
             ensure_platform_xml_workspace(&root.to_string_lossy());
             InvocationRequest::new(
                 ToolIdentity::Run,
-                serde_json::json!({"op": "infobase.build", "args": {}}),
+                serde_json::json!({"op": "test.long-work", "args": {}}),
                 root.to_string_lossy(),
                 7_000,
             )
@@ -6814,7 +10317,7 @@ struct ActorLogicalReadLease {"#,
         let owner = daemon.owner();
         let request = InvocationRequest::new(
             ToolIdentity::Run,
-            serde_json::json!({"op": "infobase.build", "args": {}}),
+            serde_json::json!({"op": "test.long-work", "args": {}}),
             root.to_string_lossy(),
             7_000,
         )

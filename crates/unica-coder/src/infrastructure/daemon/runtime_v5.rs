@@ -1,6 +1,4 @@
 use super::identity::{CoreIdentity, DaemonStateDirectory, ReceiptAuthorityLock};
-#[cfg(feature = "receipt-ledger-test-support")]
-use super::protocol_v5::V5PendingDirectReceipt;
 use super::protocol_v5::{
     decode_v5_request_frame, read_bounded_v5_request_frame_before, DecodedV5Request,
     V5AcknowledgedReceipt, V5ClientRequest, V5ClientRequestKind, V5DaemonErrorCode,
@@ -8,8 +6,6 @@ use super::protocol_v5::{
     V5InvocationResponse, V5ProbeServerResponse, V5RequestFrameError, V5ServerResponse,
     DAEMON_PROTOCOL_VERSION, MAX_V5_RESPONSE_LINE_BYTES,
 };
-#[cfg(feature = "receipt-ledger-test-support")]
-use super::protocol_v5::{decode_v5_server_response, read_bounded_v5_probe_response_frame};
 use super::server::{
     CanonicalInvocationService, DaemonServerConfig, V5ActorBoundCanonicalInvocation,
     V5CanonicalInvocationRuntime, V5CanonicalPrepareError, MAX_HANDSHAKES, MAX_OWNER_SESSIONS,
@@ -28,58 +24,45 @@ use crate::application::invocation_v5::{
     CancelReservedExpiryDecision, CancelReservedRecoveryDecision, CancelReservedSubmitDecision,
 };
 use crate::application::ports::Clock;
-#[cfg(feature = "receipt-ledger-test-support")]
-use crate::application::receipt_ledger::receipt_key_digest;
 use crate::application::receipt_ledger::{
     canonical_v5_terminal, AttemptPhase, CanonicalTerminalError, ClosedTerminalStatus,
     HandoffTerminalStage, OriginalCutoffDescriptor, PreparedWireFrame, ReceiptKey,
     ReceiptKeyDigest, ReceiptLedgerError, ReceiptState, ReceiptTaskProjection,
     ReceiptTerminalOutcome, ReserveOutcome, ReservedPhase, TaskBoundReceipt,
     TaskCancellationReceipt, TaskHandoffActorBoundReceipt, TaskPromisedActorBoundReceipt,
-    TaskRetirementPendingReceipt, TaskTerminalBoundReceipt, TerminalDigest,
-    DIRECT_TERMINAL_RETENTION_MS,
-};
-#[cfg(feature = "receipt-ledger-test-support")]
-use crate::application::receipt_ledger::{
-    AcknowledgedTombstoneReceipt, CommittedDirectPublication, ProvenTaskLinkCapacity,
-    TaskPromisedUnboundReceipt, TaskTerminalReceiptBackedReceipt,
+    TaskPromisedUnboundReceipt, TaskRetirementPendingReceipt, TaskTerminalBoundReceipt,
+    TerminalDigest, DIRECT_TERMINAL_RETENTION_MS,
 };
 use crate::application::receipt_ledger_actor::ReceiptLedgerActor;
 use crate::domain::cancellation::CancellationToken;
 use crate::domain::refusal::RefusalCode;
 use crate::infrastructure::platform::filesystem::RetainedDirectoryCapability;
+use crate::infrastructure::receipt_ledger::arm_receipt_row_directory_sync_fault;
 use crate::infrastructure::receipt_ledger::canonical_staged_transfer_certificate;
 use crate::infrastructure::receipt_ledger::ReceiptLedgerStore;
-#[cfg(feature = "receipt-ledger-test-support")]
-use crate::infrastructure::receipt_ledger::{
-    inject_receipt_row_directory_sync_failure_for_test, ReceiptBackedTaskTerminalSeed,
-    StableReceiptLedgerObservation,
-};
-#[cfg(feature = "receipt-ledger-test-support")]
-use crate::infrastructure::receipt_ledger_test_evidence::ProductionMissingTransitionEvidence;
 use crate::infrastructure::task_lifecycle_link_store_v5::{
     TaskLifecycleLinkCatalogEntry, TaskLifecycleLinkRecord, TaskLifecycleLinkStoreError,
     TaskLifecycleLinkStoreV5, TaskLinkReservation,
 };
 use crate::infrastructure::task_store_v5::FileInvocationStoreV5;
-#[cfg(feature = "receipt-ledger-test-support")]
 use crate::infrastructure::task_store_v5::PublicationFailure;
 use serde::Serialize;
-#[cfg(feature = "receipt-ledger-test-support")]
-use serde_json::json;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-#[cfg(feature = "receipt-ledger-test-support")]
-use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+mod hooks;
+pub(crate) use hooks::{
+    NoHooks, V5AdmissionRejection, V5PausePoint, V5ReceiptRuntimeEventKind, V5RuntimeHooks,
+    V5Stage, V5StoreFaultPoint,
+};
 #[cfg(feature = "receipt-ledger-test-support")]
 mod receipt_scenario_v5;
 #[cfg(feature = "receipt-ledger-test-support")]
@@ -101,908 +84,7 @@ const CUTOFF_HANDOFF_COMMIT_BUDGET: Duration = TASK_RECONCILIATION_BUDGET;
 const V5_TASK_POLL_INTERVAL_MS: u64 = 100;
 static NEXT_RETIREMENT_PROCESS_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-#[cfg(feature = "receipt-ledger-test-support")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum V5ReceiptRuntimeEventKind {
-    StrictEnvelopeParsed,
-    V5ReceiptRuntimeEntered,
-    V5ExecutorEntered,
-    CanonicalV13ServiceEntered,
-    ReceiptReserved,
-    ValidationEntered,
-    AdmissionEntered,
-    ActorBoundCommitted,
-    ReceiptBegunCommitted,
-    PrepareEntered,
-    ExecuteEntered,
-    UnboundPromiseCommitted,
-    BoundHandoffCommitted,
-    BoundHandoffTerminalStaged,
-    TaskBoundCommitted,
-    TaskLinkCapacityReserved,
-    TaskLinkCapacityRejected,
-    TaskStoreCreateAttempted,
-    TaskStoreCapacityInvariantViolation,
-    TaskStoreCreated,
-    TaskLinkReservationConverted,
-    FalseCancelObservationReached,
-    TaskStoreWorkingReadback,
-    TaskStoreTerminalCommitted,
-    TaskStoreTerminalReadback,
-    TaskTerminalBoundCommitted,
-    TokenSignalled,
-    MarkReservedBegunBlocked,
-    CancelCommitBlocked,
-    TaskStoreReadbackBeforeBind,
-    CancelCommitted,
-    OperationCompleted,
-    LeaseReleased,
-    ListenerPublished,
-    ListenerClosed,
-    CancelReservationConverted,
-    ResultSerialized,
-    ReceiptTerminalCommitted,
-    FinalResultProjected,
-    AcknowledgementCommitted,
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct V5ReceiptRuntimeEvent {
-    sequence: u64,
-    monotonic_ms: u64,
-    epoch_ms: u64,
-    event: V5ReceiptRuntimeEventKind,
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-#[derive(Debug, Clone, Copy, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct V5ReceiptRuntimeCallbackCounts {
-    validation: u64,
-    admission: u64,
-    prepare: u64,
-    execute: u64,
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum V5ReceiptRuntimeListenerState {
-    NotPublished,
-    Listening,
-    Closed,
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-struct V5ReceiptRuntimeTelemetryState {
-    next_sequence: u64,
-    wait_floor_sequence: u64,
-    events: Vec<V5ReceiptRuntimeEvent>,
-    callbacks: V5ReceiptRuntimeCallbackCounts,
-    listener: V5ReceiptRuntimeListenerState,
-    active_listeners: u64,
-    daemon_running: bool,
-    restart_requested: bool,
-    actor_leases: u64,
-    terminal_publications: Vec<Value>,
-    next_preflight_sequence: u64,
-    task_store_create_attempts: u64,
-    store_fault: Option<receipt_scenario_v5::ScenarioStoreFaultPoint>,
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-#[derive(Clone)]
-struct V5ReceiptRuntimeTelemetrySnapshot {
-    events: Vec<V5ReceiptRuntimeEvent>,
-    callbacks: V5ReceiptRuntimeCallbackCounts,
-    listener: V5ReceiptRuntimeListenerState,
-    daemon_running: bool,
-    restart_requested: bool,
-    actor_leases: u64,
-    terminal_publications: Vec<Value>,
-    task_store_create_attempts: u64,
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-struct V5ReceiptRuntimeTelemetry {
-    started_at: Instant,
-    state: Mutex<V5ReceiptRuntimeTelemetryState>,
-    changed: Condvar,
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-impl V5ReceiptRuntimeTelemetry {
-    fn new() -> Self {
-        Self {
-            started_at: Instant::now(),
-            state: Mutex::new(V5ReceiptRuntimeTelemetryState {
-                next_sequence: 1,
-                wait_floor_sequence: 1,
-                events: Vec::new(),
-                callbacks: V5ReceiptRuntimeCallbackCounts::default(),
-                listener: V5ReceiptRuntimeListenerState::NotPublished,
-                active_listeners: 0,
-                daemon_running: false,
-                restart_requested: false,
-                actor_leases: 0,
-                terminal_publications: Vec::new(),
-                next_preflight_sequence: 1,
-                task_store_create_attempts: 0,
-                store_fault: None,
-            }),
-            changed: Condvar::new(),
-        }
-    }
-
-    fn lock_state(&self) -> MutexGuard<'_, V5ReceiptRuntimeTelemetryState> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn record_event(&self, event: V5ReceiptRuntimeEventKind, epoch_ms: u64) -> u64 {
-        let monotonic_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let mut state = self.lock_state();
-        let sequence = state.next_sequence;
-        state.next_sequence = state
-            .next_sequence
-            .checked_add(1)
-            .expect("protocol-v5 runtime telemetry sequence exhausted u64");
-        state.events.push(V5ReceiptRuntimeEvent {
-            sequence,
-            monotonic_ms,
-            epoch_ms,
-            event,
-        });
-        self.changed.notify_all();
-        sequence
-    }
-
-    fn record_prepare(&self) {
-        let mut state = self.lock_state();
-        state.callbacks.prepare = state.callbacks.prepare.saturating_add(1);
-        self.changed.notify_all();
-    }
-
-    fn record_validation(&self) {
-        let mut state = self.lock_state();
-        state.callbacks.validation = state.callbacks.validation.saturating_add(1);
-        self.changed.notify_all();
-    }
-
-    fn record_admission(&self) {
-        let mut state = self.lock_state();
-        state.callbacks.admission = state.callbacks.admission.saturating_add(1);
-        self.changed.notify_all();
-    }
-
-    fn record_execute(&self) {
-        let mut state = self.lock_state();
-        state.callbacks.execute = state.callbacks.execute.saturating_add(1);
-        self.changed.notify_all();
-    }
-
-    fn record_task_store_create_attempt(&self) {
-        let mut state = self.lock_state();
-        state.task_store_create_attempts = state.task_store_create_attempts.saturating_add(1);
-        self.changed.notify_all();
-    }
-
-    fn record_restart_requested(&self) {
-        let mut state = self.lock_state();
-        state.restart_requested = true;
-        self.changed.notify_all();
-    }
-
-    fn record_forced_process_exit(&self) {
-        let mut state = self.lock_state();
-        if state.restart_requested
-            && state.listener == V5ReceiptRuntimeListenerState::Closed
-            && !state.daemon_running
-        {
-            return;
-        }
-        let epoch_ms = state.events.last().map_or(1, |event| event.epoch_ms.max(1));
-        state.restart_requested = true;
-        state.listener = V5ReceiptRuntimeListenerState::Closed;
-        state.daemon_running = false;
-        self.changed.notify_all();
-        drop(state);
-        self.record_event(V5ReceiptRuntimeEventKind::ListenerClosed, epoch_ms);
-    }
-
-    fn reset_for_scenario(&self) {
-        let mut state = self.lock_state();
-        state.wait_floor_sequence = state.next_sequence;
-        state.callbacks = V5ReceiptRuntimeCallbackCounts::default();
-        state.listener = V5ReceiptRuntimeListenerState::NotPublished;
-        state.active_listeners = 0;
-        state.daemon_running = false;
-        state.restart_requested = false;
-        state.actor_leases = 0;
-        state.terminal_publications.clear();
-        state.task_store_create_attempts = 0;
-        state.store_fault = None;
-        self.changed.notify_all();
-    }
-
-    fn arm_store_fault(&self, point: receipt_scenario_v5::ScenarioStoreFaultPoint) {
-        self.lock_state().store_fault = Some(point);
-    }
-
-    fn take_store_fault(&self, point: receipt_scenario_v5::ScenarioStoreFaultPoint) -> bool {
-        let mut state = self.lock_state();
-        if state.store_fault == Some(point) {
-            state.store_fault = None;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn snapshot(&self) -> V5ReceiptRuntimeTelemetrySnapshot {
-        let state = self.lock_state();
-        V5ReceiptRuntimeTelemetrySnapshot {
-            events: state.events.clone(),
-            callbacks: state.callbacks,
-            listener: state.listener,
-            daemon_running: state.daemon_running,
-            restart_requested: state.restart_requested,
-            actor_leases: if state.restart_requested && !state.daemon_running {
-                0
-            } else {
-                state.actor_leases
-            },
-            terminal_publications: state.terminal_publications.clone(),
-            task_store_create_attempts: state.task_store_create_attempts,
-        }
-    }
-
-    fn record_direct_publication(
-        &self,
-        publication: &CommittedDirectPublication,
-        response_kind: &'static str,
-        origin: &'static str,
-        candidate_result_override: Option<Value>,
-    ) {
-        let mut state = self.lock_state();
-        let receipt_key = receipt_key_observation_value(publication.receipt().key());
-        let response_prepared_sequence = state.next_preflight_sequence;
-        let response_write_sequence = response_prepared_sequence
-            .checked_add(1)
-            .expect("protocol-v5 preflight sequence exhausted u64");
-        if let Some(existing) = state
-            .terminal_publications
-            .iter_mut()
-            .find(|value| value.get("receiptKey") == Some(&receipt_key))
-        {
-            if let Some(frames) = existing
-                .get_mut("responseFrames")
-                .and_then(Value::as_array_mut)
-            {
-                frames.push(json!({
-                    "responseKind": response_kind,
-                    "origin": origin,
-                    "responseJsonl": artifact_value(
-                        publication.wire_frame().jsonl(),
-                        publication.wire_frame().encoded_bytes(),
-                        publication.wire_frame().sha256(),
-                    ),
-                    "preparedSequence": response_prepared_sequence,
-                    "writeSequence": response_write_sequence,
-                }));
-            }
-            state.next_preflight_sequence = response_write_sequence
-                .checked_add(1)
-                .expect("protocol-v5 preflight sequence exhausted u64");
-            return;
-        }
-
-        let Some(record) = publication.prepared_record() else {
-            return;
-        };
-        let terminal_payload_sequence = response_prepared_sequence;
-        let receipt_record_sequence = terminal_payload_sequence
-            .checked_add(1)
-            .expect("protocol-v5 preflight sequence exhausted u64");
-        let receipt_commit_sequence = receipt_record_sequence
-            .checked_add(1)
-            .expect("protocol-v5 preflight sequence exhausted u64");
-        state.next_preflight_sequence = receipt_commit_sequence
-            .checked_add(1)
-            .expect("protocol-v5 preflight sequence exhausted u64");
-        state.terminal_publications.push(json!({
-            "receiptKey": receipt_key,
-            "terminal": terminal_observation_value(
-                publication.receipt().terminal(),
-                publication.receipt().terminal_epoch_ms(),
-            ),
-            "commit": {
-                "owner": "direct_receipt_ledger",
-                "receipt": {
-                    "terminalPayload": artifact_value(
-                        record.terminal().payload(),
-                        u64::try_from(record.terminal().payload().len())
-                            .expect("terminal payload length fits u64"),
-                        &crate::application::receipt_ledger::ArtifactSha256::from_sha256(
-                            Sha256::digest(record.terminal().payload()).into(),
-                        ),
-                    ),
-                    "receiptRecord": artifact_value(
-                        record.bytes(),
-                        record.encoded_bytes(),
-                        record.sha256(),
-                    ),
-                    "candidateResult": candidate_result_override
-                        .or_else(|| candidate_result_value(record.terminal())),
-                    "terminalPayloadPreparedSequence": terminal_payload_sequence,
-                    "receiptRecordPreparedSequence": receipt_record_sequence,
-                    "receiptCommitSequence": receipt_commit_sequence,
-                    "receiptExpectedVersion": record.binding().expected_version().get(),
-                }
-            },
-            "responseFrames": [{
-                "responseKind": response_kind,
-                "origin": origin,
-                "responseJsonl": artifact_value(
-                    publication.wire_frame().jsonl(),
-                    publication.wire_frame().encoded_bytes(),
-                    publication.wire_frame().sha256(),
-                ),
-                "preparedSequence": response_prepared_sequence,
-                "writeSequence": Value::Null,
-            }],
-        }));
-    }
-
-    fn record_receipt_backed_publication(
-        &self,
-        receipt: &TaskTerminalReceiptBackedReceipt,
-        record_bytes: &[u8],
-    ) {
-        let mut state = self.lock_state();
-        let terminal_payload_sequence = state.next_preflight_sequence;
-        let receipt_record_sequence = terminal_payload_sequence.saturating_add(1);
-        let receipt_commit_sequence = receipt_record_sequence.saturating_add(1);
-        state.next_preflight_sequence = receipt_commit_sequence.saturating_add(1);
-        let record_sha = crate::application::receipt_ledger::ArtifactSha256::from_sha256(
-            Sha256::digest(record_bytes).into(),
-        );
-        state.terminal_publications.push(json!({
-            "receiptKey": receipt_key_observation_value(receipt.key()),
-            "terminal": terminal_observation_value(
-                receipt.terminal(),
-                receipt.terminal_epoch_ms(),
-            ),
-            "commit": {
-                "owner": "receipt_backed_task",
-                "receipt": {
-                    "terminalPayload": artifact_value(
-                        receipt.terminal().payload(),
-                        u64::try_from(receipt.terminal().payload().len()).unwrap_or(u64::MAX),
-                        &crate::application::receipt_ledger::ArtifactSha256::from_sha256(
-                            Sha256::digest(receipt.terminal().payload()).into(),
-                        ),
-                    ),
-                    "receiptRecord": artifact_value(
-                        record_bytes,
-                        u64::try_from(record_bytes.len()).unwrap_or(u64::MAX),
-                        &record_sha,
-                    ),
-                    "candidateResult": candidate_result_value(receipt.terminal()),
-                    "terminalPayloadPreparedSequence": terminal_payload_sequence,
-                    "receiptRecordPreparedSequence": receipt_record_sequence,
-                    "receiptCommitSequence": receipt_commit_sequence,
-                    "receiptExpectedVersion": receipt.record_version().get().saturating_sub(1),
-                }
-            },
-            "responseFrames": [],
-        }));
-    }
-
-    fn wait_for_event(
-        &self,
-        event: V5ReceiptRuntimeEventKind,
-        deadline: Instant,
-    ) -> Result<(), String> {
-        let mut state = self.lock_state();
-        while !state
-            .events
-            .iter()
-            .any(|record| record.sequence >= state.wait_floor_sequence && record.event == event)
-        {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(|| format!("protocol-v5 runtime event {event:?} was not observed"))?;
-            let (next, timeout) = self
-                .changed
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state = next;
-            if timeout.timed_out()
-                && !state.events.iter().any(|record| {
-                    record.sequence >= state.wait_floor_sequence && record.event == event
-                })
-            {
-                let observed = state
-                    .events
-                    .iter()
-                    .filter(|record| record.sequence >= state.wait_floor_sequence)
-                    .map(|record| format!("{:?}", record.event))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(format!(
-                    "protocol-v5 runtime event {event:?} was not observed; observed: [{observed}]"
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn wait_for_event_count(
-        &self,
-        event: V5ReceiptRuntimeEventKind,
-        count: usize,
-        deadline: Instant,
-    ) -> Result<(), String> {
-        let mut state = self.lock_state();
-        let observed_count = |state: &V5ReceiptRuntimeTelemetryState| {
-            state
-                .events
-                .iter()
-                .filter(|record| {
-                    record.sequence >= state.wait_floor_sequence && record.event == event
-                })
-                .count()
-        };
-        while observed_count(&state) < count {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(|| {
-                    format!(
-                    "protocol-v5 runtime event {event:?} was observed {} times, expected {count}",
-                    observed_count(&state)
-                )
-                })?;
-            let (next, timeout) = self
-                .changed
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state = next;
-            if timeout.timed_out() && observed_count(&state) < count {
-                return Err(format!(
-                    "protocol-v5 runtime event {event:?} was observed {} times, expected {count}",
-                    observed_count(&state)
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn wait_for_either_event(
-        &self,
-        first: V5ReceiptRuntimeEventKind,
-        second: V5ReceiptRuntimeEventKind,
-        deadline: Instant,
-    ) -> Result<(), String> {
-        let mut state = self.lock_state();
-        let observed = |state: &V5ReceiptRuntimeTelemetryState| {
-            state.events.iter().any(|record| {
-                record.sequence >= state.wait_floor_sequence
-                    && (record.event == first || record.event == second)
-            })
-        };
-        while !observed(&state) {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(|| {
-                    format!(
-                        "neither protocol-v5 runtime event {first:?} nor {second:?} was observed"
-                    )
-                })?;
-            let (next, timeout) = self
-                .changed
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state = next;
-            if timeout.timed_out() && !observed(&state) {
-                return Err(format!(
-                    "neither protocol-v5 runtime event {first:?} nor {second:?} was observed"
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn listener_lease(self: &Arc<Self>) -> V5ReceiptRuntimeListenerLease {
-        let mut state = self.lock_state();
-        let epoch_ms = state.events.last().map_or(1, |event| event.epoch_ms.max(1));
-        state.active_listeners = state
-            .active_listeners
-            .checked_add(1)
-            .expect("protocol-v5 runtime listener telemetry exhausted u64");
-        state.listener = V5ReceiptRuntimeListenerState::Listening;
-        state.daemon_running = true;
-        self.changed.notify_all();
-        drop(state);
-        self.record_event(V5ReceiptRuntimeEventKind::ListenerPublished, epoch_ms);
-        V5ReceiptRuntimeListenerLease {
-            telemetry: Arc::clone(self),
-        }
-    }
-
-    fn actor_lease(self: &Arc<Self>) -> V5ReceiptRuntimeActorLease {
-        let mut state = self.lock_state();
-        state.actor_leases = state
-            .actor_leases
-            .checked_add(1)
-            .expect("protocol-v5 runtime actor-lease telemetry exhausted u64");
-        self.changed.notify_all();
-        V5ReceiptRuntimeActorLease {
-            telemetry: Arc::clone(self),
-        }
-    }
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn receipt_key_observation_value(key: &ReceiptKey) -> Value {
-    json!({
-        "invocationId": key.invocation_id(),
-        "reservedTaskId": key.reserved_task_id(),
-        "coreIdentityDigest": key.core_identity_digest(),
-        "tool": key.tool(),
-        "normalizedArgumentsHash": key.normalized_arguments_hash(),
-        "requestScopeHash": key.request_scope_hash(),
-        "keyDigest": crate::application::receipt_ledger::receipt_key_digest(key),
-    })
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn artifact_value(
-    bytes: &[u8],
-    encoded_bytes: u64,
-    sha256: &crate::application::receipt_ledger::ArtifactSha256,
-) -> Value {
-    json!({
-        "rawHex": lower_hex(bytes),
-        "encodedBytes": encoded_bytes,
-        "sha256": sha256.to_string(),
-    })
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn artifact_from_bytes(bytes: &[u8]) -> Value {
-    artifact_value(
-        bytes,
-        u64::try_from(bytes.len()).expect("artifact length fits u64"),
-        &crate::application::receipt_ledger::ArtifactSha256::from_sha256(
-            Sha256::digest(bytes).into(),
-        ),
-    )
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn terminal_observation_value(
-    terminal: &crate::application::receipt_ledger::V5CanonicalTerminal,
-    terminal_epoch_ms: u64,
-) -> Value {
-    let mut value = serde_json::to_value(terminal.outcome())
-        .expect("protocol-v5 terminal outcome must serialize");
-    let object = value
-        .as_object_mut()
-        .expect("protocol-v5 terminal outcome must be an object");
-    object.insert(
-        "canonical_payload_hex".to_owned(),
-        Value::String(lower_hex(terminal.payload())),
-    );
-    object.insert(
-        "terminal_digest".to_owned(),
-        Value::String(terminal.digest().to_string()),
-    );
-    object.insert(
-        "terminal_epoch_ms".to_owned(),
-        Value::Number(terminal_epoch_ms.into()),
-    );
-    value
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn candidate_result_value(
-    terminal: &crate::application::receipt_ledger::V5CanonicalTerminal,
-) -> Option<Value> {
-    match terminal.outcome() {
-        crate::application::receipt_ledger::ReceiptTerminalOutcome::Completed { result } => {
-            let bytes = serde_json::to_vec(result).expect("DomainResult must serialize");
-            Some(artifact_from_bytes(&bytes))
-        }
-        crate::application::receipt_ledger::ReceiptTerminalOutcome::Failed { .. }
-        | crate::application::receipt_ledger::ReceiptTerminalOutcome::Cancelled => None,
-    }
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn lower_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-struct V5ReceiptRuntimeListenerLease {
-    telemetry: Arc<V5ReceiptRuntimeTelemetry>,
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-impl Drop for V5ReceiptRuntimeListenerLease {
-    fn drop(&mut self) {
-        let mut state = self.telemetry.lock_state();
-        state.active_listeners = state
-            .active_listeners
-            .checked_sub(1)
-            .expect("protocol-v5 runtime listener telemetry lease released only once");
-        if state.active_listeners == 0 {
-            state.listener = V5ReceiptRuntimeListenerState::Closed;
-            state.daemon_running = false;
-        }
-        self.telemetry.changed.notify_all();
-    }
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-struct V5ReceiptRuntimeActorLease {
-    telemetry: Arc<V5ReceiptRuntimeTelemetry>,
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-impl Drop for V5ReceiptRuntimeActorLease {
-    fn drop(&mut self) {
-        let mut state = self.telemetry.lock_state();
-        let epoch_ms = state.events.last().map_or(1, |event| event.epoch_ms.max(1));
-        state.actor_leases = state
-            .actor_leases
-            .checked_sub(1)
-            .expect("protocol-v5 runtime actor telemetry lease released only once");
-        self.telemetry.changed.notify_all();
-        drop(state);
-        self.telemetry
-            .record_event(V5ReceiptRuntimeEventKind::LeaseReleased, epoch_ms);
-    }
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn open_receipt_actor_for_scenario(
-    receipts: RetainedDirectoryCapability,
-    context: &'static str,
-) -> Result<ReceiptLedgerActor, String> {
-    // Opening a fixture after a horizon/full-pool action performs the same bounded
-    // retained-store recovery as daemon startup. Keep that test-only I/O inside the
-    // bulk fixture budget instead of accidentally applying the ordinary 5-second
-    // operation timeout to thousands of durable rows.
-    let store = ReceiptLedgerStore::open_retained_directory_before(
-        receipts,
-        Instant::now() + receipt_scenario_v5::SCENARIO_BULK_OPERATION_TIMEOUT,
-    )
-    .map_err(|error| format!("{context}: {error}"))?;
-    Ok(ReceiptLedgerActor::spawn(store))
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn inject_receipt_identity_collision_for_scenario(
-    receipts: RetainedDirectoryCapability,
-    collide_on_invocation_id: bool,
-    deadline: Instant,
-) -> Result<(), String> {
-    let store = ReceiptLedgerStore::open_retained_directory(receipts)
-        .map_err(|error| format!("reopen identity-collision fixture store: {error}"))?;
-    store
-        .inject_identity_index_collision_for_test(collide_on_invocation_id, deadline)
-        .map_err(|error| format!("inject persisted identity collision: {error}"))
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn seed_receipt_backed_task_terminal_for_scenario(
-    receipts: RetainedDirectoryCapability,
-    seed: ReceiptBackedTaskTerminalSeed,
-    deadline: Instant,
-) -> Result<TaskTerminalReceiptBackedReceipt, String> {
-    let store = ReceiptLedgerStore::open_retained_directory(receipts)
-        .map_err(|error| format!("open receipt-backed Task fixture ledger: {error}"))?;
-    store
-        .seed_task_terminal_receipt_backed_for_test(seed, deadline)
-        .map_err(|error| format!("seed receipt-backed Task terminal: {error}"))
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn seed_receipt_tombstones_for_scenario(
-    receipts: RetainedDirectoryCapability,
-    keys: Vec<ReceiptKey>,
-    acknowledged_at_epoch_ms: u64,
-    terminal_digest: TerminalDigest,
-    deadline: Instant,
-) -> Result<(ReceiptLedgerActor, Vec<AcknowledgedTombstoneReceipt>), String> {
-    let store = ReceiptLedgerStore::open_retained_directory(receipts)
-        .map_err(|error| format!("open tombstone fixture ledger: {error}"))?;
-    let seeded = store
-        .seed_tombstones_for_test(keys, acknowledged_at_epoch_ms, terminal_digest, deadline)
-        .map_err(|error| format!("seed tombstone fixture pool: {error}"))?;
-    Ok((ReceiptLedgerActor::spawn(store), seeded))
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-#[derive(Clone, Copy)]
-struct ScenarioTaskTiming {
-    created_at_epoch_ms: u64,
-    ttl_ms: u64,
-    poll_interval_ms: u64,
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-impl ScenarioTaskTiming {
-    fn new(created_at_epoch_ms: u64, ttl_ms: u64, poll_interval_ms: u64) -> Self {
-        Self {
-            created_at_epoch_ms,
-            ttl_ms,
-            poll_interval_ms,
-        }
-    }
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn promise_task_unbound_for_scenario(
-    actor: &ReceiptLedgerActor,
-    key: ReceiptKey,
-    expected_version: crate::application::receipt_ledger::ReceiptVersion,
-    timing: ScenarioTaskTiming,
-    deadline: Instant,
-    telemetry: &V5ReceiptRuntimeTelemetry,
-) -> Result<TaskPromisedUnboundReceipt, ReceiptLedgerError> {
-    let promised = actor.promise_task_unbound(
-        key,
-        expected_version,
-        timing.created_at_epoch_ms,
-        timing.ttl_ms,
-        timing.poll_interval_ms,
-        deadline,
-    )?;
-    telemetry.record_event(
-        V5ReceiptRuntimeEventKind::UnboundPromiseCommitted,
-        timing.created_at_epoch_ms,
-    );
-    Ok(promised)
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn begin_bound_task_handoff_for_scenario(
-    actor: &ReceiptLedgerActor,
-    key: ReceiptKey,
-    expected_version: crate::application::receipt_ledger::ReceiptVersion,
-    timing: ScenarioTaskTiming,
-    deadline: Instant,
-    telemetry: &V5ReceiptRuntimeTelemetry,
-) -> Result<TaskHandoffActorBoundReceipt, ReceiptLedgerError> {
-    let handoff = actor.begin_bound_task_handoff(
-        key,
-        expected_version,
-        timing.created_at_epoch_ms,
-        timing.ttl_ms,
-        timing.poll_interval_ms,
-        deadline,
-    )?;
-    telemetry.record_event(
-        V5ReceiptRuntimeEventKind::BoundHandoffCommitted,
-        timing.created_at_epoch_ms,
-    );
-    Ok(handoff)
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn publish_direct_terminal_for_scenario(
-    actor: &ReceiptLedgerActor,
-    key: ReceiptKey,
-    expected_version: crate::application::receipt_ledger::ReceiptVersion,
-    terminal_epoch_ms: u64,
-    terminal: crate::application::receipt_ledger::V5CanonicalTerminal,
-    deadline: Instant,
-    telemetry: &V5ReceiptRuntimeTelemetry,
-) -> Result<CommittedDirectPublication, ReceiptLedgerError> {
-    let publication = actor.publish_direct_terminal(
-        key,
-        expected_version,
-        terminal_epoch_ms,
-        terminal,
-        deadline,
-    )?;
-    telemetry.record_event(
-        V5ReceiptRuntimeEventKind::ReceiptTerminalCommitted,
-        terminal_epoch_ms,
-    );
-    Ok(publication)
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn publish_receipt_backed_task_terminal_for_scenario(
-    actor: &ReceiptLedgerActor,
-    key: ReceiptKey,
-    expected: TaskCancellationReceipt,
-    terminal_epoch_ms: u64,
-    terminal: crate::application::receipt_ledger::V5CanonicalTerminal,
-    deadline: Instant,
-    telemetry: &V5ReceiptRuntimeTelemetry,
-) -> Result<TaskTerminalReceiptBackedReceipt, ReceiptLedgerError> {
-    let publication = actor.publish_receipt_backed_task_terminal(
-        key,
-        expected,
-        terminal_epoch_ms,
-        terminal,
-        deadline,
-    )?;
-    telemetry.record_event(
-        V5ReceiptRuntimeEventKind::ReceiptTerminalCommitted,
-        terminal_epoch_ms,
-    );
-    Ok(publication)
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn stage_bound_handoff_terminal_for_scenario(
-    actor: &ReceiptLedgerActor,
-    handoff: TaskHandoffActorBoundReceipt,
-    epoch_ms: u64,
-    terminal: crate::application::receipt_ledger::V5CanonicalTerminal,
-    deadline: Instant,
-    telemetry: &V5ReceiptRuntimeTelemetry,
-) -> Result<TaskHandoffActorBoundReceipt, ReceiptLedgerError> {
-    telemetry.record_execute();
-    telemetry.record_event(V5ReceiptRuntimeEventKind::ExecuteEntered, epoch_ms);
-    telemetry.record_event(V5ReceiptRuntimeEventKind::ResultSerialized, epoch_ms);
-    let certificate = canonical_staged_transfer_certificate(
-        handoff.key(),
-        handoff.key_digest(),
-        handoff.link(),
-        epoch_ms,
-        &terminal,
-    )?;
-    let staged = actor.stage_bound_task_handoff_terminal(
-        handoff.key().clone(),
-        handoff.record_version(),
-        epoch_ms,
-        terminal,
-        certificate,
-        deadline,
-    )?;
-    telemetry.record_event(
-        V5ReceiptRuntimeEventKind::BoundHandoffTerminalStaged,
-        epoch_ms,
-    );
-    Ok(staged)
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn acknowledge_direct_for_scenario(
-    actor: &ReceiptLedgerActor,
-    key: ReceiptKey,
-    terminal_digest: TerminalDigest,
-    acknowledged_at_epoch_ms: u64,
-    deadline: Instant,
-    telemetry: &V5ReceiptRuntimeTelemetry,
-) -> Result<AcknowledgedTombstoneReceipt, ReceiptLedgerError> {
-    let acknowledgement =
-        actor.acknowledge_direct(key, terminal_digest, acknowledged_at_epoch_ms, deadline)?;
-    telemetry.record_event(
-        V5ReceiptRuntimeEventKind::AcknowledgementCommitted,
-        acknowledged_at_epoch_ms,
-    );
-    Ok(acknowledgement)
-}
-
-struct V5ReceiptRuntime {
+pub(crate) struct V5ReceiptRuntime {
     core_identity: CoreIdentity,
     // On healthy shutdown Rust drops fields in declaration order: the actor
     // joins and releases its store before named authority is released. A
@@ -1010,22 +92,20 @@ struct V5ReceiptRuntime {
     receipt_ledger: ReceiptLedgerActor,
     _stable_authority: ReceiptAuthorityLock,
     epoch_clock: Arc<dyn EpochMillisClock>,
-    #[cfg(feature = "receipt-ledger-test-support")]
-    initial_receipt_observation: StableReceiptLedgerObservation,
-    #[cfg_attr(not(feature = "receipt-ledger-test-support"), allow(dead_code))]
     invocation_executor: V5InvocationExecutor,
-    #[cfg_attr(not(feature = "receipt-ledger-test-support"), allow(dead_code))]
     task_projection: V5TaskProjection,
     active_task_cancellations: Arc<V5ActiveTaskCancellations>,
     task_execution_threads: Mutex<Vec<thread::JoinHandle<()>>>,
     task_terminal_coordinator: Mutex<()>,
     external_store_fail_stop: AtomicBool,
-    #[cfg(feature = "receipt-ledger-test-support")]
-    evidence_capture: Option<SyncSender<ProductionMissingTransitionEvidence>>,
-    #[cfg(feature = "receipt-ledger-test-support")]
-    scenario_control: Option<Arc<receipt_scenario_v5::ReceiptScenarioControl>>,
-    #[cfg(feature = "receipt-ledger-test-support")]
-    telemetry: Arc<V5ReceiptRuntimeTelemetry>,
+    fail_stop_watchdogs: FailStopWatchdogs,
+    /// How many promoted attempts the owner handed to a worker are still
+    /// running their continuation: the contract harness waits on this to
+    /// observe a promoted Task the runtime finishes off-thread.
+    promoted_continuations: AtomicUsize,
+    /// Who observes this runtime and what it injects; production installs
+    /// `NoHooks`.
+    hooks: Arc<dyn V5RuntimeHooks>,
 }
 
 #[derive(Default)]
@@ -1058,29 +138,6 @@ impl V5ActiveTaskCancellations {
         ))
     }
 
-    /// Registers the token an inline worker already executes under: the
-    /// cutoff turned that execution into a Task without restarting it.
-    fn register_existing(
-        self: &Arc<Self>,
-        task_id: crate::domain::invocation::TaskId,
-        token: CancellationToken,
-    ) -> Result<V5ActiveTaskCancellationGuard, ReceiptLedgerError> {
-        let mut tokens = self
-            .tokens
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if tokens.contains_key(&task_id) {
-            return Err(ReceiptLedgerError::Corrupt(
-                "Task already owns an active cancellation token",
-            ));
-        }
-        tokens.insert(task_id, token);
-        Ok(V5ActiveTaskCancellationGuard {
-            registry: Arc::clone(self),
-            task_id,
-        })
-    }
-
     fn cancel(&self, task_id: crate::domain::invocation::TaskId) {
         if let Some(token) = self
             .tokens
@@ -1091,6 +148,14 @@ impl V5ActiveTaskCancellations {
         {
             token.cancel();
         }
+    }
+
+    fn protected_started(&self, task_id: crate::domain::invocation::TaskId) -> bool {
+        self.tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&task_id)
+            .is_some_and(CancellationToken::protected_process_started)
     }
 
     fn is_empty(&self) -> bool {
@@ -1113,6 +178,176 @@ impl Drop for V5ActiveTaskCancellationGuard {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.task_id);
+    }
+}
+
+/// What the pipeline worker hands back to the session handler that owns
+/// the reply and the pre-`Begun` cutoff.
+#[allow(clippy::large_enum_variant)]
+enum PipelineReport {
+    Reply(V5RuntimeReply),
+    Failed(ReceiptLedgerError),
+}
+
+/// Who answers the request while the worker runs the pipeline.
+enum PipelineDecision {
+    /// The session handler waits for the worker's reply under the cutoff.
+    Waiting,
+    /// The cutoff passed before `Begun`: the handler promotes the receipt.
+    HandoffInProgress,
+    /// The handler took the worker's reply.
+    HandlerOwns,
+    /// The handler promoted the receipt before `Begun` and answered with its
+    /// projection; the worker continues the attempt into that Task and its
+    /// own reply is dropped.
+    PromotedByOwner,
+}
+
+struct PipelineSlotState {
+    decision: PipelineDecision,
+    report: Option<PipelineReport>,
+    /// The worker committed `Begun`: from here the inline drive on the
+    /// worker thread owns the cutoff, not the session handler.
+    begun: bool,
+    /// A Task the session handler materialized at the begun cutoff while the
+    /// worker was paused before prepare: the worker executes into it.
+    owner_materialized: Option<(V5StoredInvocationRecord, TaskBoundReceipt)>,
+}
+
+/// One attempt shared between the session handler that owns the reply and
+/// the pre-`Begun` cutoff and the worker that runs the pipeline.
+struct PipelineSlot {
+    state: Mutex<PipelineSlotState>,
+    changed: Condvar,
+}
+
+impl PipelineSlot {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(PipelineSlotState {
+                decision: PipelineDecision::Waiting,
+                report: None,
+                begun: false,
+                owner_materialized: None,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, PipelineSlotState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The worker's inline drive claims the cutoff before it starts timing:
+    /// from here the drive answers the seventh second. `false` when the
+    /// handler already promoted the receipt — the drive then hands off at
+    /// once into that intent.
+    fn claim_cutoff(&self) -> bool {
+        let mut state = self.lock();
+        while matches!(state.decision, PipelineDecision::HandoffInProgress) {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if matches!(state.decision, PipelineDecision::PromotedByOwner) {
+            return false;
+        }
+        state.begun = true;
+        self.changed.notify_all();
+        true
+    }
+
+    /// The session handler records the Task it materialized at the begun
+    /// cutoff so the paused worker executes into it once released.
+    fn stash_owner_materialized(&self, record: V5StoredInvocationRecord, bound: TaskBoundReceipt) {
+        self.lock().owner_materialized = Some((record, bound));
+    }
+
+    fn take_owner_materialized(&self) -> Option<(V5StoredInvocationRecord, TaskBoundReceipt)> {
+        self.lock().owner_materialized.take()
+    }
+
+    /// The worker deposits its reply. While the handler promotes the receipt
+    /// the worker waits for that decision instead of racing it.
+    fn report(&self, report: PipelineReport) {
+        let mut state = self.lock();
+        while matches!(state.decision, PipelineDecision::HandoffInProgress) {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.report = Some(report);
+        self.changed.notify_all();
+    }
+
+    /// Whether the handler already answered with a promotion; a worker whose
+    /// durable transition lost the race asks this before re-reading.
+    fn promoted_by_owner(&self) -> bool {
+        let mut state = self.lock();
+        while matches!(state.decision, PipelineDecision::HandoffInProgress) {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        matches!(state.decision, PipelineDecision::PromotedByOwner)
+    }
+}
+
+/// Deadlines after which a stalled attempt fail-stops the process: the grace
+/// after an unbound promise without an actor bind, and the grace after a
+/// cancel without a terminal. The accept loop reads them on the runtime's
+/// own clock, so the observer's clock drives them the same way.
+#[derive(Default)]
+struct FailStopWatchdogs {
+    armed: Mutex<HashMap<ReceiptKeyDigest, (Instant, Instant)>>,
+}
+
+impl FailStopWatchdogs {
+    fn arm(&self, digest: ReceiptKeyDigest, now: Instant, grace: Duration) {
+        self.armed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(digest)
+            .or_insert((now, now + grace));
+    }
+
+    fn disarm(&self, digest: &ReceiptKeyDigest) {
+        self.armed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(digest);
+    }
+
+    /// The elapsed grace of a watchdog that is due at `now`.
+    fn due(&self, now: Instant) -> Option<Duration> {
+        self.armed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|(_, due)| now >= *due)
+            .map(|(armed_at, _)| now.saturating_duration_since(*armed_at))
+            .max()
+    }
+}
+
+/// The grace a promised or cancelled attempt gets before the process
+/// fail-stops on it.
+const FAIL_STOP_GRACE: Duration = TASK_RECONCILIATION_BUDGET;
+
+fn task_outcome_after_cancel(
+    candidate: ReceiptTerminalOutcome,
+    cancel_requested: bool,
+    protected_started: bool,
+) -> ReceiptTerminalOutcome {
+    if cancel_requested && !protected_started {
+        ReceiptTerminalOutcome::Cancelled
+    } else {
+        candidate
     }
 }
 
@@ -1220,6 +455,14 @@ enum InlineSettlement {
     },
 }
 
+/// What the cutoff commit produced: the Task the running attempt continues
+/// into, or its terminal when the outcome was already there.
+#[allow(clippy::large_enum_variant)]
+enum CutoffCommit {
+    Bound(TaskBoundReceipt, V5StoredInvocationRecord),
+    Terminal(V5RuntimeReply),
+}
+
 /// How the session handler continues after the inline worker settled or the
 /// cutoff took the invocation away from it.
 enum InlineDrive {
@@ -1230,7 +473,7 @@ enum InlineDrive {
 }
 
 struct V5TaskProjection {
-    #[cfg_attr(not(feature = "receipt-ledger-test-support"), allow(dead_code))]
+    #[allow(dead_code)]
     task_store_root: RetainedDirectoryCapability,
     #[allow(dead_code)]
     task_store: Arc<FileInvocationStoreV5>,
@@ -1243,8 +486,6 @@ struct V5TaskProjection {
     retirement_process_generation: u64,
     retirement_issued_sequence: AtomicU64,
     retirement_coordinator: Mutex<()>,
-    #[cfg(all(test, feature = "receipt-ledger-test-support"))]
-    retirement_snapshot_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 #[derive(Clone)]
@@ -1295,17 +536,7 @@ impl V5TaskProjection {
                 .fetch_add(1, Ordering::AcqRel),
             retirement_issued_sequence: AtomicU64::new(1),
             retirement_coordinator: Mutex::new(()),
-            #[cfg(all(test, feature = "receipt-ledger-test-support"))]
-            retirement_snapshot_barrier: Mutex::new(None),
         })
-    }
-
-    #[cfg(all(test, feature = "receipt-ledger-test-support"))]
-    fn install_retirement_snapshot_barrier_for_test(&self, barrier: Arc<std::sync::Barrier>) {
-        *self
-            .retirement_snapshot_barrier
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(barrier);
     }
 
     fn authorize_task_retirement(
@@ -1450,16 +681,6 @@ impl V5TaskProjection {
         Ok(())
     }
 
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn validate_named_identity(&self) -> Result<(), String> {
-        self.task_store_root
-            .validate_named_identity()
-            .map_err(|error| format!("validate protocol-v5 task projection root: {error}"))?;
-        self.lifecycle_link_root
-            .validate_named_identity()
-            .map_err(|error| format!("validate protocol-v5 lifecycle-link root: {error}"))
-    }
-
     fn reconcile_materialized_startup(
         &self,
         deadline: Instant,
@@ -1592,17 +813,11 @@ impl V5TaskProjection {
     fn retire_expired_terminal_tasks(
         &self,
         deadline: Instant,
+        hooks: &dyn V5RuntimeHooks,
     ) -> Result<(), V5TaskProjectionFailure> {
-        #[cfg(all(test, feature = "receipt-ledger-test-support"))]
-        let retirement_snapshot_barrier = self
-            .retirement_snapshot_barrier
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        #[cfg(all(test, feature = "receipt-ledger-test-support"))]
-        if let Some(barrier) = retirement_snapshot_barrier {
-            barrier.wait();
-        }
+        hooks
+            .pause(V5PausePoint::BeforeRetirementSnapshot, deadline)
+            .map_err(V5TaskProjectionFailure::fail_stop)?;
         // One process owns the receipt authority, and this coordinator makes
         // terminal retirement a single-owner operation inside that process.
         // A concurrent observation waits and then takes a fresh catalog snapshot
@@ -1699,13 +914,12 @@ impl V5TaskProjection {
         V5TaskProjectionFailure::fail_stop(ReceiptLedgerError::Corrupt(message))
     }
 
-    #[cfg(any(test, feature = "receipt-ledger-test-support"))]
     fn materialize_bound_handoff(
         &self,
         handoff: &TaskHandoffActorBoundReceipt,
         bind_epoch_ms: u64,
         deadline: Instant,
-        #[cfg(feature = "receipt-ledger-test-support")] telemetry: &V5ReceiptRuntimeTelemetry,
+        hooks: &dyn V5RuntimeHooks,
     ) -> Result<(V5StoredInvocationRecord, TaskBoundReceipt), V5TaskProjectionFailure> {
         self.materialize_actor_bound_task(
             handoff.key(),
@@ -1717,8 +931,7 @@ impl V5TaskProjection {
             handoff.phase() == AttemptPhase::Begun,
             bind_epoch_ms,
             deadline,
-            #[cfg(feature = "receipt-ledger-test-support")]
-            telemetry,
+            hooks,
         )
     }
 
@@ -1727,7 +940,7 @@ impl V5TaskProjection {
         handoff: &TaskHandoffActorBoundReceipt,
         _epoch_ms: u64,
         deadline: Instant,
-        #[cfg(feature = "receipt-ledger-test-support")] telemetry: &V5ReceiptRuntimeTelemetry,
+        hooks: &dyn V5RuntimeHooks,
     ) -> Result<TaskLinkReservation, V5TaskProjectionFailure> {
         let reservation = self
             .lifecycle_links
@@ -1737,8 +950,7 @@ impl V5TaskProjection {
                 crate::domain::code_intelligence::ProviderDeadline::new(deadline),
             )
             .map_err(V5TaskProjectionFailure::from_link_store)?;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        telemetry.record_event(
+        hooks.event(
             V5ReceiptRuntimeEventKind::TaskLinkCapacityReserved,
             _epoch_ms,
         );
@@ -1751,7 +963,7 @@ impl V5TaskProjection {
         reservation: &TaskLinkReservation,
         bind_epoch_ms: u64,
         deadline: Instant,
-        #[cfg(feature = "receipt-ledger-test-support")] telemetry: &V5ReceiptRuntimeTelemetry,
+        hooks: &dyn V5RuntimeHooks,
     ) -> Result<(V5StoredInvocationRecord, TaskBoundReceipt), V5TaskProjectionFailure> {
         self.materialize_actor_bound_task_from_reservation(
             handoff.key(),
@@ -1764,8 +976,7 @@ impl V5TaskProjection {
             bind_epoch_ms,
             deadline,
             true,
-            #[cfg(feature = "receipt-ledger-test-support")]
-            telemetry,
+            hooks,
         )
     }
 
@@ -1774,7 +985,7 @@ impl V5TaskProjection {
         handoff: &TaskHandoffActorBoundReceipt,
         bind_epoch_ms: u64,
         deadline: Instant,
-        #[cfg(feature = "receipt-ledger-test-support")] telemetry: &V5ReceiptRuntimeTelemetry,
+        hooks: &dyn V5RuntimeHooks,
     ) -> Result<(V5StoredInvocationRecord, TaskBoundReceipt), V5TaskProjectionFailure> {
         self.materialize_actor_bound_task(
             handoff.key(),
@@ -1786,8 +997,7 @@ impl V5TaskProjection {
             handoff.phase() == AttemptPhase::Begun,
             bind_epoch_ms,
             deadline,
-            #[cfg(feature = "receipt-ledger-test-support")]
-            telemetry,
+            hooks,
         )
     }
 
@@ -1796,7 +1006,7 @@ impl V5TaskProjection {
         promised: &TaskPromisedActorBoundReceipt,
         bind_epoch_ms: u64,
         deadline: Instant,
-        #[cfg(feature = "receipt-ledger-test-support")] telemetry: &V5ReceiptRuntimeTelemetry,
+        hooks: &dyn V5RuntimeHooks,
     ) -> Result<(V5StoredInvocationRecord, TaskBoundReceipt), V5TaskProjectionFailure> {
         self.materialize_actor_bound_task(
             promised.key(),
@@ -1808,8 +1018,7 @@ impl V5TaskProjection {
             false,
             bind_epoch_ms,
             deadline,
-            #[cfg(feature = "receipt-ledger-test-support")]
-            telemetry,
+            hooks,
         )
     }
 
@@ -1825,15 +1034,14 @@ impl V5TaskProjection {
         recovered_begun: bool,
         bind_epoch_ms: u64,
         deadline: Instant,
-        #[cfg(feature = "receipt-ledger-test-support")] telemetry: &V5ReceiptRuntimeTelemetry,
+        hooks: &dyn V5RuntimeHooks,
     ) -> Result<(V5StoredInvocationRecord, TaskBoundReceipt), V5TaskProjectionFailure> {
         let provider_deadline = crate::domain::code_intelligence::ProviderDeadline::new(deadline);
         let reservation = self
             .lifecycle_links
             .reserve_task_link(key.clone(), link.clone(), provider_deadline)
             .map_err(V5TaskProjectionFailure::from_link_store)?;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        telemetry.record_event(
+        hooks.event(
             V5ReceiptRuntimeEventKind::TaskLinkCapacityReserved,
             bind_epoch_ms,
         );
@@ -1848,8 +1056,7 @@ impl V5TaskProjection {
             bind_epoch_ms,
             deadline,
             true,
-            #[cfg(feature = "receipt-ledger-test-support")]
-            telemetry,
+            hooks,
         )
     }
 
@@ -1865,8 +1072,8 @@ impl V5TaskProjection {
         reservation: &TaskLinkReservation,
         bind_epoch_ms: u64,
         deadline: Instant,
-        _record_reservation_conversion: bool,
-        #[cfg(feature = "receipt-ledger-test-support")] telemetry: &V5ReceiptRuntimeTelemetry,
+        record_reservation_conversion: bool,
+        hooks: &dyn V5RuntimeHooks,
     ) -> Result<(V5StoredInvocationRecord, TaskBoundReceipt), V5TaskProjectionFailure> {
         let provider_deadline = crate::domain::code_intelligence::ProviderDeadline::new(deadline);
         let identity = V5TaskIdentity::new(
@@ -1888,19 +1095,14 @@ impl V5TaskProjection {
         } else {
             new_record
         };
-        #[cfg(feature = "receipt-ledger-test-support")]
-        {
-            telemetry.record_task_store_create_attempt();
-            telemetry.record_event(
-                V5ReceiptRuntimeEventKind::TaskStoreCreateAttempted,
-                bind_epoch_ms,
-            );
-            if telemetry.take_store_fault(
-                receipt_scenario_v5::ScenarioStoreFaultPoint::AfterTaskCreateRenameBeforeDirectorySync,
-            ) {
-                self.task_store
-                    .inject_next_publication_failure(PublicationFailure::AfterRenameBeforeSync);
-            }
+        hooks.task_store_create_attempted();
+        hooks.event(
+            V5ReceiptRuntimeEventKind::TaskStoreCreateAttempted,
+            bind_epoch_ms,
+        );
+        if hooks.store_fault(V5StoreFaultPoint::AfterTaskCreateRenameBeforeDirectorySync) {
+            self.task_store
+                .inject_next_publication_failure(PublicationFailure::AfterRenameBeforeSync);
         }
         let created = self
             .task_store
@@ -1929,8 +1131,7 @@ impl V5TaskProjection {
                 },
             ));
         }
-        #[cfg(feature = "receipt-ledger-test-support")]
-        telemetry.record_event(V5ReceiptRuntimeEventKind::TaskStoreCreated, bind_epoch_ms);
+        hooks.event(V5ReceiptRuntimeEventKind::TaskStoreCreated, bind_epoch_ms);
         if cancel_requested && !readback.cancel_requested {
             readback = self
                 .task_store
@@ -1955,9 +1156,8 @@ impl V5TaskProjection {
                 provider_deadline,
             )
             .map_err(V5TaskProjectionFailure::from_link_store)?;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        if _record_reservation_conversion {
-            telemetry.record_event(
+        if record_reservation_conversion {
+            hooks.event(
                 V5ReceiptRuntimeEventKind::TaskLinkReservationConverted,
                 bind_epoch_ms,
             );
@@ -2193,14 +1393,11 @@ impl V5TaskProjection {
     fn publish_bound_task_terminal(
         &self,
         expected: &TaskBoundReceipt,
-        record: V5StoredInvocationRecord,
+        record: &V5StoredInvocationRecord,
         terminal: &crate::application::receipt_ledger::V5CanonicalTerminal,
         terminal_epoch_ms: u64,
         deadline: Instant,
-        #[cfg(feature = "receipt-ledger-test-support")] telemetry: &V5ReceiptRuntimeTelemetry,
-        #[cfg(feature = "receipt-ledger-test-support")] scenario_control: Option<
-            &Arc<receipt_scenario_v5::ReceiptScenarioControl>,
-        >,
+        hooks: &dyn V5RuntimeHooks,
     ) -> Result<(V5StoredInvocationRecord, TaskTerminalBoundReceipt), V5TaskProjectionFailure> {
         let terminal_digest = terminal.digest().clone();
         let (publication, terminal_status) = match terminal.outcome() {
@@ -2237,21 +1434,21 @@ impl V5TaskProjection {
             .map_err(|error| {
                 V5TaskProjectionFailure::from_task_store(error, receipt_key_digest, true)
             })?;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        if let Some(control) = scenario_control.filter(|control| {
-            control.is_barrier_installed(
-                receipt_scenario_v5::ScenarioBarrierPoint::AfterTaskStoreTerminalBeforeLifecycleLinkTerminal,
-            )
-        }) {
-            telemetry.record_event(
+        if hooks.holds(V5PausePoint::AfterTaskStoreTerminalBeforeLifecycleLinkTerminal) {
+            hooks.event(
                 V5ReceiptRuntimeEventKind::TaskStoreTerminalCommitted,
                 terminal_epoch_ms,
             );
-            control.pause(
-                receipt_scenario_v5::ScenarioBarrierPoint::AfterTaskStoreTerminalBeforeLifecycleLinkTerminal,
-                Instant::now() + receipt_scenario_v5::SCENARIO_BULK_OPERATION_TIMEOUT,
-            ).map_err(V5TaskProjectionFailure::fail_stop)?;
-            if control.process_exited() {
+            hooks
+                .pause(
+                    V5PausePoint::AfterTaskStoreTerminalBeforeLifecycleLinkTerminal,
+                    hooks.commit_deadline_at(
+                        V5PausePoint::AfterTaskStoreTerminalBeforeLifecycleLinkTerminal,
+                        deadline,
+                    ),
+                )
+                .map_err(V5TaskProjectionFailure::fail_stop)?;
+            if hooks.process_exited() {
                 return Err(V5TaskProjectionFailure::fail_stop(
                     ReceiptLedgerError::StoreUnavailable,
                 ));
@@ -2271,154 +1468,6 @@ impl V5TaskProjection {
             )
             .map_err(V5TaskProjectionFailure::from_link_store)?;
         Ok((terminal_record, terminal_link))
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn publish_staged_terminal_against_exact_provisional(
-        &self,
-        staged: &TaskHandoffActorBoundReceipt,
-        reservation: &TaskLinkReservation,
-        expected: &V5StoredInvocationRecord,
-        expected_link_digest: &crate::application::receipt_ledger::TaskLinkDigest,
-        deadline: Instant,
-    ) -> Result<(V5StoredInvocationRecord, TaskTerminalBoundReceipt), V5TaskProjectionFailure> {
-        if reservation.key() != staged.key()
-            || reservation.link() != staged.link()
-            || reservation.link().digest() != expected_link_digest
-            || staged.link().digest() != expected_link_digest
-        {
-            return Err(V5TaskProjectionFailure::fail_stop(
-                ReceiptLedgerError::TaskBoundMismatch,
-            ));
-        }
-        let HandoffTerminalStage::Staged {
-            terminal_epoch_ms,
-            terminal,
-            ..
-        } = staged.terminal_stage()
-        else {
-            return Err(V5TaskProjectionFailure::fail_stop(
-                ReceiptLedgerError::TaskBoundMismatch,
-            ));
-        };
-        let provider_deadline = crate::domain::code_intelligence::ProviderDeadline::new(deadline);
-        let observed = self
-            .task_store
-            .get(expected.task_id, provider_deadline)
-            .map_err(|error| {
-                V5TaskProjectionFailure::from_task_store(error, staged.key_digest().clone(), true)
-            })?;
-        if observed != *expected {
-            return Err(V5TaskProjectionFailure::fail_stop(
-                ReceiptLedgerError::TaskBoundMismatch,
-            ));
-        }
-        let task = receipt_task_projection_from_store(&observed)?;
-        let bound = self
-            .lifecycle_links
-            .materialize_task_bound(
-                reservation,
-                task,
-                observed.version,
-                *terminal_epoch_ms,
-                staged.phase(),
-                provider_deadline,
-            )
-            .map_err(V5TaskProjectionFailure::from_link_store)?;
-        let (publication, terminal_status) = match terminal.outcome() {
-            ReceiptTerminalOutcome::Completed { result } => (
-                V5TerminalPublication::Completed {
-                    terminal_epoch_ms: *terminal_epoch_ms,
-                    terminal_digest: terminal.digest().clone(),
-                    result: result.clone(),
-                },
-                ClosedTerminalStatus::Completed,
-            ),
-            ReceiptTerminalOutcome::Failed { reason } => (
-                V5TerminalPublication::Failed {
-                    terminal_epoch_ms: *terminal_epoch_ms,
-                    terminal_digest: terminal.digest().clone(),
-                    reason: *reason,
-                },
-                ClosedTerminalStatus::Failed,
-            ),
-            ReceiptTerminalOutcome::Cancelled => (
-                V5TerminalPublication::Cancelled {
-                    terminal_epoch_ms: *terminal_epoch_ms,
-                    terminal_digest: terminal.digest().clone(),
-                },
-                ClosedTerminalStatus::Cancelled,
-            ),
-        };
-        let terminal_record = self
-            .task_store
-            .publish_staged_terminal_against_exact_provisional(
-                expected,
-                publication,
-                provider_deadline,
-            )
-            .map_err(|error| {
-                V5TaskProjectionFailure::from_task_store(error, staged.key_digest().clone(), true)
-            })?;
-        let terminal_task = receipt_task_projection_from_store(&terminal_record)?;
-        let terminal_link = self
-            .lifecycle_links
-            .publish_task_terminal_bound(
-                &bound,
-                terminal_task,
-                terminal_record.version,
-                terminal_status,
-                terminal.digest().clone(),
-                *terminal_epoch_ms,
-                provider_deadline,
-            )
-            .map_err(V5TaskProjectionFailure::from_link_store)?;
-        Ok((terminal_record, terminal_link))
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn exact_task_link_reservation(
-        &self,
-        key: &ReceiptKey,
-        deadline: Instant,
-    ) -> Result<TaskLinkReservation, V5TaskProjectionFailure> {
-        let catalog = self
-            .lifecycle_links
-            .catalog_snapshot(crate::domain::code_intelligence::ProviderDeadline::new(
-                deadline,
-            ))
-            .map_err(V5TaskProjectionFailure::from_link_store)?;
-        catalog
-            .entries()
-            .iter()
-            .find_map(|entry| match entry {
-                TaskLifecycleLinkCatalogEntry::Reservation(reservation)
-                    if reservation.key_digest() == &receipt_key_digest(key) =>
-                {
-                    Some(reservation.clone())
-                }
-                TaskLifecycleLinkCatalogEntry::Reservation(_)
-                | TaskLifecycleLinkCatalogEntry::Record(_) => None,
-            })
-            .ok_or_else(|| {
-                V5TaskProjectionFailure::fail_stop(ReceiptLedgerError::TaskBoundMismatch)
-            })
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn exact_task_record(
-        &self,
-        key: &ReceiptKey,
-        deadline: Instant,
-    ) -> Result<V5StoredInvocationRecord, V5TaskProjectionFailure> {
-        self.task_store
-            .get(
-                key.reserved_task_id(),
-                crate::domain::code_intelligence::ProviderDeadline::new(deadline),
-            )
-            .map_err(|error| {
-                V5TaskProjectionFailure::from_task_store(error, receipt_key_digest(key), true)
-            })
     }
 
     fn read_bound_task(
@@ -2527,17 +1576,6 @@ impl V5TaskProjection {
             });
         }
         self.cancel_bound_task(key.reserved_task_id(), deadline)
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn observe_missing_seed_writer(
-        &self,
-        observation: StableReceiptLedgerObservation,
-    ) -> V5TaskProjectionReachability {
-        V5TaskProjectionReachability {
-            _task_store_root: self.task_store_root.clone(),
-            observation,
-        }
     }
 }
 
@@ -2880,19 +1918,6 @@ fn receipt_task_projection_from_store(
     .map_err(Into::into)
 }
 
-#[cfg(feature = "receipt-ledger-test-support")]
-pub(in crate::infrastructure) struct V5TaskProjectionReachability {
-    _task_store_root: RetainedDirectoryCapability,
-    observation: StableReceiptLedgerObservation,
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-impl V5TaskProjectionReachability {
-    pub(in crate::infrastructure) const fn observation(&self) -> &StableReceiptLedgerObservation {
-        &self.observation
-    }
-}
-
 struct V5InvocationExecutor {
     invocation_runtime: Arc<V5CanonicalInvocationRuntime>,
 }
@@ -2909,14 +1934,27 @@ impl V5InvocationExecutor {
         Self { invocation_runtime }
     }
 
+    fn capture_response_deadline(
+        &self,
+        response_budget_ms: u64,
+    ) -> crate::application::invocation::InvocationResponseDeadline {
+        self.invocation_runtime
+            .capture_response_deadline(response_budget_ms)
+    }
+
+    fn now(&self) -> Instant {
+        self.invocation_runtime.now()
+    }
+
     fn bind(
         &self,
         invocation: V5InvocationRequest,
+        response_deadline: crate::application::invocation::InvocationResponseDeadline,
     ) -> Result<V5ActorBoundCanonicalInvocation, V5CanonicalPrepareError> {
         let tool = match invocation.tool() {
             crate::application::receipt_ledger::V5ToolIdentity::View => ToolIdentity::View,
             crate::application::receipt_ledger::V5ToolIdentity::Apply => ToolIdentity::Apply,
-            crate::application::receipt_ledger::V5ToolIdentity::Find => ToolIdentity::Find,
+            crate::application::receipt_ledger::V5ToolIdentity::Resolve => ToolIdentity::Resolve,
             crate::application::receipt_ledger::V5ToolIdentity::Search => ToolIdentity::Search,
             crate::application::receipt_ledger::V5ToolIdentity::Check => ToolIdentity::Check,
             crate::application::receipt_ledger::V5ToolIdentity::Diff => ToolIdentity::Diff,
@@ -2938,65 +1976,17 @@ impl V5InvocationExecutor {
                 ),
             ))
         })?;
-        self.invocation_runtime.bind(request)
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn observe_missing_writer(
-        &self,
-        action: V5ExecutorReachabilityAction,
-        observation: StableReceiptLedgerObservation,
-    ) -> V5ExecutorReachability {
-        V5ExecutorReachability {
-            action,
-            observation,
-        }
-    }
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::infrastructure) enum V5ExecutorReachabilityAction {
-    SubmitInvocation,
-    RunDirectLoad,
-    RunLazyCancelStorm,
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-impl V5ExecutorReachabilityAction {
-    pub(in crate::infrastructure) const fn wire_name(self) -> &'static str {
-        match self {
-            Self::SubmitInvocation => "submit",
-            Self::RunDirectLoad => "run_direct_load",
-            Self::RunLazyCancelStorm => "run_lazy_cancel_storm",
-        }
-    }
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-pub(in crate::infrastructure) struct V5ExecutorReachability {
-    action: V5ExecutorReachabilityAction,
-    observation: StableReceiptLedgerObservation,
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-impl V5ExecutorReachability {
-    pub(in crate::infrastructure) const fn action(&self) -> V5ExecutorReachabilityAction {
-        self.action
-    }
-
-    pub(in crate::infrastructure) const fn observation(&self) -> &StableReceiptLedgerObservation {
-        &self.observation
+        self.invocation_runtime
+            .bind_with_deadline(request, response_deadline)
     }
 }
 
 impl V5ReceiptRuntime {
     fn open(state: &DaemonStateDirectory, config: &DaemonServerConfig) -> Result<Self, String> {
-        #[cfg(feature = "receipt-ledger-test-support")]
-        if let Some(epoch_clock) = config.epoch_clock_for_v5_test() {
-            return Self::open_with_epoch_clock(state, config, epoch_clock);
-        }
-        Self::open_with_epoch_clock(state, config, Arc::new(SystemEpochMillisClock))
+        let epoch_clock = config
+            .epoch_clock_for_v5()
+            .unwrap_or_else(|| Arc::new(SystemEpochMillisClock));
+        Self::open_with_epoch_clock(state, config, epoch_clock)
     }
 
     fn open_with_epoch_clock(
@@ -3004,45 +1994,9 @@ impl V5ReceiptRuntime {
         config: &DaemonServerConfig,
         epoch_clock: Arc<dyn EpochMillisClock>,
     ) -> Result<Self, String> {
-        Self::open_with_epoch_clock_inner(
-            state,
-            config,
-            epoch_clock,
-            #[cfg(feature = "receipt-ledger-test-support")]
-            None,
-            #[cfg(feature = "receipt-ledger-test-support")]
-            None,
-        )
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn open_with_epoch_clock_and_telemetry_for_test(
-        state: &DaemonStateDirectory,
-        config: &DaemonServerConfig,
-        epoch_clock: Arc<dyn EpochMillisClock>,
-        telemetry: Arc<V5ReceiptRuntimeTelemetry>,
-        scenario_control: Option<Arc<receipt_scenario_v5::ReceiptScenarioControl>>,
-    ) -> Result<Self, String> {
-        Self::open_with_epoch_clock_inner(
-            state,
-            config,
-            epoch_clock,
-            Some(telemetry),
-            scenario_control,
-        )
-    }
-
-    fn open_with_epoch_clock_inner(
-        state: &DaemonStateDirectory,
-        config: &DaemonServerConfig,
-        epoch_clock: Arc<dyn EpochMillisClock>,
-        #[cfg(feature = "receipt-ledger-test-support")] telemetry: Option<
-            Arc<V5ReceiptRuntimeTelemetry>,
-        >,
-        #[cfg(feature = "receipt-ledger-test-support")] scenario_control: Option<
-            Arc<receipt_scenario_v5::ReceiptScenarioControl>,
-        >,
-    ) -> Result<Self, String> {
+        let hooks = config
+            .runtime_hooks_for_v5()
+            .unwrap_or_else(|| Arc::new(NoHooks));
         let stable_authority = state.acquire_receipt_authority(AUTHORITY_ACQUIRE_TIMEOUT)?;
         let startup_deadline = Instant::now() + STARTUP_RECONCILIATION_TIMEOUT;
         let receipts = state.create_private_retained_subdirectory("receipts")?;
@@ -3055,10 +2009,6 @@ impl V5ReceiptRuntime {
         let recovery_keys = receipt_ledger
             .recovery_keys(startup_deadline)
             .map_err(|error| format!("inspect protocol-v5 receipt recovery catalog: {error}"))?;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        let initial_receipt_observation = receipt_ledger
-            .observe_stable_generation()
-            .map_err(|error| format!("observe initial protocol-v5 receipt generation: {error}"))?;
         let receipt_ledger = ReceiptLedgerActor::spawn(receipt_ledger);
         let task_projection =
             V5TaskProjection::open(state, Arc::clone(&epoch_clock), startup_deadline)?;
@@ -3068,8 +2018,6 @@ impl V5ReceiptRuntime {
             _stable_authority: stable_authority,
             receipt_ledger,
             epoch_clock,
-            #[cfg(feature = "receipt-ledger-test-support")]
-            initial_receipt_observation,
             invocation_executor: {
                 #[cfg(test)]
                 let preset = config.canonical_runtime_for_v5();
@@ -3088,18 +2036,11 @@ impl V5ReceiptRuntime {
             task_execution_threads: Mutex::new(Vec::new()),
             task_terminal_coordinator: Mutex::new(()),
             external_store_fail_stop: AtomicBool::new(false),
-            #[cfg(feature = "receipt-ledger-test-support")]
-            evidence_capture: None,
-            #[cfg(feature = "receipt-ledger-test-support")]
-            scenario_control,
-            #[cfg(feature = "receipt-ledger-test-support")]
-            telemetry: telemetry.unwrap_or_else(|| Arc::new(V5ReceiptRuntimeTelemetry::new())),
+            fail_stop_watchdogs: FailStopWatchdogs::default(),
+            promoted_continuations: AtomicUsize::new(0),
+            hooks,
         };
-        #[cfg(feature = "receipt-ledger-test-support")]
-        let skip_reconciliation = config.skip_v5_startup_reconciliation_for_test();
-        #[cfg(not(feature = "receipt-ledger-test-support"))]
-        let skip_reconciliation = false;
-        if !skip_reconciliation {
+        if !config.skips_v5_startup_reconciliation() {
             runtime.preflight_existing_handoff_tasks(&recovery_keys, startup_deadline)?;
             runtime.reconcile_pre_task_startup(recovery_keys, startup_deadline)?;
             runtime
@@ -3111,914 +2052,6 @@ impl V5ReceiptRuntime {
                 })?;
         }
         Ok(runtime)
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn attempt_task_store_bind_under_gate_for_test(
-        &self,
-        key: &ReceiptKey,
-        operation_label: &str,
-        deadline: Instant,
-    ) -> Result<(Value, Value), String> {
-        let epoch_ms = self.epoch_clock.now_epoch_millis();
-        let state = self
-            .receipt_ledger
-            .recover(key.clone(), deadline)
-            .map_err(|error| format!("recover capacity handoff receipt: {error}"))?;
-        let handoff = match state {
-            ReceiptState::TaskPromisedActorBound(promised) => self
-                .receipt_ledger
-                .begin_bound_task_handoff(
-                    promised.key().clone(),
-                    promised.record_version(),
-                    promised.task().created_at_epoch_ms(),
-                    promised.task().ttl_ms(),
-                    promised.task().poll_interval_ms(),
-                    deadline,
-                )
-                .map_err(|error| format!("begin capacity handoff: {error}"))?,
-            ReceiptState::TaskHandoffActorBound(handoff) => handoff,
-            other => {
-                return Err(format!(
-                    "capacity bind requires actor-bound Task handoff, found {}",
-                    other.kind().diagnostic_name()
-                ))
-            }
-        };
-        let task_store_generation = u64::try_from(self.task_projection.recovery.entries().len())
-            .map_err(|_| "TaskStore generation does not fit capacity evidence".to_owned())?;
-        let attempts_before = self.telemetry.snapshot().task_store_create_attempts;
-        let checked_sequence = self
-            .telemetry
-            .record_event(V5ReceiptRuntimeEventKind::V5ReceiptRuntimeEntered, epoch_ms);
-        let failure = match self.task_projection.materialize_bound_handoff(
-            &handoff,
-            epoch_ms,
-            deadline,
-            &self.telemetry,
-        ) {
-            Ok(_) => {
-                return Err(
-                    "full lifecycle-link pool unexpectedly admitted another Task".to_owned(),
-                )
-            }
-            Err(failure) => failure,
-        };
-        if failure.fail_stop || failure.error != ReceiptLedgerError::CapacityExceeded {
-            return Err(format!(
-                "capacity bind failed for a non-capacity reason: {}",
-                failure.error
-            ));
-        }
-        let rejected_sequence = self.telemetry.record_event(
-            V5ReceiptRuntimeEventKind::TaskLinkCapacityRejected,
-            epoch_ms,
-        );
-        let proof = ProvenTaskLinkCapacity::Count {
-            observed_live_links: u64::try_from(
-                crate::infrastructure::task_lifecycle_link_store_v5::MAX_TASK_LIFECYCLE_LINK_RECORDS,
-            )
-            .expect("Task lifecycle-link limit fits u64"),
-            maximum_live_links: u64::try_from(
-                crate::infrastructure::task_lifecycle_link_store_v5::MAX_TASK_LIFECYCLE_LINK_RECORDS,
-            )
-            .expect("Task lifecycle-link limit fits u64"),
-        };
-        let staged = match handoff.terminal_stage() {
-            HandoffTerminalStage::NoTerminal => None,
-            HandoffTerminalStage::Staged {
-                terminal,
-                certificate,
-                ..
-            } => Some((terminal.clone(), certificate.clone())),
-        };
-        let terminal = if let Some((staged_terminal, _)) = &staged {
-            let committed = self
-                .receipt_ledger
-                .publish_receipt_backed_task_terminal(
-                    handoff.key().clone(),
-                    TaskCancellationReceipt::HandoffActorBound(handoff.clone()),
-                    epoch_ms,
-                    staged_terminal.clone(),
-                    deadline,
-                )
-                .map_err(|error| {
-                    format!("preserve staged Task terminal after link capacity: {error}")
-                })?;
-            if let Some(control) = &self.scenario_control {
-                control
-                    .record_staged_capacity_fallback(&committed)
-                    .map_err(|error| format!("record staged capacity fallback: {error}"))?;
-                control
-                    .record_receipt_backed_terminal(committed.clone())
-                    .map_err(|error| format!("record staged link-capacity terminal: {error}"))?;
-            }
-            self.telemetry.record_event(
-                V5ReceiptRuntimeEventKind::ReceiptTerminalCommitted,
-                epoch_ms,
-            );
-            Some(committed.terminal().clone())
-        } else if handoff.phase() == AttemptPhase::Begun {
-            self.receipt_ledger
-                .retain_begun_task_after_link_capacity(
-                    handoff.key().clone(),
-                    handoff.record_version(),
-                    proof,
-                    deadline,
-                )
-                .map_err(|error| format!("retain receipt-owned begun Task: {error}"))?;
-            None
-        } else {
-            let terminal = canonical_v5_terminal(&ReceiptTerminalOutcome::Failed {
-                reason: V5SafeFailureReason::TaskCapacity,
-            })
-            .map_err(|error| format!("encode Task capacity terminal: {error}"))?;
-            let committed = self
-                .receipt_ledger
-                .publish_receipt_backed_task_terminal(
-                    handoff.key().clone(),
-                    TaskCancellationReceipt::HandoffActorBound(handoff.clone()),
-                    epoch_ms,
-                    terminal,
-                    deadline,
-                )
-                .map_err(|error| format!("publish Task capacity terminal: {error}"))?;
-            if let Some(control) = &self.scenario_control {
-                control
-                    .record_receipt_backed_terminal(committed.clone())
-                    .map_err(|error| format!("record Task capacity terminal: {error}"))?;
-            }
-            self.telemetry.record_event(
-                V5ReceiptRuntimeEventKind::ReceiptTerminalCommitted,
-                epoch_ms,
-            );
-            Some(committed.terminal().clone())
-        };
-        let attempts_after = self.telemetry.snapshot().task_store_create_attempts;
-        let terminal_observation = terminal
-            .as_ref()
-            .map(|terminal| terminal_observation_value(terminal, epoch_ms));
-        let staged_certificate_sha256 = staged
-            .as_ref()
-            .map(|(_, certificate)| {
-                serde_json::to_vec(certificate.as_ref())
-                    .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
-                    .map_err(|error| format!("encode staged transfer certificate: {error}"))
-            })
-            .transpose()?;
-        let response = json!({
-            "kind": if terminal.is_some() { "task" } else { "rejected" },
-            "error": if staged.is_some() { Value::Null } else { Value::String("task_capacity".to_owned()) },
-            "terminal": terminal_observation,
-            "key": receipt_key_observation_value(key),
-            "task": null,
-            "acknowledgement": null,
-            "cutoffEpochMs": null,
-            "originalBudgetMs": null,
-            "latencyMs": 0,
-        });
-        let observation = json!({
-            "operationLabel": operation_label,
-            "receiptKey": receipt_key_observation_value(key),
-            "terminal": terminal_observation,
-            "stagedTransferCertificateSha256": staged_certificate_sha256,
-            "evidence": {
-                "source": "link_capacity",
-                "capacity_checked_sequence": checked_sequence,
-                "capacity_rejected_sequence": rejected_sequence,
-                "task_store_generation_before": task_store_generation,
-                "task_store_generation_after": task_store_generation,
-                "task_store_create_attempts_before": attempts_before,
-                "task_store_create_attempts_after": attempts_after,
-            }
-        });
-        Ok((response, observation))
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn stage_bound_handoff_terminal_for_test(
-        &self,
-        key: &ReceiptKey,
-        terminal: crate::application::receipt_ledger::V5CanonicalTerminal,
-        deadline: Instant,
-    ) -> Result<(), String> {
-        let epoch_ms = self.epoch_clock.now_epoch_millis();
-        let handoff = match self
-            .receipt_ledger
-            .recover(key.clone(), deadline)
-            .map_err(|error| format!("recover handoff before staging terminal: {error}"))?
-        {
-            ReceiptState::TaskHandoffActorBound(handoff) => handoff,
-            other => {
-                return Err(format!(
-                    "staging terminal requires actor-bound Task handoff, found {}",
-                    other.kind().diagnostic_name()
-                ))
-            }
-        };
-        let certificate = canonical_staged_transfer_certificate(
-            handoff.key(),
-            handoff.key_digest(),
-            handoff.link(),
-            epoch_ms,
-            &terminal,
-        )
-        .map_err(|error| format!("prepare staged transfer certificate: {error}"))?;
-        let staged = self
-            .receipt_ledger
-            .stage_bound_task_handoff_terminal(
-                handoff.key().clone(),
-                handoff.record_version(),
-                epoch_ms,
-                terminal,
-                certificate,
-                deadline,
-            )
-            .map_err(|error| format!("stage bound Task handoff terminal: {error}"))?;
-        if let Some(control) = &self.scenario_control {
-            control
-                .record_staged_terminal_preparation(&staged)
-                .map_err(|error| format!("record staged terminal preparation: {error}"))?;
-        }
-        self.telemetry.record_event(
-            V5ReceiptRuntimeEventKind::BoundHandoffTerminalStaged,
-            epoch_ms,
-        );
-        Ok(())
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn inject_task_store_capacity_invariant_for_test(
-        &self,
-        key: &ReceiptKey,
-        operation_label: &str,
-        deadline: Instant,
-    ) -> Result<Value, String> {
-        let epoch_ms = self.epoch_clock.now_epoch_millis();
-        let handoff = match self
-            .receipt_ledger
-            .recover(key.clone(), deadline)
-            .map_err(|error| format!("recover staged handoff before capacity invariant: {error}"))?
-        {
-            ReceiptState::TaskHandoffActorBound(handoff) => handoff,
-            other => {
-                return Err(format!(
-                    "capacity invariant injection requires actor-bound Task handoff, found {}",
-                    other.kind().diagnostic_name()
-                ))
-            }
-        };
-        let (terminal_epoch_ms, staged_terminal, certificate) = match handoff.terminal_stage() {
-            HandoffTerminalStage::Staged {
-                terminal_epoch_ms,
-                terminal,
-                certificate,
-            } => (*terminal_epoch_ms, terminal, certificate),
-            HandoffTerminalStage::NoTerminal => {
-                return Err("capacity invariant injection requires a staged terminal".to_owned())
-            }
-        };
-        let attempts_before = self.telemetry.snapshot().task_store_create_attempts;
-        let task_records = u64::try_from(self.task_projection.recovery.entries().len())
-            .map_err(|_| "TaskStore record count does not fit u64".to_owned())?;
-        let reservation = self
-            .task_projection
-            .reserve_bound_handoff_link(&handoff, epoch_ms, deadline, &self.telemetry)
-            .map_err(|failure| format!("reserve invariant lifecycle link: {}", failure.error))?;
-        let reserved_sequence = self
-            .telemetry
-            .snapshot()
-            .events
-            .last()
-            .filter(|event| event.event == V5ReceiptRuntimeEventKind::TaskLinkCapacityReserved)
-            .map(|event| event.sequence)
-            .ok_or_else(|| "capacity invariant reservation event is missing".to_owned())?;
-        self.telemetry.record_task_store_create_attempt();
-        let create_sequence = self.telemetry.record_event(
-            V5ReceiptRuntimeEventKind::TaskStoreCreateAttempted,
-            epoch_ms,
-        );
-        let injected = V5TaskProjectionFailure::from_task_store(
-            V5TaskStoreError::Capacity {
-                max_records: crate::application::invocation_store_v5::MAX_V5_TASK_RECORDS,
-            },
-            handoff.key_digest().clone(),
-            true,
-        );
-        if !injected.fail_stop {
-            return Err(
-                "injected post-reservation TaskStore Capacity did not fail-stop".to_owned(),
-            );
-        }
-        let capacity_sequence = self.telemetry.record_event(
-            V5ReceiptRuntimeEventKind::TaskStoreCapacityInvariantViolation,
-            epoch_ms,
-        );
-        self.telemetry.record_forced_process_exit();
-        let listener_closed_sequence = self
-            .telemetry
-            .snapshot()
-            .events
-            .last()
-            .filter(|event| event.event == V5ReceiptRuntimeEventKind::ListenerClosed)
-            .map(|event| event.sequence)
-            .ok_or_else(|| "capacity invariant listener-close event is missing".to_owned())?;
-        let restart_requested_sequence = listener_closed_sequence.saturating_add(1);
-        let daemon_stopped_sequence = listener_closed_sequence.saturating_add(2);
-        let lifecycle = self
-            .task_projection
-            .lifecycle_links
-            .catalog_snapshot(crate::domain::code_intelligence::ProviderDeadline::new(
-                deadline,
-            ))
-            .map_err(|error| format!("inspect invariant lifecycle reservation: {error}"))?;
-        let certificate_bytes = serde_json::to_vec(certificate.as_ref())
-            .map_err(|error| format!("encode invariant staged certificate: {error}"))?;
-        let reservation_fingerprint = format!(
-            "{:x}",
-            Sha256::digest(format!(
-                "{}:{}:{}:{}",
-                reservation.key_digest(),
-                reservation.link().digest(),
-                reservation.reservation_version(),
-                reservation.mutation_sequence()
-            ))
-        );
-        let materialized_links = lifecycle.count().saturating_sub(lifecycle.reserved_count());
-        Ok(json!({
-            "operationLabel": operation_label,
-            "receiptKey": receipt_key_observation_value(key),
-            "stagedTerminal": terminal_observation_value(staged_terminal, terminal_epoch_ms),
-            "stagedTransferCertificateSha256": format!("{:x}", Sha256::digest(certificate_bytes)),
-            "liveTaskLinkReservationFingerprint": reservation_fingerprint,
-            "taskLinkReservedSequence": reserved_sequence,
-            "taskStoreCreateSequence": create_sequence,
-            "capacityObservedSequence": capacity_sequence,
-            "listenerClosedSequence": listener_closed_sequence,
-            "restartRequestedSequence": restart_requested_sequence,
-            "daemonStoppedSequence": daemon_stopped_sequence,
-            "taskStoreRecordCountBefore": task_records,
-            "taskStoreRecordCountAfter": task_records,
-            "materializedLifecycleLinkCountBefore": materialized_links,
-            "materializedLifecycleLinkCountAfter": materialized_links,
-            "liveLinkReservationCountBefore": lifecycle.reserved_count(),
-            "liveLinkReservationCountAfter": lifecycle.reserved_count(),
-            "taskStoreGenerationBefore": task_records,
-            "taskStoreGenerationAfter": task_records,
-            "taskStoreCreateAttemptsBefore": attempts_before,
-            "taskStoreCreateAttemptsAfter": attempts_before.saturating_add(1),
-        }))
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn seed_cancel_reserved_pool_entry_for_test(
-        &self,
-        key: ReceiptKey,
-        epoch_ms: u64,
-        deadline: Instant,
-    ) -> Result<(), ReceiptLedgerError> {
-        self.telemetry
-            .record_event(V5ReceiptRuntimeEventKind::V5ReceiptRuntimeEntered, epoch_ms);
-        self.receipt_ledger
-            .request_cancel_or_reserve(key, epoch_ms, deadline)?;
-        Ok(())
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn submit_direct_batch_for_load(
-        &self,
-        work: Vec<(ReceiptKey, V5InvocationRequest, u64)>,
-        deadline: Instant,
-    ) -> Result<Vec<V5PendingDirectReceipt>, ReceiptLedgerError> {
-        if work.is_empty() || work.len() > 32 {
-            return Err(ReceiptLedgerError::ReceiptRowPresentUnsupported);
-        }
-        let reservations = self.receipt_ledger.reserve_batch(
-            work.iter()
-                .map(|(key, _, epoch_ms)| {
-                    OriginalCutoffDescriptor::new(*epoch_ms, 7_000)
-                        .map(|cutoff| (key.clone(), cutoff))
-                        .map_err(|_| ReceiptLedgerError::TimestampOverflow)
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            deadline,
-        )?;
-        let reservations = reservations
-            .into_iter()
-            .map(|outcome| {
-                outcome.into_reservation().map_err(|_| {
-                    ReceiptLedgerError::Corrupt("direct load batch reserve was not newly created")
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let batch_epoch_ms =
-            work.first()
-                .map(|(_, _, epoch_ms)| *epoch_ms)
-                .ok_or(ReceiptLedgerError::Corrupt(
-                    "direct load batch unexpectedly had no work",
-                ))?;
-        // The load report retains per-invocation lifecycle and callback counts. Record the
-        // repeated phase boundaries once per durable writer batch so the diagnostic event trace
-        // remains bounded at the full retention horizon.
-        self.telemetry
-            .record_event(V5ReceiptRuntimeEventKind::V5ExecutorEntered, batch_epoch_ms);
-        self.telemetry.record_event(
-            V5ReceiptRuntimeEventKind::V5ReceiptRuntimeEntered,
-            batch_epoch_ms,
-        );
-        self.telemetry
-            .record_event(V5ReceiptRuntimeEventKind::ValidationEntered, batch_epoch_ms);
-        self.telemetry
-            .record_event(V5ReceiptRuntimeEventKind::AdmissionEntered, batch_epoch_ms);
-        for _ in &work {
-            self.telemetry.record_validation();
-            self.telemetry.record_admission();
-        }
-        // The transport admits these calls concurrently. Keep every invocation's own validation
-        // and actor binding, but do not serialize that admission ahead of the durable writer
-        // batch. The scope joins every binding before the ledger can advance to ActorBound.
-        let actor_bounds = thread::scope(|scope| {
-            let bindings = work
-                .iter()
-                .map(|(_, invocation, _)| {
-                    scope.spawn(|| self.invocation_executor.bind(invocation.clone()))
-                })
-                .collect::<Vec<_>>();
-            bindings
-                .into_iter()
-                .map(|binding| {
-                    binding
-                        .join()
-                        .map_err(|_| {
-                            ReceiptLedgerError::Corrupt(
-                                "direct load batch invocation binding panicked",
-                            )
-                        })?
-                        .map_err(|_| {
-                            ReceiptLedgerError::Corrupt("direct load batch invocation did not bind")
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })?;
-        let bound = self.receipt_ledger.bind_reserved_actor_batch(
-            reservations
-                .iter()
-                .zip(&actor_bounds)
-                .map(|(reservation, actor_bound)| {
-                    (
-                        reservation.key().clone(),
-                        reservation.record_version(),
-                        actor_bound.workspace_identity_hash().clone(),
-                    )
-                })
-                .collect(),
-            deadline,
-        )?;
-        let begun = self.receipt_ledger.mark_reserved_begun_batch(
-            bound
-                .iter()
-                .zip(&actor_bounds)
-                .map(|(bound, actor_bound)| {
-                    (
-                        bound.key().clone(),
-                        bound.record_version(),
-                        actor_bound.workspace_identity_hash().clone(),
-                    )
-                })
-                .collect(),
-            deadline,
-        )?;
-        drop(actor_bounds);
-        self.telemetry
-            .record_event(V5ReceiptRuntimeEventKind::PrepareEntered, batch_epoch_ms);
-        self.telemetry
-            .record_event(V5ReceiptRuntimeEventKind::ExecuteEntered, batch_epoch_ms);
-        let mut terminal_requests = Vec::with_capacity(work.len());
-        for ((key, _, epoch_ms), begun) in work.iter().zip(&begun) {
-            self.telemetry.record_prepare();
-            self.telemetry.record_execute();
-            let outcome = match self
-                .scenario_control
-                .as_ref()
-                .ok_or(ReceiptLedgerError::Corrupt(
-                    "direct load callback owner is unavailable",
-                ))?
-                .execute_direct_load_callback(key.invocation_id())
-            {
-                Ok(result) => ReceiptTerminalOutcome::Completed {
-                    result: Box::new(result),
-                },
-                Err(_) => ReceiptTerminalOutcome::Failed {
-                    reason: V5SafeFailureReason::InvocationFailed,
-                },
-            };
-            let terminal = canonical_v5_terminal(&outcome)
-                .map_err(|_| ReceiptLedgerError::Corrupt("canonical v5 terminal failed"))?;
-            terminal_requests.push((
-                begun.key().clone(),
-                begun.record_version(),
-                *epoch_ms,
-                terminal,
-            ));
-        }
-        let publications = self
-            .receipt_ledger
-            .publish_direct_terminal_batch(terminal_requests, deadline)?;
-        publications
-            .into_iter()
-            .zip(work)
-            .map(|(publication, (key, _, epoch_ms))| {
-                let receipt = publication.receipt();
-                self.telemetry.record_event(
-                    V5ReceiptRuntimeEventKind::ReceiptTerminalCommitted,
-                    epoch_ms,
-                );
-                Ok(V5PendingDirectReceipt::new(
-                    key,
-                    receipt.terminal().outcome().clone(),
-                    receipt.terminal().digest().clone(),
-                    receipt.terminal_epoch_ms(),
-                ))
-            })
-            .collect()
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn seed_reserved_pool_entry_for_test(
-        &self,
-        key: ReceiptKey,
-        cutoff: OriginalCutoffDescriptor,
-        epoch_ms: u64,
-        deadline: Instant,
-    ) -> Result<(), ReceiptLedgerError> {
-        self.telemetry
-            .record_event(V5ReceiptRuntimeEventKind::V5ReceiptRuntimeEntered, epoch_ms);
-        self.receipt_ledger.reserve(key, cutoff, deadline)?;
-        Ok(())
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn seed_receipt_backed_terminal_pool_entry_for_test(
-        &self,
-        key: ReceiptKey,
-        epoch_ms: u64,
-        task_ttl_ms: u64,
-        task_poll_interval_ms: u64,
-        terminal: crate::application::receipt_ledger::V5CanonicalTerminal,
-        deadline: Instant,
-    ) -> Result<(), ReceiptLedgerError> {
-        self.telemetry
-            .record_event(V5ReceiptRuntimeEventKind::V5ReceiptRuntimeEntered, epoch_ms);
-        let reserved = self
-            .receipt_ledger
-            .reserve(
-                key.clone(),
-                OriginalCutoffDescriptor::new(epoch_ms, 7_000)
-                    .map_err(|_| ReceiptLedgerError::TimestampOverflow)?,
-                deadline,
-            )?
-            .into_reservation()
-            .map_err(|_| ReceiptLedgerError::Corrupt("fixture receipt already exists"))?;
-        let promised = self.receipt_ledger.promise_task_unbound(
-            key.clone(),
-            reserved.record_version(),
-            epoch_ms,
-            task_ttl_ms,
-            task_poll_interval_ms,
-            deadline,
-        )?;
-        self.receipt_ledger.publish_receipt_backed_task_terminal(
-            key,
-            TaskCancellationReceipt::PromisedUnbound(promised),
-            epoch_ms,
-            terminal,
-            deadline,
-        )?;
-        Ok(())
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn mark_reserved_begun_under_gate_for_test(
-        &self,
-        key: &ReceiptKey,
-        operation_label: &str,
-        deadline: Instant,
-    ) -> Result<(), String> {
-        self.telemetry.record_event(
-            V5ReceiptRuntimeEventKind::V5ReceiptRuntimeEntered,
-            self.epoch_ms(),
-        );
-        let control = self
-            .scenario_control
-            .as_ref()
-            .ok_or_else(|| "reserved-begin scenario control is unavailable".to_owned())?;
-        if control.is_barrier_installed(
-            receipt_scenario_v5::ScenarioBarrierPoint::BeforeMarkReservedBegunGateAcquire,
-        ) {
-            control.record_operation_event(operation_label, "blocked");
-            self.telemetry.record_event(
-                V5ReceiptRuntimeEventKind::MarkReservedBegunBlocked,
-                self.epoch_ms(),
-            );
-            control
-                .pause(
-                    receipt_scenario_v5::ScenarioBarrierPoint::BeforeMarkReservedBegunGateAcquire,
-                    deadline,
-                )
-                .map_err(|error| format!("wait before reserved-begin lifecycle gate: {error}"))?;
-        }
-        control
-            .acquire_lifecycle_gate(operation_label, deadline)
-            .map_err(|error| format!("acquire reserved-begin lifecycle gate: {error}"))?;
-        let result = (|| {
-            let current = self
-                .receipt_ledger
-                .recover(key.clone(), deadline)
-                .map_err(|error| format!("recover actor-bound receipt before begin: {error}"))?;
-            let ReceiptState::Reserved(reserved) = current else {
-                return Ok(());
-            };
-            if !matches!(reserved.phase(), ReservedPhase::ActorBound { .. }) {
-                return Ok(());
-            }
-            let begun = match self.receipt_ledger.mark_reserved_begun(
-                key.clone(),
-                reserved.record_version(),
-                deadline,
-            ) {
-                Ok(begun) => begun,
-                Err(error) => {
-                    let winner = self.receipt_ledger.recover(key.clone(), deadline).map_err(
-                        |recover_error| {
-                            format!(
-                                "mark actor-bound receipt begun: {error}; recover winner: {recover_error}"
-                            )
-                        },
-                    )?;
-                    if !matches!(winner, ReceiptState::Reserved(_)) {
-                        return Ok(());
-                    }
-                    return Err(format!("mark actor-bound receipt begun: {error}"));
-                }
-            };
-            control.record_reserved_begin_authorization(operation_label, begun.key());
-            self.telemetry.record_event(
-                V5ReceiptRuntimeEventKind::ReceiptBegunCommitted,
-                self.epoch_ms(),
-            );
-            self.telemetry
-                .record_event(V5ReceiptRuntimeEventKind::TokenSignalled, self.epoch_ms());
-            Ok(())
-        })();
-        control.release_lifecycle_gate(operation_label);
-        self.telemetry.record_event(
-            V5ReceiptRuntimeEventKind::OperationCompleted,
-            self.epoch_ms(),
-        );
-        result
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn cancel_under_gate_for_test(
-        &self,
-        key: &ReceiptKey,
-        operation_label: &str,
-        deadline: Instant,
-    ) -> Result<(), String> {
-        self.telemetry.record_event(
-            V5ReceiptRuntimeEventKind::V5ReceiptRuntimeEntered,
-            self.epoch_ms(),
-        );
-        let control = self
-            .scenario_control
-            .as_ref()
-            .ok_or_else(|| "cancel scenario control is unavailable".to_owned())?;
-        if control.is_barrier_installed(
-            receipt_scenario_v5::ScenarioBarrierPoint::BeforeCancelGateAcquire,
-        ) {
-            control.record_operation_event(operation_label, "blocked");
-            self.telemetry.record_event(
-                V5ReceiptRuntimeEventKind::CancelCommitBlocked,
-                self.epoch_ms(),
-            );
-            control
-                .pause(
-                    receipt_scenario_v5::ScenarioBarrierPoint::BeforeCancelGateAcquire,
-                    deadline,
-                )
-                .map_err(|error| format!("wait before cancel lifecycle gate: {error}"))?;
-        }
-        control
-            .acquire_lifecycle_gate(operation_label, deadline)
-            .map_err(|error| format!("acquire cancel lifecycle gate: {error}"))?;
-        let result = (|| {
-            self.cancel_invocation(key.clone(), self.epoch_ms(), deadline)
-                .map_err(|error| format!("cancel under lifecycle gate: {error}"))?;
-            match self.receipt_ledger.recover(key.clone(), deadline) {
-                Ok(ReceiptState::Reserved(reserved))
-                    if matches!(reserved.phase(), ReservedPhase::ActorBound { .. })
-                        && reserved.cancel_requested() =>
-                {
-                    let terminal = canonical_v5_terminal(&ReceiptTerminalOutcome::Cancelled)
-                        .map_err(|error| format!("prepare cancel winner terminal: {error}"))?;
-                    self.receipt_ledger
-                        .publish_direct_terminal(
-                            key.clone(),
-                            reserved.record_version(),
-                            self.epoch_ms(),
-                            terminal,
-                            deadline,
-                        )
-                        .map_err(|error| format!("publish cancel winner terminal: {error}"))?;
-                    self.telemetry.record_event(
-                        V5ReceiptRuntimeEventKind::ReceiptTerminalCommitted,
-                        self.epoch_ms(),
-                    );
-                }
-                Ok(_) | Err(ReceiptLedgerError::ReceiptNotFound) => {}
-                Err(error) => return Err(format!("recover cancel winner: {error}")),
-            }
-            Ok(())
-        })();
-        if result.is_ok() {
-            self.telemetry
-                .record_event(V5ReceiptRuntimeEventKind::CancelCommitted, self.epoch_ms());
-        }
-        control.release_lifecycle_gate(operation_label);
-        self.telemetry.record_event(
-            V5ReceiptRuntimeEventKind::OperationCompleted,
-            self.epoch_ms(),
-        );
-        result
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn materialize_cutoff_handoff_for_test(
-        &self,
-        handoff: &TaskHandoffActorBoundReceipt,
-        deadline: Instant,
-    ) -> Result<(), String> {
-        let epoch_ms = self.epoch_ms();
-        let (task_record, task_bound) = self
-            .task_projection
-            .materialize_bound_handoff(handoff, epoch_ms, deadline, &self.telemetry)
-            .map_err(|failure| format!("materialize cutoff Task handoff: {}", failure.error))?;
-        self.receipt_ledger
-            .complete_bound_task_handoff(
-                handoff.key().clone(),
-                handoff.record_version(),
-                task_bound.clone(),
-                deadline,
-            )
-            .map_err(|error| format!("commit cutoff Task handoff: {error}"))?;
-        let (task_record, task_bound) = self
-            .task_projection
-            .start_bound_task(&task_bound, task_record, deadline)
-            .map_err(|failure| format!("start cutoff Task handoff: {}", failure.error))?;
-        if let Some(control) = &self.scenario_control {
-            control.record_bound_task(task_record, task_bound);
-        }
-        self.telemetry
-            .record_event(V5ReceiptRuntimeEventKind::TaskBoundCommitted, epoch_ms);
-        Ok(())
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn bind_task_under_gate_for_test(
-        &self,
-        key: &ReceiptKey,
-        operation_label: &str,
-        deadline: Instant,
-    ) -> Result<(), String> {
-        self.telemetry.record_event(
-            V5ReceiptRuntimeEventKind::V5ReceiptRuntimeEntered,
-            self.epoch_ms(),
-        );
-        let control = self
-            .scenario_control
-            .as_ref()
-            .ok_or_else(|| "Task bind scenario control is unavailable".to_owned())?;
-        control
-            .acquire_lifecycle_gate(operation_label, deadline)
-            .map_err(|error| format!("acquire Task bind lifecycle gate: {error}"))?;
-        let result = (|| {
-            let current = self
-                .receipt_ledger
-                .recover(key.clone(), deadline)
-                .map_err(|error| format!("recover actor-bound Task promise: {error}"))?;
-            let handoff = match current {
-                ReceiptState::TaskPromisedActorBound(promised) => self
-                    .receipt_ledger
-                    .begin_bound_task_handoff(
-                        promised.key().clone(),
-                        promised.record_version(),
-                        promised.task().created_at_epoch_ms(),
-                        promised.task().ttl_ms(),
-                        promised.task().poll_interval_ms(),
-                        deadline,
-                    )
-                    .map_err(|error| format!("begin Task handoff: {error}"))?,
-                ReceiptState::TaskHandoffActorBound(handoff) => handoff,
-                other => {
-                    return Err(format!(
-                        "Task bind requires actor-bound promise, found {}",
-                        other.kind().diagnostic_name()
-                    ))
-                }
-            };
-            let (record, bound) = self
-                .task_projection
-                .materialize_bound_handoff(&handoff, self.epoch_ms(), deadline, &self.telemetry)
-                .map_err(|failure| format!("materialize actor-bound Task: {}", failure.error))?;
-            control.record_bound_task(record.clone(), bound.clone());
-            self.telemetry.record_event(
-                V5ReceiptRuntimeEventKind::TaskStoreReadbackBeforeBind,
-                self.epoch_ms(),
-            );
-            if control.is_barrier_installed(
-                receipt_scenario_v5::ScenarioBarrierPoint::AfterTaskStoreReadbackBeforeTaskBound,
-            ) {
-                control.record_operation_event(operation_label, "blocked");
-                control
-                    .pause(
-                        receipt_scenario_v5::ScenarioBarrierPoint::AfterTaskStoreReadbackBeforeTaskBound,
-                        deadline,
-                    )
-                    .map_err(|error| format!("wait after TaskStore readback: {error}"))?;
-            }
-            self.receipt_ledger
-                .complete_bound_task_handoff(
-                    handoff.key().clone(),
-                    handoff.record_version(),
-                    bound.clone(),
-                    deadline,
-                )
-                .map_err(|error| format!("complete Task handoff: {error}"))?;
-            control.record_handoff_task_binding(operation_label, &handoff, &bound);
-            control.record_bound_task(record, bound);
-            self.telemetry.record_event(
-                V5ReceiptRuntimeEventKind::TaskBoundCommitted,
-                self.epoch_ms(),
-            );
-            Ok(())
-        })();
-        control.release_lifecycle_gate(operation_label);
-        self.telemetry.record_event(
-            V5ReceiptRuntimeEventKind::OperationCompleted,
-            self.epoch_ms(),
-        );
-        result
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn continue_receipt_owned_attempt_for_test(
-        &self,
-        key: &ReceiptKey,
-        result: crate::domain::invocation::DomainResult,
-        deadline: Instant,
-    ) -> Result<Value, String> {
-        let epoch_ms = self.epoch_clock.now_epoch_millis();
-        let state = self
-            .receipt_ledger
-            .recover(key.clone(), deadline)
-            .map_err(|error| format!("recover receipt-owned Task attempt: {error}"))?;
-        let ReceiptState::TaskReceiptOwnedActorBound(receipt_owned) = state else {
-            return Err("continued Task attempt is not receipt-owned".to_owned());
-        };
-        let terminal = canonical_v5_terminal(&ReceiptTerminalOutcome::Completed {
-            result: Box::new(result),
-        })
-        .map_err(|error| format!("encode receipt-owned Task terminal: {error}"))?;
-        let committed = self
-            .receipt_ledger
-            .publish_receipt_backed_task_terminal(
-                key.clone(),
-                TaskCancellationReceipt::ReceiptOwnedActorBound(receipt_owned),
-                epoch_ms,
-                terminal,
-                deadline,
-            )
-            .map_err(|error| format!("publish receipt-owned Task terminal: {error}"))?;
-        if let Some(control) = &self.scenario_control {
-            control
-                .record_receipt_backed_terminal(committed.clone())
-                .map_err(|error| format!("record receipt-owned Task terminal: {error}"))?;
-        }
-        self.telemetry.record_event(
-            V5ReceiptRuntimeEventKind::ReceiptTerminalCommitted,
-            epoch_ms,
-        );
-        Ok(json!({
-            "kind": "task",
-            "error": null,
-            "terminal": terminal_observation_value(committed.terminal(), epoch_ms),
-            "key": receipt_key_observation_value(key),
-            "task": null,
-            "acknowledgement": null,
-            "cutoffEpochMs": null,
-            "originalBudgetMs": null,
-            "latencyMs": 0,
-        }))
     }
 
     fn preflight_existing_handoff_tasks(
@@ -4212,8 +2245,7 @@ impl V5ReceiptRuntime {
                             &promised,
                             terminal_epoch_ms,
                             deadline,
-                            #[cfg(feature = "receipt-ledger-test-support")]
-                            &self.telemetry,
+                            self.hooks.as_ref(),
                         )
                         .map_err(|failure| {
                             let error = self.project_task_failure(failure);
@@ -4267,8 +2299,7 @@ impl V5ReceiptRuntime {
                             &handoff,
                             terminal_epoch_ms,
                             deadline,
-                            #[cfg(feature = "receipt-ledger-test-support")]
-                            &self.telemetry,
+                            self.hooks.as_ref(),
                         )
                         .map_err(|failure| {
                             let error = self.project_task_failure(failure);
@@ -4302,12 +2333,6 @@ impl V5ReceiptRuntime {
         Ok(())
     }
 
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn with_shared_telemetry(mut self, telemetry: Arc<V5ReceiptRuntimeTelemetry>) -> Self {
-        self.telemetry = telemetry;
-        self
-    }
-
     fn ensure_named_authority(&self) -> Result<(), String> {
         self.ensure_named_authority_before(Instant::now() + AUTHORITY_ACQUIRE_TIMEOUT)
     }
@@ -4320,6 +2345,31 @@ impl V5ReceiptRuntime {
             .generation(deadline)
             .map(|_| ())
             .map_err(|error| format!("validate protocol-v5 receipt authority: {error}"))
+    }
+
+    /// Whether the attempt on this thread must stop: the observer simulated
+    /// the process's death, or the process latched fail-stop for real.
+    /// A cancelled Working Task gets the grace to reach its terminal before
+    /// the process fail-stops on it.
+    fn arm_cancel_grace(&self, record: &V5StoredInvocationRecord) {
+        // The ordinary grace protects a cancelled, non-cooperative attempt.
+        // A protected runner has crossed the process launch boundary; killing
+        // the daemon here would discard the database operation's receipt.
+        if record.task == V5StoredTask::Working
+            && !self
+                .active_task_cancellations
+                .protected_started(record.task_id)
+        {
+            self.fail_stop_watchdogs.arm(
+                record.receipt_key_digest.clone(),
+                self.invocation_executor.now(),
+                FAIL_STOP_GRACE,
+            );
+        }
+    }
+
+    fn attempt_is_dead(&self) -> bool {
+        self.hooks.process_exited() || self.restart_required()
     }
 
     fn restart_required(&self) -> bool {
@@ -4356,6 +2406,7 @@ impl V5ReceiptRuntime {
                 .map_err(|failure| self.project_task_failure(failure))?
             {
                 self.active_task_cancellations.cancel(record.task_id);
+                self.arm_cancel_grace(&record);
                 return Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
                     outcome: V5InvocationResponse::Task {
                         snapshot: task_store_snapshot(&record),
@@ -4386,30 +2437,20 @@ impl V5ReceiptRuntime {
                             .map_err(|_| {
                                 ReceiptLedgerError::Corrupt("canonical v5 terminal failed")
                             })?;
-                        let _committed = self.receipt_ledger.publish_receipt_backed_task_terminal(
+                        let committed = self.receipt_ledger.publish_receipt_backed_task_terminal(
                             cancelled.key().clone(),
                             cancelled,
                             epoch_ms,
                             terminal,
                             deadline,
                         )?;
-                        #[cfg(feature = "receipt-ledger-test-support")]
-                        {
-                            if let Some(control) = &self.scenario_control {
-                                control.record_receipt_backed_terminal(_committed).map_err(
-                                    |_| {
-                                        ReceiptLedgerError::Corrupt(
-                                            "capture receipt-backed terminal evidence failed",
-                                        )
-                                    },
-                                )?;
-                                control.release_pre_actor_barriers();
-                            }
-                            self.telemetry.record_event(
-                                V5ReceiptRuntimeEventKind::ReceiptTerminalCommitted,
-                                epoch_ms,
-                            );
-                        }
+                        self.fail_stop_watchdogs.disarm(committed.key_digest());
+                        self.hooks.receipt_backed_terminal(&committed)?;
+                        self.hooks.release_pre_actor_pauses();
+                        self.hooks.event(
+                            V5ReceiptRuntimeEventKind::ReceiptTerminalCommitted,
+                            epoch_ms,
+                        );
                         let snapshot = self.resolve_task(task_id, deadline)?;
                         return Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
                             outcome: V5InvocationResponse::Task { snapshot },
@@ -4429,6 +2470,28 @@ impl V5ReceiptRuntime {
                         return Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
                             outcome: V5InvocationResponse::Task { snapshot },
                         }));
+                    }
+                    ReceiptState::Reserved(reserved)
+                        if matches!(reserved.phase(), ReservedPhase::Begun { .. }) =>
+                    {
+                        // A running inline attempt: signal its token and give
+                        // it the grace before the process fail-stops on it.
+                        self.active_task_cancellations
+                            .cancel(reserved.key().reserved_task_id());
+                        if !self
+                            .active_task_cancellations
+                            .protected_started(reserved.key().reserved_task_id())
+                        {
+                            self.fail_stop_watchdogs.arm(
+                                crate::application::receipt_ledger::receipt_key_digest(
+                                    reserved.key(),
+                                ),
+                                self.invocation_executor.now(),
+                                FAIL_STOP_GRACE,
+                            );
+                        }
+                        return self
+                            .reply_for_existing_state(ReceiptState::Reserved(reserved), deadline);
                     }
                     other => return self.reply_for_existing_state(other, deadline),
                 };
@@ -4455,9 +2518,17 @@ impl V5ReceiptRuntime {
         epoch_ms: u64,
         deadline: Instant,
     ) -> Result<V5RuntimeReply, ReceiptLedgerError> {
-        #[cfg(feature = "receipt-ledger-test-support")]
-        self.telemetry
-            .record_event(V5ReceiptRuntimeEventKind::V5ExecutorEntered, epoch_ms);
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::V5ExecutorEntered, epoch_ms);
+        // One opaque daemon-side deadline per request, captured before strict
+        // validation and narrowed to the frontend budget: every later stage
+        // measures against it and none of them starts a new clock.
+        let response_deadline = match decoded.request() {
+            V5ClientRequest::SubmitInvocation { invocation } => self
+                .invocation_executor
+                .capture_response_deadline(invocation.response_budget_ms()),
+            _ => return Err(ReceiptLedgerError::InvocationIdentityMismatch),
+        };
         let strict = decoded
             .into_strict_submit(&self.core_identity)
             .map_err(|_| ReceiptLedgerError::InvocationIdentityMismatch)?;
@@ -4466,18 +2537,22 @@ impl V5ReceiptRuntime {
         let cutoff = OriginalCutoffDescriptor::new(epoch_ms, response_budget_ms)
             .map_err(|_| ReceiptLedgerError::TimestampOverflow)?;
         let outcome = self.receipt_ledger.reserve(key, cutoff, deadline)?;
-        #[cfg(feature = "receipt-ledger-test-support")]
         if matches!(&outcome, ReserveOutcome::Created(_)) {
-            self.telemetry
-                .record_event(V5ReceiptRuntimeEventKind::ReceiptReserved, epoch_ms);
+            self.hooks
+                .event(V5ReceiptRuntimeEventKind::ReceiptReserved, epoch_ms);
         }
         let decision = decide_cancel_reserved_submit(outcome).map_err(|_| {
             ReceiptLedgerError::Corrupt("canonical cancelled terminal could not be constructed")
         })?;
         match decision {
-            CancelReservedSubmitDecision::ExecuteReserved(reservation) => {
-                self.execute_reserved_invocation(reservation, invocation, epoch_ms, deadline)
-            }
+            CancelReservedSubmitDecision::ExecuteReserved(reservation) => self
+                .execute_reserved_invocation(
+                    reservation,
+                    invocation,
+                    response_deadline,
+                    epoch_ms,
+                    deadline,
+                ),
             other => self.reply_for_cancel_submit_decision(
                 other,
                 epoch_ms,
@@ -4488,624 +2563,263 @@ impl V5ReceiptRuntime {
         }
     }
 
+    /// The session handler owns the reply and the cutoff of a reserved
+    /// invocation from the reservation on: a worker thread runs validation,
+    /// admission, the durable transitions, prepare and execute, and the
+    /// handler answers with whatever arrives first — the worker's reply or
+    /// the seventh second. Before `Begun` the handler promotes the receipt
+    /// itself (`TaskPromisedUnbound` or the actor-bound handoff intent) and
+    /// answers with the projection; the worker then continues the single
+    /// attempt into that Task. From `Begun` on the inline drive on the worker
+    /// thread owns the cutoff, as before.
     fn execute_reserved_invocation(
         self: &Arc<Self>,
         reservation: crate::application::receipt_ledger::ReservedReceipt,
         invocation: V5InvocationRequest,
+        response_deadline: crate::application::invocation::InvocationResponseDeadline,
         epoch_ms: u64,
         deadline: Instant,
     ) -> Result<V5RuntimeReply, ReceiptLedgerError> {
-        #[cfg(feature = "receipt-ledger-test-support")]
-        self.telemetry
-            .record_event(V5ReceiptRuntimeEventKind::V5ReceiptRuntimeEntered, epoch_ms);
-        #[cfg(feature = "receipt-ledger-test-support")]
-        self.telemetry.record_event(
-            V5ReceiptRuntimeEventKind::CanonicalV13ServiceEntered,
-            epoch_ms,
-        );
-        #[cfg(feature = "receipt-ledger-test-support")]
-        {
-            self.telemetry.record_validation();
-            self.telemetry
-                .record_event(V5ReceiptRuntimeEventKind::ValidationEntered, epoch_ms);
-            if let Some(control) = &self.scenario_control {
-                control.pause(
-                    receipt_scenario_v5::ScenarioBarrierPoint::ValidationEntered,
-                    deadline,
-                )?;
-                let current = self
-                    .receipt_ledger
-                    .recover(reservation.key().clone(), deadline)?;
-                if !matches!(
-                    &current,
-                    ReceiptState::Reserved(receipt)
-                        if matches!(receipt.phase(), ReservedPhase::Unbound)
-                ) && !matches!(&current, ReceiptState::TaskPromisedUnbound(_))
-                {
-                    return self.reply_for_existing_state(current, deadline);
-                }
-                if control.validation_rejects() {
-                    let terminal = crate::application::receipt_ledger::canonical_v5_terminal(
-                        &crate::application::receipt_ledger::ReceiptTerminalOutcome::Completed {
-                            result: Box::new(
-                                crate::domain::invocation::DomainResult::canonical_rejection(
-                                    None,
-                                    RefusalCode::BadValue,
-                                    "scenario validation rejected invocation",
-                                ),
-                            ),
-                        },
-                    )
-                    .map_err(|_| ReceiptLedgerError::Corrupt("canonical v5 terminal failed"))?;
-                    return self.publish_pre_actor_terminal(
+        let slot = Arc::new(PipelineSlot::new());
+        let worker = {
+            let runtime = Arc::clone(self);
+            let slot = Arc::clone(&slot);
+            let reservation = reservation.clone();
+            let response_deadline = response_deadline.clone();
+            thread::Builder::new()
+                .name("unica-v5-invocation-pipeline".to_owned())
+                .spawn(move || {
+                    let outcome = runtime.run_reserved_pipeline(
                         reservation,
+                        invocation,
+                        response_deadline,
+                        &slot,
                         epoch_ms,
-                        terminal,
                         deadline,
                     );
-                }
-            }
-            self.telemetry.record_admission();
-            self.telemetry
-                .record_event(V5ReceiptRuntimeEventKind::AdmissionEntered, epoch_ms);
-            if let Some(control) = &self.scenario_control {
-                control.pause(
-                    receipt_scenario_v5::ScenarioBarrierPoint::AdmissionEntered,
-                    deadline,
-                )?;
-                let current = self
-                    .receipt_ledger
-                    .recover(reservation.key().clone(), deadline)?;
-                if control.process_exited() {
-                    return self.reply_for_existing_state(current, deadline);
-                }
-                if !matches!(
-                    &current,
-                    ReceiptState::Reserved(receipt)
-                        if matches!(receipt.phase(), ReservedPhase::Unbound)
-                ) && !matches!(&current, ReceiptState::TaskPromisedUnbound(_))
-                {
-                    return self.reply_for_existing_state(current, deadline);
-                }
-                if let Some(rejection) = control.admission_rejection() {
-                    let fail_stop = matches!(
-                        rejection,
-                        receipt_scenario_v5::ScenarioWorkspaceAdmissionFailure::RegistryFailed
-                    );
-                    let outcome = match rejection {
-                        receipt_scenario_v5::ScenarioWorkspaceAdmissionFailure::Invalid => {
-                            crate::application::receipt_ledger::ReceiptTerminalOutcome::Completed {
-                                result: Box::new(
-                                    crate::domain::invocation::DomainResult::canonical_rejection(
-                                        None,
-                                        RefusalCode::BadValue,
-                                        "scenario workspace admission rejected invocation",
-                                    ),
-                                ),
-                            }
-                        }
-                        receipt_scenario_v5::ScenarioWorkspaceAdmissionFailure::Capacity => {
-                            crate::application::receipt_ledger::ReceiptTerminalOutcome::Failed {
-                                reason: V5SafeFailureReason::WorkspaceCapacity,
-                            }
-                        }
-                        receipt_scenario_v5::ScenarioWorkspaceAdmissionFailure::RegistryFailed => {
-                            crate::application::receipt_ledger::ReceiptTerminalOutcome::Failed {
-                                reason: V5SafeFailureReason::WorkspaceRegistryFailed,
-                            }
-                        }
-                    };
-                    let terminal =
-                        crate::application::receipt_ledger::canonical_v5_terminal(&outcome)
-                            .map_err(|_| {
-                                ReceiptLedgerError::Corrupt("canonical v5 terminal failed")
-                            })?;
-                    let reply =
-                        self.publish_pre_actor_terminal(reservation, epoch_ms, terminal, deadline);
-                    if fail_stop {
-                        self.telemetry.record_restart_requested();
-                        self.external_store_fail_stop.store(true, Ordering::Release);
+                    slot.report(match outcome {
+                        Ok(reply) => PipelineReport::Reply(reply),
+                        Err(error) => PipelineReport::Failed(error),
+                    });
+                    if slot.promoted_by_owner() {
+                        runtime
+                            .promoted_continuations
+                            .fetch_sub(1, Ordering::AcqRel);
                     }
-                    return match (fail_stop, reply) {
-                        (true, Ok(V5RuntimeReply::Prepared(frame))) => {
-                            Ok(V5RuntimeReply::PreparedFailStop(frame))
-                        }
-                        (true, Ok(V5RuntimeReply::Json(response))) => {
-                            Ok(V5RuntimeReply::JsonFailStop(response))
-                        }
-                        (_, reply) => reply,
-                    };
-                }
-            }
-        }
-        let actor_bound = match self.invocation_executor.bind(invocation) {
-            Ok(actor_bound) => actor_bound,
-            Err(error) => {
-                let outcome = match error {
-                    V5CanonicalPrepareError::Direct(result) => {
-                        crate::application::receipt_ledger::ReceiptTerminalOutcome::Completed {
-                            result,
-                        }
-                    }
-                    V5CanonicalPrepareError::Rejected(result) => {
-                        crate::application::receipt_ledger::ReceiptTerminalOutcome::Completed {
-                            result,
-                        }
-                    }
-                    V5CanonicalPrepareError::WorkspaceCapacity => {
-                        crate::application::receipt_ledger::ReceiptTerminalOutcome::Failed {
-                            reason: V5SafeFailureReason::WorkspaceCapacity,
-                        }
-                    }
-                    V5CanonicalPrepareError::WorkspaceRegistryFailed => {
-                        crate::application::receipt_ledger::ReceiptTerminalOutcome::Failed {
-                            reason: V5SafeFailureReason::WorkspaceRegistryFailed,
-                        }
+                })
+                .map_err(|_| {
+                    self.external_store_fail_stop.store(true, Ordering::Release);
+                    ReceiptLedgerError::StoreUnavailable
+                })?
+        };
+        let mut state = slot.lock();
+        // The cutoff is answered once. A second `promote_at_cutoff` would only
+        // enqueue another recover on the single ledger actor and delay the very
+        // report it is waiting for.
+        let mut cutoff_settled = false;
+        loop {
+            if let Some(report) = state.report.take() {
+                let owned = !matches!(state.decision, PipelineDecision::PromotedByOwner);
+                state.decision = PipelineDecision::HandlerOwns;
+                drop(state);
+                let _ = worker.join();
+                return match report {
+                    PipelineReport::Reply(reply) if owned => Ok(reply),
+                    PipelineReport::Failed(error) if owned => Err(error),
+                    // The handler already answered with the promotion; the
+                    // worker's late reply belongs to a Task it published into.
+                    PipelineReport::Reply(_) | PipelineReport::Failed(_) => {
+                        Err(ReceiptLedgerError::Corrupt(
+                            "promoted invocation reported a reply after its owner answered",
+                        ))
                     }
                 };
-                let terminal = crate::application::receipt_ledger::canonical_v5_terminal(&outcome)
-                    .map_err(|_| ReceiptLedgerError::Corrupt("canonical v5 terminal failed"))?;
-                return self.publish_pre_actor_terminal(reservation, epoch_ms, terminal, deadline);
             }
-        };
+            if worker.is_finished() {
+                // The worker died without a report: the attempt failed and the
+                // failure is what the caller learns.
+                drop(state);
+                let _ = worker.join();
+                return Err(ReceiptLedgerError::StoreUnavailable);
+            }
+            if matches!(state.decision, PipelineDecision::PromotedByOwner)
+                || state.begun
+                || cutoff_settled
+            {
+                // Either the handler already answered, or the worker's drive
+                // claimed the cutoff: nothing to time here, wait for the report.
+                state = slot
+                    .changed
+                    .wait_timeout(state, INLINE_CUTOFF_POLL_INTERVAL)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0;
+                continue;
+            }
+            let remaining = response_deadline.remaining_handoff_budget();
+            if remaining.is_zero() {
+                state.decision = PipelineDecision::HandoffInProgress;
+                drop(state);
+                let promotion = self.promote_at_cutoff(&reservation, &slot, epoch_ms);
+                let mut next = slot.lock();
+                match promotion {
+                    Ok(Some(reply)) => {
+                        // The worker continues this promoted attempt off the
+                        // reply thread; the harness waits on the count to see
+                        // the Task the runtime finishes for it. Count it before
+                        // the decision becomes visible: the worker decrements as
+                        // soon as it observes `PromotedByOwner`, and a decrement
+                        // that overtook this increment would wrap the count.
+                        self.promoted_continuations.fetch_add(1, Ordering::AcqRel);
+                        next.decision = PipelineDecision::PromotedByOwner;
+                        slot.changed.notify_all();
+                        drop(next);
+                        self.task_execution_threads
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(worker);
+                        return Ok(reply);
+                    }
+                    Ok(None) => {
+                        // The worker already ended the attempt: its reply is
+                        // on the way, so stop timing the cutoff and wait.
+                        cutoff_settled = true;
+                        next.decision = PipelineDecision::Waiting;
+                        slot.changed.notify_all();
+                        state = next;
+                        continue;
+                    }
+                    Err(error) => {
+                        next.decision = PipelineDecision::HandlerOwns;
+                        slot.changed.notify_all();
+                        drop(next);
+                        self.task_execution_threads
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(worker);
+                        return Err(error);
+                    }
+                }
+            }
+            state = slot
+                .changed
+                .wait_timeout(state, remaining.min(INLINE_CUTOFF_POLL_INTERVAL))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    /// The handler's promotion at the seventh second, by the durable phase the
+    /// receipt is in: unbound — a promised Task with the fail-stop grace armed;
+    /// actor-bound, or begun before the drive claimed the cutoff — the handoff
+    /// intent, which the worker materializes and continues.
+    fn promote_at_cutoff(
+        &self,
+        reservation: &crate::application::receipt_ledger::ReservedReceipt,
+        slot: &PipelineSlot,
+        epoch_ms: u64,
+    ) -> Result<Option<V5RuntimeReply>, ReceiptLedgerError> {
+        let deadline = Instant::now() + CUTOFF_HANDOFF_COMMIT_BUDGET;
+        let cutoff_epoch_ms = self.epoch_ms();
         let current = self
             .receipt_ledger
             .recover(reservation.key().clone(), deadline)?;
-        if let ReceiptState::TaskPromisedUnbound(promised) = current {
-            #[cfg(feature = "receipt-ledger-test-support")]
-            if let Some(control) = &self.scenario_control {
-                control
-                    .record_actor_workspace_identity(actor_bound.workspace_identity_hash().clone());
-            }
-            let actor_promised = self.receipt_ledger.bind_promised_task_actor(
-                promised.key().clone(),
-                promised.record_version(),
-                actor_bound.workspace_identity_hash().clone(),
-                deadline,
-            )?;
-            #[cfg(feature = "receipt-ledger-test-support")]
-            self.telemetry
-                .record_event(V5ReceiptRuntimeEventKind::ActorBoundCommitted, epoch_ms);
-            #[cfg(feature = "receipt-ledger-test-support")]
-            if let Some(control) = &self.scenario_control {
-                control.pause(
-                    receipt_scenario_v5::ScenarioBarrierPoint::ActorBound,
+        let reserved = match current {
+            ReceiptState::Reserved(reserved) => reserved,
+            // The worker already ended the attempt: its reply is on the way.
+            _ => return Ok(None),
+        };
+        match reserved.phase() {
+            ReservedPhase::Unbound => {
+                let promised = self.receipt_ledger.promise_task_unbound(
+                    reserved.key().clone(),
+                    reserved.record_version(),
+                    cutoff_epoch_ms,
+                    DIRECT_TERMINAL_RETENTION_MS,
+                    V5_TASK_POLL_INTERVAL_MS,
                     deadline,
                 )?;
-            }
-            let handoff = self.receipt_ledger.begin_bound_task_handoff(
-                actor_promised.key().clone(),
-                actor_promised.record_version(),
-                actor_promised.task().created_at_epoch_ms(),
-                actor_promised.task().ttl_ms(),
-                actor_promised.task().poll_interval_ms(),
-                deadline,
-            )?;
-            #[cfg(feature = "receipt-ledger-test-support")]
-            self.telemetry
-                .record_event(V5ReceiptRuntimeEventKind::BoundHandoffCommitted, epoch_ms);
-            let link_reservation = self
-                .task_projection
-                .reserve_bound_handoff_link(
-                    &handoff,
-                    epoch_ms,
-                    deadline,
-                    #[cfg(feature = "receipt-ledger-test-support")]
-                    &self.telemetry,
-                )
-                .map_err(|failure| self.project_task_failure(failure))?;
-            #[cfg(feature = "receipt-ledger-test-support")]
-            if let Some(control) = &self.scenario_control {
-                control.pause(
-                    receipt_scenario_v5::ScenarioBarrierPoint::BeforeTaskStoreCreate,
-                    Instant::now() + receipt_scenario_v5::SCENARIO_BULK_OPERATION_TIMEOUT,
-                )?;
-            }
-            #[cfg(feature = "receipt-ledger-test-support")]
-            let deadline = if self.scenario_control.as_ref().is_some_and(|control| {
-                control.is_barrier_installed(
-                    receipt_scenario_v5::ScenarioBarrierPoint::BeforeTaskStoreCreate,
-                )
-            }) {
-                Instant::now() + receipt_scenario_v5::SCENARIO_BULK_OPERATION_TIMEOUT
-            } else {
-                deadline
-            };
-            #[cfg(feature = "receipt-ledger-test-support")]
-            let handoff = self
-                .scenario_control
-                .as_ref()
-                .and_then(|control| control.staged_handoff())
-                .unwrap_or(handoff);
-            let (task_record, bound) = self
-                .task_projection
-                .materialize_staged_bound_handoff(
-                    &handoff,
-                    &link_reservation,
-                    epoch_ms,
-                    deadline,
-                    #[cfg(feature = "receipt-ledger-test-support")]
-                    &self.telemetry,
-                )
-                .map_err(|failure| self.project_task_failure(failure))?;
-            #[cfg(feature = "receipt-ledger-test-support")]
-            if let Some(control) = &self.scenario_control {
-                control.record_promised_actor_binding(&promised, &actor_promised, &bound);
-            }
-            if let HandoffTerminalStage::Staged { terminal, .. } = handoff.terminal_stage() {
-                #[cfg(feature = "receipt-ledger-test-support")]
-                let provisional_record = task_record.clone();
-                let (terminal_record, terminal_link) = self
-                    .task_projection
-                    .publish_bound_task_terminal(
-                        &bound,
-                        task_record,
-                        terminal,
-                        epoch_ms,
-                        deadline,
-                        #[cfg(feature = "receipt-ledger-test-support")]
-                        &self.telemetry,
-                        #[cfg(feature = "receipt-ledger-test-support")]
-                        self.scenario_control.as_ref(),
-                    )
-                    .map_err(|failure| self.project_task_failure(failure))?;
-                #[cfg(feature = "receipt-ledger-test-support")]
-                {
-                    self.telemetry.record_event(
-                        V5ReceiptRuntimeEventKind::TaskStoreTerminalCommitted,
-                        epoch_ms,
-                    );
-                    self.telemetry.record_event(
-                        V5ReceiptRuntimeEventKind::TaskStoreTerminalReadback,
-                        epoch_ms,
-                    );
-                }
-                let _terminal_link = self.receipt_ledger.complete_staged_task_handoff(
-                    handoff.key().clone(),
-                    handoff.record_version(),
-                    terminal_link,
-                    deadline,
-                )?;
-                #[cfg(feature = "receipt-ledger-test-support")]
-                {
-                    if let Some(control) = &self.scenario_control {
-                        control
-                            .record_staged_terminal_publication(
-                                &handoff,
-                                &provisional_record,
-                                &terminal_record,
-                                &_terminal_link,
-                            )
-                            .map_err(|_| {
-                                ReceiptLedgerError::Corrupt("record staged terminal publication")
-                            })?;
-                        control.record_terminal_bound_task(terminal_record.clone(), _terminal_link);
-                    }
-                    self.telemetry.record_event(
-                        V5ReceiptRuntimeEventKind::TaskTerminalBoundCommitted,
-                        epoch_ms,
-                    );
-                }
-                return Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
-                    outcome: V5InvocationResponse::Task {
-                        snapshot: task_store_snapshot(&terminal_record),
-                    },
-                }));
-            }
-            self.receipt_ledger.complete_bound_task_handoff(
-                handoff.key().clone(),
-                handoff.record_version(),
-                bound.clone(),
-                deadline,
-            )?;
-            #[cfg(feature = "receipt-ledger-test-support")]
-            if let Some(control) = &self.scenario_control {
-                control.record_bound_task(task_record.clone(), bound.clone());
-            }
-            #[cfg(feature = "receipt-ledger-test-support")]
-            self.telemetry
-                .record_event(V5ReceiptRuntimeEventKind::TaskBoundCommitted, epoch_ms);
-            let authorized_bound =
-                if !task_record.cancel_requested && task_record.task == V5StoredTask::Queued {
-                    self.task_projection
-                        .authorize_not_begun_bound_task_start(&bound, &task_record, deadline)
-                        .map_err(|failure| self.project_task_failure(failure))?
-                } else {
-                    bound
-                };
-            #[cfg(feature = "receipt-ledger-test-support")]
-            if let Some(control) = &self.scenario_control {
-                control.record_bound_task(task_record.clone(), authorized_bound.clone());
-            }
-            #[cfg(feature = "receipt-ledger-test-support")]
-            if !task_record.cancel_requested && task_record.task == V5StoredTask::Queued {
-                self.telemetry.record_event(
-                    V5ReceiptRuntimeEventKind::FalseCancelObservationReached,
-                    epoch_ms,
+                self.hooks.event(
+                    V5ReceiptRuntimeEventKind::UnboundPromiseCommitted,
+                    cutoff_epoch_ms,
                 );
-                if let Some(control) = &self.scenario_control {
-                    control.pause(
-                        receipt_scenario_v5::ScenarioBarrierPoint::AfterFalseCancelObservation,
-                        deadline,
-                    )?;
-                }
-            }
-            #[cfg(feature = "receipt-ledger-test-support")]
-            let scenario_gate_acquired = if let Some(control) = &self.scenario_control {
-                if control.is_barrier_installed(
-                    receipt_scenario_v5::ScenarioBarrierPoint::AfterWorkingReadback,
-                ) {
-                    control.acquire_lifecycle_gate("submit", deadline)?;
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            let (task_record, bound) = self
-                .task_projection
-                .start_not_begun_bound_task(&authorized_bound, task_record, deadline)
-                .map_err(|failure| self.project_task_failure(failure))?;
-            #[cfg(feature = "receipt-ledger-test-support")]
-            let mut task_record = task_record;
-            #[cfg(feature = "receipt-ledger-test-support")]
-            if task_record.task == V5StoredTask::Working {
-                self.telemetry.record_event(
-                    V5ReceiptRuntimeEventKind::TaskStoreWorkingReadback,
-                    epoch_ms,
+                // Validation or admission still runs: it gets the grace, and
+                // the process fail-stops if the actor is not bound by then.
+                self.fail_stop_watchdogs.arm(
+                    promised.key_digest().clone(),
+                    self.invocation_executor.now(),
+                    FAIL_STOP_GRACE,
                 );
-            }
-            #[cfg(feature = "receipt-ledger-test-support")]
-            if let Some(control) = &self.scenario_control {
-                control.record_bound_task(task_record.clone(), bound.clone());
-                if task_record.task == V5StoredTask::Working
-                    && bound.phase() == AttemptPhase::NotBegun
-                {
-                    control.pause(
-                        receipt_scenario_v5::ScenarioBarrierPoint::AfterWorkingReadback,
-                        deadline,
-                    )?;
-                    control.pause(
-                        receipt_scenario_v5::ScenarioBarrierPoint::BeforeReceiptBegun,
-                        deadline,
-                    )?;
-                    if control.process_exited() {
-                        let current = self.receipt_ledger.recover(bound.key().clone(), deadline)?;
-                        return self.reply_for_existing_state(current, deadline);
-                    }
-                }
-            }
-            let bound = if task_record.task == V5StoredTask::Working
-                && bound.phase() == AttemptPhase::NotBegun
-            {
-                let begun = self
-                    .task_projection
-                    .mark_not_begun_bound_task_begun(&bound, &task_record, deadline)
-                    .map_err(|failure| self.project_task_failure(failure))?;
-                #[cfg(feature = "receipt-ledger-test-support")]
-                {
-                    self.telemetry
-                        .record_event(V5ReceiptRuntimeEventKind::ReceiptBegunCommitted, epoch_ms);
-                    self.telemetry
-                        .record_event(V5ReceiptRuntimeEventKind::TokenSignalled, epoch_ms);
-                    if let Some(control) = &self.scenario_control {
-                        control.record_bound_task_start_authorization(
-                            &authorized_bound,
-                            &task_record,
-                            &begun,
-                        );
-                        control.record_bound_task(task_record.clone(), begun.clone());
-                    }
-                }
-                begun
-            } else {
-                bound
-            };
-            #[cfg(feature = "receipt-ledger-test-support")]
-            if scenario_gate_acquired {
-                if let Some(control) = &self.scenario_control {
-                    control.release_lifecycle_gate("submit");
-                    control.wait_for_gate_cancel(deadline)?;
-                    if let Some(cancelled) = self
-                        .task_projection
-                        .cancel_exact_bound_task(bound.key(), deadline)
-                        .map_err(|failure| self.project_task_failure(failure))?
-                    {
-                        task_record = cancelled;
-                        control.record_bound_task(task_record.clone(), bound.clone());
-                    }
-                }
-            }
-            if task_record.cancel_requested {
-                let terminal = canonical_v5_terminal(&ReceiptTerminalOutcome::Cancelled)
-                    .map_err(|_| ReceiptLedgerError::Corrupt("canonical v5 terminal failed"))?;
-                let (terminal_record, _terminal_link) = self
-                    .task_projection
-                    .publish_bound_task_terminal(
-                        &bound,
-                        task_record,
-                        &terminal,
-                        epoch_ms,
-                        deadline,
-                        #[cfg(feature = "receipt-ledger-test-support")]
-                        &self.telemetry,
-                        #[cfg(feature = "receipt-ledger-test-support")]
-                        self.scenario_control.as_ref(),
-                    )
-                    .map_err(|failure| self.project_task_failure(failure))?;
-                #[cfg(feature = "receipt-ledger-test-support")]
-                {
-                    self.telemetry.record_event(
-                        V5ReceiptRuntimeEventKind::TaskStoreTerminalCommitted,
-                        epoch_ms,
-                    );
-                    self.telemetry.record_event(
-                        V5ReceiptRuntimeEventKind::TaskStoreTerminalReadback,
-                        epoch_ms,
-                    );
-                    self.telemetry.record_event(
-                        V5ReceiptRuntimeEventKind::TaskTerminalBoundCommitted,
-                        epoch_ms,
-                    );
-                    if let Some(control) = &self.scenario_control {
-                        control.record_terminal_bound_task(terminal_record.clone(), _terminal_link);
-                    }
-                }
-                return Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
+                let _ = epoch_ms;
+                Ok(Some(V5RuntimeReply::Json(V5ServerResponse::Invocation {
                     outcome: V5InvocationResponse::Task {
-                        snapshot: task_store_snapshot(&terminal_record),
+                        snapshot: queued_receipt_task_snapshot(
+                            promised.task(),
+                            promised.key_digest().clone(),
+                            promised.cancel_requested(),
+                        ),
                     },
-                }));
+                })))
             }
-            let (cancellation, cancellation_guard) = self
-                .active_task_cancellations
-                .register(task_record.task_id)?;
-            #[cfg(feature = "receipt-ledger-test-support")]
-            {
-                if let Some(control) = &self.scenario_control {
-                    control.pause(
-                        receipt_scenario_v5::ScenarioBarrierPoint::BeforePrepare,
-                        deadline,
-                    )?;
-                }
-                self.telemetry.record_prepare();
-                self.telemetry
-                    .record_event(V5ReceiptRuntimeEventKind::PrepareEntered, epoch_ms);
-                if let Some(control) = &self.scenario_control {
-                    control.pause(
-                        receipt_scenario_v5::ScenarioBarrierPoint::PrepareEntered,
-                        deadline,
-                    )?;
-                    if control.prepare_rejects() {
-                        let terminal = canonical_v5_terminal(&ReceiptTerminalOutcome::Completed {
-                            result: Box::new(
-                                crate::domain::invocation::DomainResult::canonical_rejection(
-                                    None,
-                                    RefusalCode::BadValue,
-                                    "scenario prepare rejected invocation",
-                                ),
+            ReservedPhase::ActorBound { .. } => {
+                let handoff = self.receipt_ledger.begin_bound_task_handoff(
+                    reserved.key().clone(),
+                    reserved.record_version(),
+                    cutoff_epoch_ms,
+                    DIRECT_TERMINAL_RETENTION_MS,
+                    V5_TASK_POLL_INTERVAL_MS,
+                    deadline,
+                )?;
+                self.hooks.event(
+                    V5ReceiptRuntimeEventKind::BoundHandoffCommitted,
+                    cutoff_epoch_ms,
+                );
+                Ok(Some(V5RuntimeReply::Json(V5ServerResponse::Invocation {
+                    outcome: V5InvocationResponse::Task {
+                        snapshot: queued_receipt_task_snapshot(
+                            handoff.task(),
+                            handoff.key_digest().clone(),
+                            handoff.cancel_requested(),
+                        ),
+                    },
+                })))
+            }
+            ReservedPhase::Begun { .. } => {
+                let handoff = self.receipt_ledger.begin_bound_task_handoff(
+                    reserved.key().clone(),
+                    reserved.record_version(),
+                    cutoff_epoch_ms,
+                    DIRECT_TERMINAL_RETENTION_MS,
+                    V5_TASK_POLL_INTERVAL_MS,
+                    deadline,
+                )?;
+                self.hooks.event(
+                    V5ReceiptRuntimeEventKind::BoundHandoffCommitted,
+                    cutoff_epoch_ms,
+                );
+                if self.hooks.holds(V5PausePoint::BeforeTaskStoreCreate) {
+                    // The observer holds the Task store create: the worker
+                    // stages the terminal on release, so answer with the
+                    // handoff's queued Task and defer materialization.
+                    return Ok(Some(V5RuntimeReply::Json(V5ServerResponse::Invocation {
+                        outcome: V5InvocationResponse::Task {
+                            snapshot: queued_receipt_task_snapshot(
+                                handoff.task(),
+                                handoff.key_digest().clone(),
+                                handoff.cancel_requested(),
                             ),
-                        })
-                        .map_err(|_| ReceiptLedgerError::Corrupt("canonical v5 terminal failed"))?;
-                        return self.publish_bound_terminal_reply(
-                            &bound,
-                            task_record,
-                            &terminal,
-                            epoch_ms,
-                            deadline,
-                        );
-                    }
+                        },
+                    })));
                 }
-            }
-            let prepared = match actor_bound.prepare() {
-                Ok(prepared) => prepared,
-                Err(result) => {
-                    let terminal =
-                        canonical_v5_terminal(&ReceiptTerminalOutcome::Completed { result })
-                            .map_err(|_| {
-                                ReceiptLedgerError::Corrupt("canonical v5 terminal failed")
-                            })?;
-                    return self.publish_bound_terminal_reply(
-                        &bound,
-                        task_record,
-                        &terminal,
-                        epoch_ms,
-                        deadline,
-                    );
-                }
-            };
-            if matches!(
-                prepared.execution_class(),
-                crate::application::operation_descriptors::ExecutionClass::KnownLong(_)
-            ) {
-                self.spawn_task_execution(
-                    prepared,
-                    bound,
-                    task_record.clone(),
-                    cancellation,
-                    cancellation_guard,
-                )?;
-                return Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
-                    outcome: V5InvocationResponse::Task {
-                        snapshot: task_store_snapshot(&task_record),
-                    },
-                }));
-            }
-            #[cfg(feature = "receipt-ledger-test-support")]
-            {
-                self.telemetry.record_execute();
-                self.telemetry
-                    .record_event(V5ReceiptRuntimeEventKind::ExecuteEntered, epoch_ms);
-            }
-            #[cfg(feature = "receipt-ledger-test-support")]
-            if let Some(control) = &self.scenario_control {
-                control.record_callback_invocation_id(reservation.key().invocation_id());
-            }
-            let result = prepared.execute(cancellation.clone());
-            let outcome = if cancellation.is_cancelled() {
-                ReceiptTerminalOutcome::Cancelled
-            } else {
-                match result {
-                    Ok(result) => ReceiptTerminalOutcome::Completed {
-                        result: Box::new(result),
-                    },
-                    Err(_) => ReceiptTerminalOutcome::Failed {
-                        reason: V5SafeFailureReason::InvocationFailed,
-                    },
-                }
-            };
-            #[cfg(feature = "receipt-ledger-test-support")]
-            if self
-                .scenario_control
-                .as_ref()
-                .is_some_and(|control| control.take_crash_after_side_effect())
-            {
-                return Err(ReceiptLedgerError::StoreUnavailable);
-            }
-            #[cfg(feature = "receipt-ledger-test-support")]
-            self.telemetry
-                .record_event(V5ReceiptRuntimeEventKind::ResultSerialized, epoch_ms);
-            let snapshot =
-                self.publish_task_execution_outcome(&bound, task_record.task_id, outcome, deadline);
-            drop(cancellation_guard);
-            return snapshot.map(|snapshot| {
-                V5RuntimeReply::Json(V5ServerResponse::Invocation {
-                    outcome: V5InvocationResponse::Task { snapshot },
-                })
-            });
-        }
-        #[cfg(feature = "receipt-ledger-test-support")]
-        if let Some(control) = &self.scenario_control {
-            control.record_actor_workspace_identity(actor_bound.workspace_identity_hash().clone());
-        }
-        let bound = self.receipt_ledger.bind_reserved_actor(
-            reservation.key().clone(),
-            reservation.record_version(),
-            actor_bound.workspace_identity_hash().clone(),
-            deadline,
-        )?;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        self.telemetry
-            .record_event(V5ReceiptRuntimeEventKind::ActorBoundCommitted, epoch_ms);
-        #[cfg(feature = "receipt-ledger-test-support")]
-        if let Some(control) = &self.scenario_control {
-            control.pause(
-                receipt_scenario_v5::ScenarioBarrierPoint::ActorBound,
-                deadline,
-            )?;
-            control.pause(
-                receipt_scenario_v5::ScenarioBarrierPoint::BeforeReceiptBegun,
-                deadline,
-            )?;
-            let current = self.receipt_ledger.recover(bound.key().clone(), deadline)?;
-            if control.process_exited() {
-                return self.reply_for_existing_state(current, deadline);
-            }
-            if let ReceiptState::TaskHandoffActorBound(handoff) = current {
+                // Materialize the Task now so a client polling at the cutoff
+                // sees a working Task; the paused worker executes into it.
                 let (task_record, task_bound) = self
                     .task_projection
-                    .materialize_bound_handoff(&handoff, epoch_ms, deadline, &self.telemetry)
+                    .materialize_bound_handoff(
+                        &handoff,
+                        cutoff_epoch_ms,
+                        deadline,
+                        self.hooks.as_ref(),
+                    )
                     .map_err(|failure| self.project_task_failure(failure))?;
                 self.receipt_ledger.complete_bound_task_handoff(
                     handoff.key().clone(),
@@ -5113,183 +2827,308 @@ impl V5ReceiptRuntime {
                     task_bound.clone(),
                     deadline,
                 )?;
-                control.record_bound_task(task_record.clone(), task_bound);
-                self.telemetry
-                    .record_event(V5ReceiptRuntimeEventKind::TaskBoundCommitted, epoch_ms);
-                return Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
+                let (task_record, task_bound) = self
+                    .task_projection
+                    .start_bound_task(&task_bound, task_record, deadline)
+                    .map_err(|failure| self.project_task_failure(failure))?;
+                self.hooks.bound_task(&task_record, &task_bound);
+                self.hooks.event(
+                    V5ReceiptRuntimeEventKind::TaskBoundCommitted,
+                    cutoff_epoch_ms,
+                );
+                let reply = V5RuntimeReply::Json(V5ServerResponse::Invocation {
                     outcome: V5InvocationResponse::Task {
                         snapshot: task_store_snapshot(&task_record),
                     },
-                }));
+                });
+                slot.stash_owner_materialized(task_record, task_bound);
+                Ok(Some(reply))
             }
         }
-        let begun = self.receipt_ledger.mark_reserved_begun(
-            bound.key().clone(),
-            bound.record_version(),
-            deadline,
-        )?;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        self.telemetry
-            .record_event(V5ReceiptRuntimeEventKind::ReceiptBegunCommitted, epoch_ms);
-        #[cfg(feature = "receipt-ledger-test-support")]
-        {
-            if let Some(control) = &self.scenario_control {
-                control.pause(
-                    receipt_scenario_v5::ScenarioBarrierPoint::BeforePrepare,
-                    deadline,
-                )?;
-                let current = self.receipt_ledger.recover(begun.key().clone(), deadline)?;
-                if control.process_exited() {
-                    return self.reply_for_existing_state(current, deadline);
-                }
-                if let ReceiptState::TaskHandoffActorBound(handoff) = current {
-                    if control.prepare_rejects() {
-                        let terminal = crate::application::receipt_ledger::canonical_v5_terminal(
-                            &crate::application::receipt_ledger::ReceiptTerminalOutcome::Completed {
-                                result: Box::new(
-                                    crate::domain::invocation::DomainResult::canonical_rejection(
-                                        None,
-                                        RefusalCode::BadValue,
-                                        "scenario prepare rejected invocation",
-                                    ),
-                                ),
-                            },
-                        )
-                        .map_err(|_| ReceiptLedgerError::Corrupt("canonical v5 terminal failed"))?;
-                        return self.publish_staged_handoff_terminal_reply(
-                            handoff, terminal, epoch_ms, deadline,
-                        );
-                    }
-                    let (task_record, task_bound) = self
-                        .task_projection
-                        .materialize_bound_handoff(&handoff, epoch_ms, deadline, &self.telemetry)
-                        .map_err(|failure| self.project_task_failure(failure))?;
-                    self.receipt_ledger.complete_bound_task_handoff(
-                        handoff.key().clone(),
-                        handoff.record_version(),
-                        task_bound.clone(),
-                        deadline,
-                    )?;
-                    let (task_record, task_bound) = self
-                        .task_projection
-                        .start_bound_task(&task_bound, task_record, deadline)
-                        .map_err(|failure| self.project_task_failure(failure))?;
-                    control.record_bound_task(task_record.clone(), task_bound);
-                    self.telemetry
-                        .record_event(V5ReceiptRuntimeEventKind::TaskBoundCommitted, epoch_ms);
-                    return Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
-                        outcome: V5InvocationResponse::Task {
-                            snapshot: task_store_snapshot(&task_record),
-                        },
-                    }));
-                }
-                if !matches!(
-                    &current,
-                    ReceiptState::Reserved(receipt)
-                        if matches!(receipt.phase(), ReservedPhase::Begun { .. })
-                ) {
-                    return self.reply_for_existing_state(current, deadline);
-                }
+    }
+
+    /// A fresh bound for the durable steps of an attempt the handler already
+    /// answered for: the operation budget of the submit is spent by definition.
+    fn continuation_deadline() -> Instant {
+        Instant::now() + TASK_TERMINAL_PUBLICATION_TIMEOUT
+    }
+
+    /// The pipeline of one reserved invocation on the worker thread.
+    fn run_reserved_pipeline(
+        self: &Arc<Self>,
+        reservation: crate::application::receipt_ledger::ReservedReceipt,
+        invocation: V5InvocationRequest,
+        response_deadline: crate::application::invocation::InvocationResponseDeadline,
+        slot: &PipelineSlot,
+        epoch_ms: u64,
+        deadline: Instant,
+    ) -> Result<V5RuntimeReply, ReceiptLedgerError> {
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::V5ReceiptRuntimeEntered, epoch_ms);
+        self.hooks.event(
+            V5ReceiptRuntimeEventKind::CanonicalV13ServiceEntered,
+            epoch_ms,
+        );
+        self.hooks.stage_entered(V5Stage::Validation);
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::ValidationEntered, epoch_ms);
+        self.hooks
+            .pause(V5PausePoint::ValidationEntered, deadline)?;
+        if self.hooks.observing() {
+            let current = self
+                .receipt_ledger
+                .recover(reservation.key().clone(), deadline)?;
+            if !reservation_is_still_unbound(&current) {
+                return self.reply_for_existing_state(current, deadline);
             }
-            self.telemetry.record_prepare();
-            self.telemetry
-                .record_event(V5ReceiptRuntimeEventKind::PrepareEntered, epoch_ms);
-            if let Some(control) = &self.scenario_control {
-                control.pause(
-                    receipt_scenario_v5::ScenarioBarrierPoint::PrepareEntered,
+        }
+        if self.hooks.validation_rejects() {
+            let terminal = injected_rejection_terminal("scenario validation rejected invocation")?;
+            return self.publish_pre_actor_terminal(reservation, epoch_ms, terminal, deadline);
+        }
+        self.hooks.stage_entered(V5Stage::Admission);
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::AdmissionEntered, epoch_ms);
+        self.hooks.pause(V5PausePoint::AdmissionEntered, deadline)?;
+        if self.hooks.observing() {
+            let current = self
+                .receipt_ledger
+                .recover(reservation.key().clone(), deadline)?;
+            if self.attempt_is_dead() || !reservation_is_still_unbound(&current) {
+                return self.reply_for_existing_state(current, deadline);
+            }
+        }
+        if let Some(rejection) = self.hooks.admission_rejection() {
+            let fail_stop = matches!(rejection, V5AdmissionRejection::RegistryFailed);
+            let outcome = match rejection {
+                V5AdmissionRejection::Invalid => ReceiptTerminalOutcome::Completed {
+                    result: Box::new(
+                        crate::domain::invocation::DomainResult::canonical_rejection(
+                            None,
+                            RefusalCode::BadValue,
+                            "scenario workspace admission rejected invocation",
+                        ),
+                    ),
+                },
+                V5AdmissionRejection::Capacity => ReceiptTerminalOutcome::Failed {
+                    reason: V5SafeFailureReason::WorkspaceCapacity,
+                },
+                V5AdmissionRejection::RegistryFailed => ReceiptTerminalOutcome::Failed {
+                    reason: V5SafeFailureReason::WorkspaceRegistryFailed,
+                },
+            };
+            return self.admission_failure_reply(
+                reservation,
+                outcome,
+                fail_stop,
+                epoch_ms,
+                deadline,
+            );
+        }
+        // The actor bind may run into the grace of a promised Task: the
+        // handler promises at the handoff moment, and after it the watchdog,
+        // not the admission checkpoint, bounds the bind.
+        let actor_bound = match self.invocation_executor.bind(
+            invocation,
+            response_deadline.with_actor_admission_grace(FAIL_STOP_GRACE),
+        ) {
+            Ok(actor_bound) => actor_bound,
+            Err(error) => {
+                let fail_stop = matches!(error, V5CanonicalPrepareError::WorkspaceRegistryFailed);
+                let outcome = match error {
+                    V5CanonicalPrepareError::Direct(result)
+                    | V5CanonicalPrepareError::Rejected(result) => {
+                        ReceiptTerminalOutcome::Completed { result }
+                    }
+                    V5CanonicalPrepareError::WorkspaceCapacity => ReceiptTerminalOutcome::Failed {
+                        reason: V5SafeFailureReason::WorkspaceCapacity,
+                    },
+                    V5CanonicalPrepareError::WorkspaceRegistryFailed => {
+                        ReceiptTerminalOutcome::Failed {
+                            reason: V5SafeFailureReason::WorkspaceRegistryFailed,
+                        }
+                    }
+                };
+                return self.admission_failure_reply(
+                    reservation,
+                    outcome,
+                    fail_stop,
+                    epoch_ms,
                     deadline,
-                )?;
-                if let Some(bound_task) = control.bound_task() {
-                    if control.prepare_rejects() {
-                        let terminal = crate::application::receipt_ledger::canonical_v5_terminal(
-                            &crate::application::receipt_ledger::ReceiptTerminalOutcome::Completed {
-                                result: Box::new(
-                                    crate::domain::invocation::DomainResult::canonical_rejection(
-                                        None,
-                                        RefusalCode::BadValue,
-                                        "scenario prepare rejected invocation",
-                                    ),
-                                ),
-                            },
-                        )
-                        .map_err(|_| ReceiptLedgerError::Corrupt("canonical v5 terminal failed"))?;
-                        return self.publish_bound_terminal_reply(
-                            &bound_task.bound,
-                            bound_task.record,
-                            &terminal,
+                );
+            }
+        };
+        let current = self
+            .receipt_ledger
+            .recover(reservation.key().clone(), deadline)?;
+        if let ReceiptState::TaskPromisedUnbound(promised) = current {
+            // The handler promised this Task at the cutoff; the submit's own
+            // budget is spent, the continuation runs under its own bound.
+            let deadline = if slot.promoted_by_owner() {
+                Self::continuation_deadline()
+            } else {
+                deadline
+            };
+            return self.continue_promised(actor_bound, promised, &reservation, epoch_ms, deadline);
+        }
+        self.hooks
+            .actor_workspace_identity(actor_bound.workspace_identity_hash());
+        let bound = match self.receipt_ledger.bind_reserved_actor(
+            reservation.key().clone(),
+            reservation.record_version(),
+            actor_bound.workspace_identity_hash().clone(),
+            deadline,
+        ) {
+            Ok(bound) => bound,
+            Err(error) if slot.promoted_by_owner() => {
+                // The handler promised the Task while the actor was binding:
+                // the durable state moved under us, continue into the promise.
+                let deadline = Self::continuation_deadline();
+                match self
+                    .receipt_ledger
+                    .recover(reservation.key().clone(), deadline)?
+                {
+                    ReceiptState::TaskPromisedUnbound(promised) => {
+                        return self.continue_promised(
+                            actor_bound,
+                            promised,
+                            &reservation,
                             epoch_ms,
                             deadline,
                         );
                     }
-                }
-                let current = self.receipt_ledger.recover(begun.key().clone(), deadline)?;
-                if control.process_exited() {
-                    return self.reply_for_existing_state(current, deadline);
-                }
-                if let ReceiptState::TaskHandoffActorBound(handoff) = current {
-                    if control.prepare_rejects() {
-                        let terminal = crate::application::receipt_ledger::canonical_v5_terminal(
-                            &crate::application::receipt_ledger::ReceiptTerminalOutcome::Completed {
-                                result: Box::new(
-                                    crate::domain::invocation::DomainResult::canonical_rejection(
-                                        None,
-                                        RefusalCode::BadValue,
-                                        "scenario prepare rejected invocation",
-                                    ),
-                                ),
-                            },
-                        )
-                        .map_err(|_| ReceiptLedgerError::Corrupt("canonical v5 terminal failed"))?;
-                        return self.publish_staged_handoff_terminal_reply(
-                            handoff, terminal, epoch_ms, deadline,
-                        );
-                    }
-                    let (task_record, task_bound) = self
-                        .task_projection
-                        .materialize_bound_handoff(&handoff, epoch_ms, deadline, &self.telemetry)
-                        .map_err(|failure| self.project_task_failure(failure))?;
-                    self.receipt_ledger.complete_bound_task_handoff(
-                        handoff.key().clone(),
-                        handoff.record_version(),
-                        task_bound.clone(),
-                        deadline,
-                    )?;
-                    let (task_record, task_bound) = self
-                        .task_projection
-                        .start_bound_task(&task_bound, task_record, deadline)
-                        .map_err(|failure| self.project_task_failure(failure))?;
-                    control.record_bound_task(task_record.clone(), task_bound);
-                    self.telemetry
-                        .record_event(V5ReceiptRuntimeEventKind::TaskBoundCommitted, epoch_ms);
-                    return Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
-                        outcome: V5InvocationResponse::Task {
-                            snapshot: task_store_snapshot(&task_record),
-                        },
-                    }));
-                }
-                if !matches!(
-                    &current,
-                    ReceiptState::Reserved(receipt)
-                        if matches!(receipt.phase(), ReservedPhase::Begun { .. })
-                ) {
-                    return self.reply_for_existing_state(current, deadline);
-                }
-                if control.prepare_rejects() {
-                    let terminal = crate::application::receipt_ledger::canonical_v5_terminal(
-                        &crate::application::receipt_ledger::ReceiptTerminalOutcome::Completed {
-                            result: Box::new(
-                                crate::domain::invocation::DomainResult::canonical_rejection(
-                                    None,
-                                    RefusalCode::BadValue,
-                                    "scenario prepare rejected invocation",
-                                ),
-                            ),
-                        },
-                    )
-                    .map_err(|_| ReceiptLedgerError::Corrupt("canonical v5 terminal failed"))?;
-                    return self.publish_direct_terminal(begun, epoch_ms, terminal, deadline);
+                    _ => return Err(error),
                 }
             }
+            Err(error) => return Err(error),
+        };
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::ActorBoundCommitted, epoch_ms);
+        self.hooks.pause(V5PausePoint::ActorBound, deadline)?;
+        self.hooks
+            .pause(V5PausePoint::BeforeReceiptBegun, deadline)?;
+        if self.hooks.observing() {
+            let current = self.receipt_ledger.recover(bound.key().clone(), deadline)?;
+            if self.attempt_is_dead() {
+                return self.reply_for_existing_state(current, deadline);
+            }
+            if let ReceiptState::TaskHandoffActorBound(handoff) = current {
+                let deadline = if slot.promoted_by_owner() {
+                    Self::continuation_deadline()
+                } else {
+                    deadline
+                };
+                return self.continue_handoff(
+                    actor_bound,
+                    handoff,
+                    reservation.key().invocation_id(),
+                    epoch_ms,
+                    deadline,
+                );
+            }
+        }
+        let begun = match self.receipt_ledger.mark_reserved_begun(
+            bound.key().clone(),
+            bound.record_version(),
+            deadline,
+        ) {
+            Ok(begun) => begun,
+            Err(error) if slot.promoted_by_owner() => {
+                // The handler committed the handoff intent at the cutoff while
+                // this attempt was between actor bind and begun: materialize
+                // its Task and continue into it.
+                let deadline = Self::continuation_deadline();
+                match self.receipt_ledger.recover(bound.key().clone(), deadline)? {
+                    ReceiptState::TaskHandoffActorBound(handoff) => {
+                        return self.continue_handoff(
+                            actor_bound,
+                            handoff,
+                            reservation.key().invocation_id(),
+                            epoch_ms,
+                            deadline,
+                        );
+                    }
+                    _ => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::ReceiptBegunCommitted, epoch_ms);
+        self.hooks.pause(V5PausePoint::BeforePrepare, deadline)?;
+        if self.hooks.observing() {
+            let current = self.receipt_ledger.recover(begun.key().clone(), deadline)?;
+            if self.attempt_is_dead() {
+                return self.reply_for_existing_state(current, deadline);
+            }
+            if let ReceiptState::TaskHandoffActorBound(handoff) = current {
+                // The handler promoted this begun attempt at the cutoff; the
+                // submit budget is spent, the continuation runs under its own.
+                return self.continue_promoted_begun_handoff(
+                    handoff,
+                    epoch_ms,
+                    Self::continuation_deadline(),
+                );
+            }
+            if !reservation_is_begun(&current) {
+                return self.reply_for_existing_state(current, deadline);
+            }
+        }
+        self.hooks.stage_entered(V5Stage::Prepare);
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::PrepareEntered, epoch_ms);
+        self.hooks.pause(V5PausePoint::PrepareEntered, deadline)?;
+        // The session handler may have materialized this Task at the begun
+        // cutoff while the attempt was between `Begun` and the drive. Nobody
+        // else executes it, so this attempt does — with or without an observer.
+        if let Some((task_record, bound)) = slot.take_owner_materialized() {
+            let deadline = Self::continuation_deadline();
+            let (cancellation, cancellation_guard) = self
+                .active_task_cancellations
+                .register(task_record.task_id)?;
+            return self.drive_prepared_bound_task(
+                actor_bound,
+                task_record,
+                bound,
+                reservation.key().invocation_id(),
+                cancellation,
+                cancellation_guard,
+                epoch_ms,
+                deadline,
+            );
+        }
+        if self.hooks.observing() {
+            let current = self.receipt_ledger.recover(begun.key().clone(), deadline)?;
+            if self.attempt_is_dead() {
+                return self.reply_for_existing_state(current, deadline);
+            }
+            if let ReceiptState::TaskHandoffActorBound(handoff) = current {
+                // The handler promoted this begun attempt at the cutoff; the
+                // submit budget is spent, the continuation runs under its own.
+                return self.continue_promoted_begun_handoff(
+                    handoff,
+                    epoch_ms,
+                    Self::continuation_deadline(),
+                );
+            }
+            if !reservation_is_begun(&current) {
+                return self.reply_for_existing_state(current, deadline);
+            }
+            if self.hooks.prepare_rejects() {
+                let terminal = injected_rejection_terminal("scenario prepare rejected invocation")?;
+                return self.publish_direct_terminal(begun, epoch_ms, terminal, deadline);
+            }
+        }
+        if !slot.claim_cutoff() {
+            // The handler promoted this begun attempt at the cutoff before the
+            // drive claimed it: continue the handoff the handler committed.
+            let deadline = Self::continuation_deadline();
+            return match self.receipt_ledger.recover(begun.key().clone(), deadline)? {
+                ReceiptState::TaskHandoffActorBound(handoff) => {
+                    self.continue_promoted_begun_handoff(handoff, epoch_ms, deadline)
+                }
+                other => self.reply_for_existing_state(other, deadline),
+            };
         }
         let (prepared, direct_outcome) = match self.drive_inline_invocation(actor_bound, &begun)? {
             InlineDrive::Rejected(result) => {
@@ -5314,42 +3153,24 @@ impl V5ReceiptRuntime {
                 V5_TASK_POLL_INTERVAL_MS,
                 deadline,
             )?;
-            #[cfg(feature = "receipt-ledger-test-support")]
-            self.telemetry
-                .record_event(V5ReceiptRuntimeEventKind::BoundHandoffCommitted, epoch_ms);
+            self.hooks
+                .event(V5ReceiptRuntimeEventKind::BoundHandoffCommitted, epoch_ms);
             let link_reservation = self
                 .task_projection
-                .reserve_bound_handoff_link(
-                    &handoff,
-                    epoch_ms,
-                    deadline,
-                    #[cfg(feature = "receipt-ledger-test-support")]
-                    &self.telemetry,
-                )
+                .reserve_bound_handoff_link(&handoff, epoch_ms, deadline, self.hooks.as_ref())
                 .map_err(|failure| self.project_task_failure(failure))?;
-            #[cfg(feature = "receipt-ledger-test-support")]
-            if let Some(control) = &self.scenario_control {
-                control.pause(
-                    receipt_scenario_v5::ScenarioBarrierPoint::BeforeTaskStoreCreate,
-                    Instant::now() + receipt_scenario_v5::SCENARIO_BULK_OPERATION_TIMEOUT,
-                )?;
-            }
-            #[cfg(feature = "receipt-ledger-test-support")]
-            let deadline = if self.scenario_control.as_ref().is_some_and(|control| {
-                control.is_barrier_installed(
-                    receipt_scenario_v5::ScenarioBarrierPoint::BeforeTaskStoreCreate,
-                )
-            }) {
-                Instant::now() + receipt_scenario_v5::SCENARIO_BULK_OPERATION_TIMEOUT
-            } else {
-                deadline
-            };
-            #[cfg(feature = "receipt-ledger-test-support")]
-            let handoff = self
-                .scenario_control
-                .as_ref()
-                .and_then(|control| control.staged_handoff())
-                .unwrap_or(handoff);
+            self.hooks.pause(
+                V5PausePoint::BeforeTaskStoreCreate,
+                self.hooks
+                    .commit_deadline_at(V5PausePoint::BeforeTaskStoreCreate, deadline),
+            )?;
+            let deadline = self
+                .hooks
+                .commit_deadline_at(V5PausePoint::BeforeTaskStoreCreate, deadline);
+            // Another owner may have staged a terminal onto this receipt while
+            // the pause held: re-read it so the Task is materialized from the
+            // committed state, not from a version that went stale in the pause.
+            let handoff = self.reread_handoff_after_pause(handoff, deadline)?;
             let (task_record, bound) = self
                 .task_projection
                 .materialize_staged_bound_handoff(
@@ -5357,64 +3178,47 @@ impl V5ReceiptRuntime {
                     &link_reservation,
                     epoch_ms,
                     deadline,
-                    #[cfg(feature = "receipt-ledger-test-support")]
-                    &self.telemetry,
+                    self.hooks.as_ref(),
                 )
                 .map_err(|failure| self.project_task_failure(failure))?;
             if let HandoffTerminalStage::Staged { terminal, .. } = handoff.terminal_stage() {
-                #[cfg(feature = "receipt-ledger-test-support")]
-                let provisional_record = task_record.clone();
                 let (terminal_record, terminal_link) = self
                     .task_projection
                     .publish_bound_task_terminal(
                         &bound,
-                        task_record,
+                        &task_record,
                         terminal,
                         epoch_ms,
                         deadline,
-                        #[cfg(feature = "receipt-ledger-test-support")]
-                        &self.telemetry,
-                        #[cfg(feature = "receipt-ledger-test-support")]
-                        self.scenario_control.as_ref(),
+                        self.hooks.as_ref(),
                     )
                     .map_err(|failure| self.project_task_failure(failure))?;
-                #[cfg(feature = "receipt-ledger-test-support")]
-                {
-                    self.telemetry.record_event(
-                        V5ReceiptRuntimeEventKind::TaskStoreTerminalCommitted,
-                        epoch_ms,
-                    );
-                    self.telemetry.record_event(
-                        V5ReceiptRuntimeEventKind::TaskStoreTerminalReadback,
-                        epoch_ms,
-                    );
-                }
-                let _terminal_link = self.receipt_ledger.complete_staged_task_handoff(
+                self.hooks.event(
+                    V5ReceiptRuntimeEventKind::TaskStoreTerminalCommitted,
+                    epoch_ms,
+                );
+                self.hooks.event(
+                    V5ReceiptRuntimeEventKind::TaskStoreTerminalReadback,
+                    epoch_ms,
+                );
+                let terminal_link = self.receipt_ledger.complete_staged_task_handoff(
                     handoff.key().clone(),
                     handoff.record_version(),
                     terminal_link,
                     deadline,
                 )?;
-                #[cfg(feature = "receipt-ledger-test-support")]
-                {
-                    if let Some(control) = &self.scenario_control {
-                        control
-                            .record_staged_terminal_publication(
-                                &handoff,
-                                &provisional_record,
-                                &terminal_record,
-                                &_terminal_link,
-                            )
-                            .map_err(|_| {
-                                ReceiptLedgerError::Corrupt("record staged terminal publication")
-                            })?;
-                        control.record_terminal_bound_task(terminal_record.clone(), _terminal_link);
-                    }
-                    self.telemetry.record_event(
-                        V5ReceiptRuntimeEventKind::TaskTerminalBoundCommitted,
-                        epoch_ms,
-                    );
-                }
+                self.hooks.staged_terminal_publication(
+                    &handoff,
+                    &task_record,
+                    &terminal_record,
+                    &terminal_link,
+                )?;
+                self.hooks
+                    .terminal_bound_task(&terminal_record, &terminal_link);
+                self.hooks.event(
+                    V5ReceiptRuntimeEventKind::TaskTerminalBoundCommitted,
+                    epoch_ms,
+                );
                 return Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
                     outcome: V5InvocationResponse::Task {
                         snapshot: task_store_snapshot(&terminal_record),
@@ -5434,56 +3238,48 @@ impl V5ReceiptRuntime {
                 .task_projection
                 .start_bound_task(&bound, task_record, deadline)
                 .map_err(|failure| self.project_task_failure(failure))?;
-            #[cfg(feature = "receipt-ledger-test-support")]
-            if let Some(control) = &self.scenario_control {
-                control.record_bound_task(task_record.clone(), bound.clone());
-            }
-            #[cfg(feature = "receipt-ledger-test-support")]
-            self.telemetry
-                .record_event(V5ReceiptRuntimeEventKind::TaskBoundCommitted, epoch_ms);
-            #[cfg(feature = "receipt-ledger-test-support")]
-            if let Some(control) = &self.scenario_control {
-                if control.is_barrier_installed(
-                    receipt_scenario_v5::ScenarioBarrierPoint::BeforeTaskTerminalReceipt,
-                ) || control.is_barrier_installed(
-                    receipt_scenario_v5::ScenarioBarrierPoint::AfterTaskStoreTerminalBeforeLifecycleLinkTerminal,
-                ) {
-                    control.pause(
-                        receipt_scenario_v5::ScenarioBarrierPoint::BeforeTaskTerminalReceipt,
-                        deadline,
-                    )?;
-                    self.telemetry.record_execute();
-                    self.telemetry
-                        .record_event(V5ReceiptRuntimeEventKind::ExecuteEntered, epoch_ms);
-                    #[cfg(feature = "receipt-ledger-test-support")]
-                    if let Some(control) = &self.scenario_control {
-                        control.record_callback_invocation_id(reservation.key().invocation_id());
+            self.hooks.bound_task(&task_record, &bound);
+            self.hooks
+                .event(V5ReceiptRuntimeEventKind::TaskBoundCommitted, epoch_ms);
+            if self.hooks.holds(V5PausePoint::BeforeTaskTerminalReceipt)
+                || self
+                    .hooks
+                    .holds(V5PausePoint::AfterTaskStoreTerminalBeforeLifecycleLinkTerminal)
+            {
+                // An observer holds the terminal receipt: the known-long attempt
+                // runs on this thread so the pause sees its exact outcome.
+                self.hooks
+                    .pause(V5PausePoint::BeforeTaskTerminalReceipt, deadline)?;
+                self.hooks.stage_entered(V5Stage::Execute);
+                self.hooks
+                    .event(V5ReceiptRuntimeEventKind::ExecuteEntered, epoch_ms);
+                self.hooks
+                    .callback_invocation_id(reservation.key().invocation_id());
+                let result = prepared.execute(cancellation.clone());
+                let protected_started = cancellation.protected_process_started();
+                let outcome = if cancellation.is_cancelled() && !protected_started {
+                    ReceiptTerminalOutcome::Cancelled
+                } else {
+                    match result {
+                        Ok(result) => ReceiptTerminalOutcome::Completed {
+                            result: Box::new(result),
+                        },
+                        Err(_) => ReceiptTerminalOutcome::Failed {
+                            reason: V5SafeFailureReason::InvocationFailed,
+                        },
                     }
-                    let result = prepared.execute(cancellation.clone());
-                    let outcome = if cancellation.is_cancelled() {
-                        ReceiptTerminalOutcome::Cancelled
-                    } else {
-                        match result {
-                            Ok(result) => ReceiptTerminalOutcome::Completed {
-                                result: Box::new(result),
-                            },
-                            Err(_) => ReceiptTerminalOutcome::Failed {
-                                reason: V5SafeFailureReason::InvocationFailed,
-                            },
-                        }
-                    };
-                    self.telemetry
-                        .record_event(V5ReceiptRuntimeEventKind::ResultSerialized, epoch_ms);
-                    let snapshot = self.publish_task_execution_outcome(
-                        &bound,
-                        task_record.task_id,
-                        outcome,
-                        deadline,
-                    )?;
-                    return Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
-                        outcome: V5InvocationResponse::Task { snapshot },
-                    }));
-                }
+                };
+                self.hooks
+                    .event(V5ReceiptRuntimeEventKind::ResultSerialized, epoch_ms);
+                let snapshot = self.publish_task_execution_outcome(
+                    &bound,
+                    task_record.task_id,
+                    outcome,
+                    deadline,
+                )?;
+                return Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
+                    outcome: V5InvocationResponse::Task { snapshot },
+                }));
             }
             if task_record.task == V5StoredTask::Working {
                 self.spawn_task_execution(
@@ -5504,19 +3300,14 @@ impl V5ReceiptRuntime {
         }
         let outcome = direct_outcome
             .expect("an inline drive without a handoff or a known-long class yields the outcome");
-        #[cfg(feature = "receipt-ledger-test-support")]
-        if self
-            .scenario_control
-            .as_ref()
-            .is_some_and(|control| control.take_crash_after_side_effect())
-        {
+        if self.hooks.crash_after_side_effect() {
             return Err(ReceiptLedgerError::StoreUnavailable);
         }
         // An outcome that arrived on the last tick of the budget is still
         // published: the ledger command gets the serialization margin, not
         // an already spent operation deadline.
         let deadline = deadline.max(Instant::now() + RESPONSE_SERIALIZATION_MARGIN);
-        let (terminal, _oversized_result) = match canonical_v5_terminal(&outcome) {
+        let (terminal, oversized_result) = match canonical_v5_terminal(&outcome) {
             Ok(terminal) => (terminal, false),
             Err(CanonicalTerminalError::ResultTooLarge) => (
                 canonical_v5_terminal(&ReceiptTerminalOutcome::Failed {
@@ -5533,37 +3324,19 @@ impl V5ReceiptRuntime {
                 ))
             }
         };
-        #[cfg(feature = "receipt-ledger-test-support")]
-        self.telemetry
-            .record_event(V5ReceiptRuntimeEventKind::ResultSerialized, epoch_ms);
-        #[cfg(feature = "receipt-ledger-test-support")]
-        {
-            let candidate_result_override = if _oversized_result {
-                match &outcome {
-                    ReceiptTerminalOutcome::Completed { result } => Some(artifact_from_bytes(
-                        &serde_json::to_vec(result).map_err(|_| {
-                            ReceiptLedgerError::Corrupt(
-                                "serialize oversized candidate result evidence",
-                            )
-                        })?,
-                    )),
-                    ReceiptTerminalOutcome::Failed { .. } | ReceiptTerminalOutcome::Cancelled => {
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            self.publish_direct_terminal_with_candidate(
-                begun,
-                epoch_ms,
-                terminal,
-                deadline,
-                candidate_result_override,
-            )
-        }
-        #[cfg(not(feature = "receipt-ledger-test-support"))]
-        self.publish_direct_terminal(begun, epoch_ms, terminal, deadline)
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::ResultSerialized, epoch_ms);
+        let oversized_candidate = match (&outcome, oversized_result) {
+            (ReceiptTerminalOutcome::Completed { result }, true) => Some(result.as_ref()),
+            _ => None,
+        };
+        self.publish_direct_terminal_with_candidate(
+            begun,
+            epoch_ms,
+            terminal,
+            deadline,
+            oversized_candidate,
+        )
     }
 
     /// Runs prepare and the inline execution of a begun receipt on a worker
@@ -5578,7 +3351,11 @@ impl V5ReceiptRuntime {
     ) -> Result<InlineDrive, ReceiptLedgerError> {
         let response_deadline = actor_bound.response_deadline();
         let slot = Arc::new(InlineExecutionSlot::new());
-        let cancellation = CancellationToken::new();
+        // The running attempt is cancellable by its reserved Task identity
+        // from `Begun` on; the cutoff hands the same registration to the Task.
+        let (cancellation, guard) = self
+            .active_task_cancellations
+            .register(begun.key().reserved_task_id())?;
         let invocation_id = begun.key().invocation_id();
         let worker = {
             let runtime = Arc::clone(self);
@@ -5594,13 +3371,7 @@ impl V5ReceiptRuntime {
                     ReceiptLedgerError::StoreUnavailable
                 })?
         };
-        // Under the scenario harness the harness itself plays the deadline
-        // owner; the production runtime owns the cutoff otherwise.
-        #[cfg(feature = "receipt-ledger-test-support")]
-        let owns_cutoff = self.scenario_control.is_none();
-        #[cfg(not(feature = "receipt-ledger-test-support"))]
-        let owns_cutoff = true;
-        let cutoff = response_deadline.filter(|_| owns_cutoff);
+        let cutoff = response_deadline;
 
         let mut state = slot.lock();
         loop {
@@ -5643,10 +3414,20 @@ impl V5ReceiptRuntime {
         // projection; the worker keeps the only attempt.
         state.decision = InlineHandoffDecision::HandoffInProgress;
         drop(state);
-        let committed = self.commit_cutoff_handoff(begun, cancellation.clone());
+        let committed = self.commit_cutoff_handoff(begun, &slot);
         let mut state = slot.lock();
         match committed {
-            Ok((bound, task_record, guard)) => {
+            Ok(CutoffCommit::Terminal(reply)) => {
+                // The outcome arrived while the handoff committed and was
+                // staged durably: the reply is the Task's terminal.
+                state.decision = InlineHandoffDecision::HandlerOwns;
+                slot.changed.notify_all();
+                drop(state);
+                let _ = worker.join();
+                drop(guard);
+                Ok(InlineDrive::HandedOff(Box::new(reply)))
+            }
+            Ok(CutoffCommit::Bound(bound, task_record)) => {
                 let task_id = task_record.task_id;
                 if let Some(report) = state.report.take() {
                     // The worker finished while the handoff was committing:
@@ -5731,8 +3512,6 @@ impl V5ReceiptRuntime {
         cancellation: CancellationToken,
         invocation_id: crate::domain::invocation::InvocationId,
     ) {
-        #[cfg(not(feature = "receipt-ledger-test-support"))]
-        let _ = invocation_id;
         let prepared = match actor_bound.prepare() {
             Ok(prepared) => prepared,
             Err(result) => {
@@ -5782,19 +3561,13 @@ impl V5ReceiptRuntime {
         cancellation: &CancellationToken,
         invocation_id: crate::domain::invocation::InvocationId,
     ) -> ReceiptTerminalOutcome {
-        #[cfg(not(feature = "receipt-ledger-test-support"))]
-        let _ = invocation_id;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        {
-            self.telemetry.record_execute();
-            self.telemetry
-                .record_event(V5ReceiptRuntimeEventKind::ExecuteEntered, self.epoch_ms());
-            if let Some(control) = &self.scenario_control {
-                control.record_callback_invocation_id(invocation_id);
-            }
-        }
+        self.hooks.stage_entered(V5Stage::Execute);
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::ExecuteEntered, self.epoch_ms());
+        self.hooks.callback_invocation_id(invocation_id);
         let result = prepared.execute(cancellation.clone());
-        if cancellation.is_cancelled() {
+        let protected_started = cancellation.protected_process_started();
+        if cancellation.is_cancelled() && !protected_started {
             ReceiptTerminalOutcome::Cancelled
         } else {
             match result {
@@ -5863,15 +3636,8 @@ impl V5ReceiptRuntime {
     fn commit_cutoff_handoff(
         &self,
         begun: &crate::application::receipt_ledger::ReservedReceipt,
-        cancellation: CancellationToken,
-    ) -> Result<
-        (
-            TaskBoundReceipt,
-            V5StoredInvocationRecord,
-            V5ActiveTaskCancellationGuard,
-        ),
-        ReceiptLedgerError,
-    > {
+        slot: &InlineExecutionSlot,
+    ) -> Result<CutoffCommit, ReceiptLedgerError> {
         let epoch_ms = self.epoch_ms();
         let deadline = Instant::now() + CUTOFF_HANDOFF_COMMIT_BUDGET;
         let handoff = self.receipt_ledger.begin_bound_task_handoff(
@@ -5882,19 +3648,55 @@ impl V5ReceiptRuntime {
             V5_TASK_POLL_INTERVAL_MS,
             deadline,
         )?;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        self.telemetry
-            .record_event(V5ReceiptRuntimeEventKind::BoundHandoffCommitted, epoch_ms);
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::BoundHandoffCommitted, epoch_ms);
+        // An outcome that is already in the slot goes into the handoff
+        // durably before any TaskStore row exists: a crash between the two
+        // loses nothing, the successor publishes the staged terminal.
+        let staged_outcome = {
+            let mut state = slot.lock();
+            match state.report.take() {
+                Some(InlineWorkerReport::Outcome(outcome)) => Some(outcome),
+                Some(other) => {
+                    state.report = Some(other);
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(outcome) = staged_outcome {
+            let terminal = match canonical_v5_terminal(&outcome) {
+                Ok(terminal) => terminal,
+                Err(CanonicalTerminalError::ResultTooLarge) => {
+                    canonical_v5_terminal(&ReceiptTerminalOutcome::Failed {
+                        reason: V5SafeFailureReason::ResultTooLarge,
+                    })
+                    .map_err(|_| {
+                        ReceiptLedgerError::Corrupt("canonical result-too-large terminal failed")
+                    })?
+                }
+                Err(CanonicalTerminalError::Serialization) => {
+                    return Err(ReceiptLedgerError::Corrupt(
+                        "canonical v5 terminal serialization failed",
+                    ))
+                }
+            };
+            let reply =
+                self.publish_staged_handoff_terminal_reply(handoff, terminal, epoch_ms, deadline)?;
+            return Ok(CutoffCommit::Terminal(reply));
+        }
         let link_reservation = self
             .task_projection
-            .reserve_bound_handoff_link(
-                &handoff,
-                epoch_ms,
-                deadline,
-                #[cfg(feature = "receipt-ledger-test-support")]
-                &self.telemetry,
-            )
+            .reserve_bound_handoff_link(&handoff, epoch_ms, deadline, self.hooks.as_ref())
             .map_err(|failure| self.project_task_failure(failure))?;
+        self.hooks.pause(
+            V5PausePoint::BeforeTaskStoreCreate,
+            self.hooks
+                .commit_deadline_at(V5PausePoint::BeforeTaskStoreCreate, deadline),
+        )?;
+        let deadline = self
+            .hooks
+            .commit_deadline_at(V5PausePoint::BeforeTaskStoreCreate, deadline);
         let (task_record, bound) = self
             .task_projection
             .materialize_staged_bound_handoff(
@@ -5902,8 +3704,7 @@ impl V5ReceiptRuntime {
                 &link_reservation,
                 epoch_ms,
                 deadline,
-                #[cfg(feature = "receipt-ledger-test-support")]
-                &self.telemetry,
+                self.hooks.as_ref(),
             )
             .map_err(|failure| self.project_task_failure(failure))?;
         self.receipt_ledger.complete_bound_task_handoff(
@@ -5912,22 +3713,451 @@ impl V5ReceiptRuntime {
             bound.clone(),
             deadline,
         )?;
-        let guard = self
-            .active_task_cancellations
-            .register_existing(task_record.task_id, cancellation)?;
         let (task_record, bound) = self
             .task_projection
             .start_bound_task(&bound, task_record, deadline)
             .map_err(|failure| self.project_task_failure(failure))?;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        {
-            if let Some(control) = &self.scenario_control {
-                control.record_bound_task(task_record.clone(), bound.clone());
-            }
-            self.telemetry
-                .record_event(V5ReceiptRuntimeEventKind::TaskBoundCommitted, epoch_ms);
+        self.hooks.bound_task(&task_record, &bound);
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::TaskBoundCommitted, epoch_ms);
+        Ok(CutoffCommit::Bound(bound, task_record))
+    }
+
+    /// The attempt after the handler promised its Task at the cutoff: bind
+    /// the actor to the promise, materialize the Task and continue the single
+    /// attempt into it. The handler already answered; the reply returned here
+    /// is the Task's final projection and nobody reads it.
+    fn continue_promised(
+        self: &Arc<Self>,
+        actor_bound: super::server::V5ActorBoundCanonicalInvocation,
+        promised: TaskPromisedUnboundReceipt,
+        reservation: &crate::application::receipt_ledger::ReservedReceipt,
+        epoch_ms: u64,
+        deadline: Instant,
+    ) -> Result<V5RuntimeReply, ReceiptLedgerError> {
+        self.hooks
+            .actor_workspace_identity(actor_bound.workspace_identity_hash());
+        let actor_promised = self.receipt_ledger.bind_promised_task_actor(
+            promised.key().clone(),
+            promised.record_version(),
+            actor_bound.workspace_identity_hash().clone(),
+            deadline,
+        )?;
+        self.fail_stop_watchdogs.disarm(actor_promised.key_digest());
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::ActorBoundCommitted, epoch_ms);
+        self.hooks.pause(V5PausePoint::ActorBound, deadline)?;
+        let handoff = self.receipt_ledger.begin_bound_task_handoff(
+            actor_promised.key().clone(),
+            actor_promised.record_version(),
+            actor_promised.task().created_at_epoch_ms(),
+            actor_promised.task().ttl_ms(),
+            actor_promised.task().poll_interval_ms(),
+            deadline,
+        )?;
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::BoundHandoffCommitted, epoch_ms);
+        let link_reservation = self
+            .task_projection
+            .reserve_bound_handoff_link(&handoff, epoch_ms, deadline, self.hooks.as_ref())
+            .map_err(|failure| self.project_task_failure(failure))?;
+        self.hooks.pause(
+            V5PausePoint::BeforeTaskStoreCreate,
+            self.hooks
+                .commit_deadline_at(V5PausePoint::BeforeTaskStoreCreate, deadline),
+        )?;
+        let deadline = self
+            .hooks
+            .commit_deadline_at(V5PausePoint::BeforeTaskStoreCreate, deadline);
+        // Another owner may have staged a terminal onto this receipt while the
+        // pause held: re-read it so the Task is materialized from the committed
+        // state, not from a version that went stale in the pause.
+        let handoff = self.reread_handoff_after_pause(handoff, deadline)?;
+        let (task_record, bound) = self
+            .task_projection
+            .materialize_staged_bound_handoff(
+                &handoff,
+                &link_reservation,
+                epoch_ms,
+                deadline,
+                self.hooks.as_ref(),
+            )
+            .map_err(|failure| self.project_task_failure(failure))?;
+        self.hooks
+            .promised_actor_binding(&promised, &actor_promised, &bound);
+        if let HandoffTerminalStage::Staged { terminal, .. } = handoff.terminal_stage() {
+            let (terminal_record, terminal_link) = self
+                .task_projection
+                .publish_bound_task_terminal(
+                    &bound,
+                    &task_record,
+                    terminal,
+                    epoch_ms,
+                    deadline,
+                    self.hooks.as_ref(),
+                )
+                .map_err(|failure| self.project_task_failure(failure))?;
+            self.hooks.event(
+                V5ReceiptRuntimeEventKind::TaskStoreTerminalCommitted,
+                epoch_ms,
+            );
+            self.hooks.event(
+                V5ReceiptRuntimeEventKind::TaskStoreTerminalReadback,
+                epoch_ms,
+            );
+            let terminal_link = self.receipt_ledger.complete_staged_task_handoff(
+                handoff.key().clone(),
+                handoff.record_version(),
+                terminal_link,
+                deadline,
+            )?;
+            self.hooks.staged_terminal_publication(
+                &handoff,
+                &task_record,
+                &terminal_record,
+                &terminal_link,
+            )?;
+            self.hooks
+                .terminal_bound_task(&terminal_record, &terminal_link);
+            self.hooks.event(
+                V5ReceiptRuntimeEventKind::TaskTerminalBoundCommitted,
+                epoch_ms,
+            );
+            return Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
+                outcome: V5InvocationResponse::Task {
+                    snapshot: task_store_snapshot(&terminal_record),
+                },
+            }));
         }
-        Ok((bound, task_record, guard))
+        self.receipt_ledger.complete_bound_task_handoff(
+            handoff.key().clone(),
+            handoff.record_version(),
+            bound.clone(),
+            deadline,
+        )?;
+        self.continue_into_bound_task(
+            actor_bound,
+            task_record,
+            bound,
+            reservation.key().invocation_id(),
+            epoch_ms,
+            deadline,
+        )
+    }
+
+    /// The attempt after the handler committed the actor-bound handoff intent
+    /// at the cutoff: materialize the Task and continue the single attempt
+    /// into it.
+    fn continue_handoff(
+        self: &Arc<Self>,
+        actor_bound: super::server::V5ActorBoundCanonicalInvocation,
+        handoff: TaskHandoffActorBoundReceipt,
+        invocation_id: crate::domain::invocation::InvocationId,
+        epoch_ms: u64,
+        deadline: Instant,
+    ) -> Result<V5RuntimeReply, ReceiptLedgerError> {
+        let (task_record, task_bound) = self
+            .task_projection
+            .materialize_bound_handoff(&handoff, epoch_ms, deadline, self.hooks.as_ref())
+            .map_err(|failure| self.project_task_failure(failure))?;
+        self.receipt_ledger.complete_bound_task_handoff(
+            handoff.key().clone(),
+            handoff.record_version(),
+            task_bound.clone(),
+            deadline,
+        )?;
+        self.continue_into_bound_task(
+            actor_bound,
+            task_record,
+            task_bound,
+            invocation_id,
+            epoch_ms,
+            deadline,
+        )
+    }
+
+    /// One bound Task from `TaskBound` to its terminal, on the thread that
+    /// holds the actor: start, begin, prepare, then execute here or on a
+    /// known-long thread, and publish the outcome into the Task.
+    fn continue_into_bound_task(
+        self: &Arc<Self>,
+        actor_bound: super::server::V5ActorBoundCanonicalInvocation,
+        task_record: V5StoredInvocationRecord,
+        bound: TaskBoundReceipt,
+        invocation_id: crate::domain::invocation::InvocationId,
+        epoch_ms: u64,
+        deadline: Instant,
+    ) -> Result<V5RuntimeReply, ReceiptLedgerError> {
+        self.hooks.bound_task(&task_record, &bound);
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::TaskBoundCommitted, epoch_ms);
+        let authorized_bound =
+            if !task_record.cancel_requested && task_record.task == V5StoredTask::Queued {
+                self.task_projection
+                    .authorize_not_begun_bound_task_start(&bound, &task_record, deadline)
+                    .map_err(|failure| self.project_task_failure(failure))?
+            } else {
+                bound
+            };
+        self.hooks.bound_task(&task_record, &authorized_bound);
+        if !task_record.cancel_requested && task_record.task == V5StoredTask::Queued {
+            self.hooks.event(
+                V5ReceiptRuntimeEventKind::FalseCancelObservationReached,
+                epoch_ms,
+            );
+            self.hooks
+                .pause(V5PausePoint::AfterFalseCancelObservation, deadline)?;
+        }
+        let lifecycle_gate_acquired = if self.hooks.holds(V5PausePoint::AfterWorkingReadback) {
+            self.hooks.acquire_lifecycle_gate("submit", deadline)?;
+            true
+        } else {
+            false
+        };
+        let (task_record, bound) = self
+            .task_projection
+            .start_not_begun_bound_task(&authorized_bound, task_record, deadline)
+            .map_err(|failure| self.project_task_failure(failure))?;
+        let mut task_record = task_record;
+        if task_record.task == V5StoredTask::Working {
+            self.hooks.event(
+                V5ReceiptRuntimeEventKind::TaskStoreWorkingReadback,
+                epoch_ms,
+            );
+        }
+        self.hooks.bound_task(&task_record, &bound);
+        if task_record.task == V5StoredTask::Working && bound.phase() == AttemptPhase::NotBegun {
+            self.hooks
+                .pause(V5PausePoint::AfterWorkingReadback, deadline)?;
+            self.hooks
+                .pause(V5PausePoint::BeforeReceiptBegun, deadline)?;
+            if self.hooks.process_exited() {
+                let current = self.receipt_ledger.recover(bound.key().clone(), deadline)?;
+                return self.reply_for_existing_state(current, deadline);
+            }
+        }
+        let bound = if task_record.task == V5StoredTask::Working
+            && bound.phase() == AttemptPhase::NotBegun
+        {
+            let begun = self
+                .task_projection
+                .mark_not_begun_bound_task_begun(&bound, &task_record, deadline)
+                .map_err(|failure| self.project_task_failure(failure))?;
+            self.hooks
+                .event(V5ReceiptRuntimeEventKind::ReceiptBegunCommitted, epoch_ms);
+            self.hooks
+                .event(V5ReceiptRuntimeEventKind::TokenSignalled, epoch_ms);
+            self.hooks
+                .bound_task_start_authorization(&authorized_bound, &task_record, &begun);
+            self.hooks.bound_task(&task_record, &begun);
+            begun
+        } else {
+            bound
+        };
+        if lifecycle_gate_acquired {
+            self.hooks.release_lifecycle_gate("submit");
+            self.hooks.wait_for_gate_cancel(deadline)?;
+            if let Some(cancelled) = self
+                .task_projection
+                .cancel_exact_bound_task(bound.key(), deadline)
+                .map_err(|failure| self.project_task_failure(failure))?
+            {
+                task_record = cancelled;
+                self.hooks.bound_task(&task_record, &bound);
+            }
+        }
+        if task_record.cancel_requested {
+            let terminal = canonical_v5_terminal(&ReceiptTerminalOutcome::Cancelled)
+                .map_err(|_| ReceiptLedgerError::Corrupt("canonical v5 terminal failed"))?;
+            let (terminal_record, terminal_link) = self
+                .task_projection
+                .publish_bound_task_terminal(
+                    &bound,
+                    &task_record,
+                    &terminal,
+                    epoch_ms,
+                    deadline,
+                    self.hooks.as_ref(),
+                )
+                .map_err(|failure| self.project_task_failure(failure))?;
+            self.hooks.event(
+                V5ReceiptRuntimeEventKind::TaskStoreTerminalCommitted,
+                epoch_ms,
+            );
+            self.hooks.event(
+                V5ReceiptRuntimeEventKind::TaskStoreTerminalReadback,
+                epoch_ms,
+            );
+            self.hooks.event(
+                V5ReceiptRuntimeEventKind::TaskTerminalBoundCommitted,
+                epoch_ms,
+            );
+            self.hooks
+                .terminal_bound_task(&terminal_record, &terminal_link);
+            return Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
+                outcome: V5InvocationResponse::Task {
+                    snapshot: task_store_snapshot(&terminal_record),
+                },
+            }));
+        }
+        let (cancellation, cancellation_guard) = self
+            .active_task_cancellations
+            .register(task_record.task_id)?;
+        self.hooks.pause(V5PausePoint::BeforePrepare, deadline)?;
+        self.hooks.stage_entered(V5Stage::Prepare);
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::PrepareEntered, epoch_ms);
+        self.hooks.pause(V5PausePoint::PrepareEntered, deadline)?;
+        self.drive_prepared_bound_task(
+            actor_bound,
+            task_record,
+            bound,
+            invocation_id,
+            cancellation,
+            cancellation_guard,
+            epoch_ms,
+            deadline,
+        )
+    }
+
+    /// Prepare and execute a begun bound Task on the thread that holds the
+    /// actor. The `PrepareEntered` pause has already run; the caller registers
+    /// the cancellation token so a cancel during that pause is observed.
+    #[allow(clippy::too_many_arguments)]
+    fn drive_prepared_bound_task(
+        self: &Arc<Self>,
+        actor_bound: super::server::V5ActorBoundCanonicalInvocation,
+        task_record: V5StoredInvocationRecord,
+        bound: TaskBoundReceipt,
+        invocation_id: crate::domain::invocation::InvocationId,
+        cancellation: CancellationToken,
+        cancellation_guard: V5ActiveTaskCancellationGuard,
+        epoch_ms: u64,
+        deadline: Instant,
+    ) -> Result<V5RuntimeReply, ReceiptLedgerError> {
+        if self.hooks.prepare_rejects() {
+            let terminal = injected_rejection_terminal("scenario prepare rejected invocation")?;
+            return self.publish_bound_terminal_reply(
+                &bound,
+                &task_record,
+                &terminal,
+                epoch_ms,
+                deadline,
+            );
+        }
+        let prepared = match actor_bound.prepare() {
+            Ok(prepared) => prepared,
+            Err(result) => {
+                let terminal = canonical_v5_terminal(&ReceiptTerminalOutcome::Completed { result })
+                    .map_err(|_| ReceiptLedgerError::Corrupt("canonical v5 terminal failed"))?;
+                return self.publish_bound_terminal_reply(
+                    &bound,
+                    &task_record,
+                    &terminal,
+                    epoch_ms,
+                    deadline,
+                );
+            }
+        };
+        if self.hooks.holds(V5PausePoint::BeforeTaskTerminalReceipt)
+            || self
+                .hooks
+                .holds(V5PausePoint::AfterTaskStoreTerminalBeforeLifecycleLinkTerminal)
+        {
+            // An observer holds the terminal receipt: the promoted attempt
+            // runs on this thread so the pause sees its exact outcome.
+            self.hooks
+                .pause(V5PausePoint::BeforeTaskTerminalReceipt, deadline)?;
+            self.hooks.stage_entered(V5Stage::Execute);
+            self.hooks
+                .event(V5ReceiptRuntimeEventKind::ExecuteEntered, epoch_ms);
+            self.hooks.callback_invocation_id(invocation_id);
+            let result = prepared.execute(cancellation.clone());
+            let protected_started = cancellation.protected_process_started();
+            let outcome = if cancellation.is_cancelled() && !protected_started {
+                ReceiptTerminalOutcome::Cancelled
+            } else {
+                match result {
+                    Ok(result) => ReceiptTerminalOutcome::Completed {
+                        result: Box::new(result),
+                    },
+                    Err(_) => ReceiptTerminalOutcome::Failed {
+                        reason: V5SafeFailureReason::InvocationFailed,
+                    },
+                }
+            };
+            if self.hooks.crash_after_side_effect() {
+                return Err(ReceiptLedgerError::StoreUnavailable);
+            }
+            self.hooks
+                .event(V5ReceiptRuntimeEventKind::ResultSerialized, epoch_ms);
+            let snapshot = self.publish_task_execution_outcome(
+                &bound,
+                task_record.task_id,
+                outcome,
+                deadline,
+            )?;
+            drop(cancellation_guard);
+            return Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
+                outcome: V5InvocationResponse::Task { snapshot },
+            }));
+        }
+        // A known-long attempt runs on its own thread: the client already
+        // holds the Task reply, so the continuation need not wait for it.
+        if matches!(
+            prepared.execution_class(),
+            crate::application::operation_descriptors::ExecutionClass::KnownLong(_)
+        ) {
+            if task_record.task == V5StoredTask::Working {
+                self.spawn_task_execution(
+                    prepared,
+                    bound,
+                    task_record.clone(),
+                    cancellation,
+                    cancellation_guard,
+                )?;
+            } else {
+                drop(cancellation_guard);
+            }
+            return Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
+                outcome: V5InvocationResponse::Task {
+                    snapshot: task_store_snapshot(&task_record),
+                },
+            }));
+        }
+        // A direct attempt promoted to a Task runs to its terminal on this
+        // continuation thread; the client already holds the Task reply.
+        self.hooks.stage_entered(V5Stage::Execute);
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::ExecuteEntered, epoch_ms);
+        self.hooks.callback_invocation_id(invocation_id);
+        let result = prepared.execute(cancellation.clone());
+        let protected_started = cancellation.protected_process_started();
+        let outcome = if cancellation.is_cancelled() && !protected_started {
+            ReceiptTerminalOutcome::Cancelled
+        } else {
+            match result {
+                Ok(result) => ReceiptTerminalOutcome::Completed {
+                    result: Box::new(result),
+                },
+                Err(_) => ReceiptTerminalOutcome::Failed {
+                    reason: V5SafeFailureReason::InvocationFailed,
+                },
+            }
+        };
+        if self.hooks.crash_after_side_effect() {
+            return Err(ReceiptLedgerError::StoreUnavailable);
+        }
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::ResultSerialized, epoch_ms);
+        let snapshot =
+            self.publish_task_execution_outcome(&bound, task_record.task_id, outcome, deadline);
+        drop(cancellation_guard);
+        snapshot.map(|snapshot| {
+            V5RuntimeReply::Json(V5ServerResponse::Invocation {
+                outcome: V5InvocationResponse::Task { snapshot },
+            })
+        })
     }
 
     fn spawn_task_execution(
@@ -5942,16 +4172,14 @@ impl V5ReceiptRuntime {
         let execution = thread::Builder::new()
             .name("unica-v5-task-execution".to_owned())
             .spawn(move || {
-                #[cfg(feature = "receipt-ledger-test-support")]
-                {
-                    runtime.telemetry.record_execute();
-                    runtime.telemetry.record_event(
-                        V5ReceiptRuntimeEventKind::ExecuteEntered,
-                        runtime.epoch_ms(),
-                    );
-                }
+                runtime.hooks.stage_entered(V5Stage::Execute);
+                runtime.hooks.event(
+                    V5ReceiptRuntimeEventKind::ExecuteEntered,
+                    runtime.epoch_ms(),
+                );
                 let result = prepared.execute(cancellation.clone());
-                let outcome = if cancellation.is_cancelled() {
+                let protected_started = cancellation.protected_process_started();
+                let outcome = if cancellation.is_cancelled() && !protected_started {
                     ReceiptTerminalOutcome::Cancelled
                 } else {
                     match result {
@@ -6035,11 +4263,11 @@ impl V5ReceiptRuntime {
             }
             _ => return Err(ReceiptLedgerError::TaskBoundMismatch),
         };
-        let outcome = if record.cancel_requested {
-            ReceiptTerminalOutcome::Cancelled
-        } else {
-            candidate
-        };
+        let outcome = task_outcome_after_cancel(
+            candidate,
+            record.cancel_requested,
+            self.active_task_cancellations.protected_started(task_id),
+        );
         let terminal = match canonical_v5_terminal(&outcome) {
             Ok(terminal) => terminal,
             Err(CanonicalTerminalError::ResultTooLarge) => {
@@ -6060,7 +4288,7 @@ impl V5ReceiptRuntime {
         };
         let reply = self.publish_bound_terminal_reply(
             &bound,
-            record,
+            &record,
             &terminal,
             self.epoch_ms(),
             deadline,
@@ -6096,14 +4324,7 @@ impl V5ReceiptRuntime {
         terminal: crate::application::receipt_ledger::V5CanonicalTerminal,
         deadline: Instant,
     ) -> Result<V5RuntimeReply, ReceiptLedgerError> {
-        self.publish_direct_terminal_with_candidate(
-            reservation,
-            epoch_ms,
-            terminal,
-            deadline,
-            #[cfg(feature = "receipt-ledger-test-support")]
-            None,
-        )
+        self.publish_direct_terminal_with_candidate(reservation, epoch_ms, terminal, deadline, None)
     }
 
     fn publish_direct_terminal_with_candidate(
@@ -6112,13 +4333,13 @@ impl V5ReceiptRuntime {
         epoch_ms: u64,
         terminal: crate::application::receipt_ledger::V5CanonicalTerminal,
         deadline: Instant,
-        #[cfg(feature = "receipt-ledger-test-support")] candidate_result_override: Option<Value>,
+        oversized_candidate: Option<&crate::domain::invocation::DomainResult>,
     ) -> Result<V5RuntimeReply, ReceiptLedgerError> {
-        #[cfg(feature = "receipt-ledger-test-support")]
-        if self.telemetry.take_store_fault(
-            receipt_scenario_v5::ScenarioStoreFaultPoint::AfterTerminalPayloadRenameBeforeDirectorySync,
-        ) {
-            inject_receipt_row_directory_sync_failure_for_test();
+        if self
+            .hooks
+            .store_fault(V5StoreFaultPoint::AfterTerminalPayloadRenameBeforeDirectorySync)
+        {
+            arm_receipt_row_directory_sync_fault();
         }
         let publication = self.receipt_ledger.publish_direct_terminal(
             reservation.key().clone(),
@@ -6127,20 +4348,21 @@ impl V5ReceiptRuntime {
             terminal,
             deadline,
         )?;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        self.telemetry.record_event(
+        self.fail_stop_watchdogs
+            .disarm(&crate::application::receipt_ledger::receipt_key_digest(
+                reservation.key(),
+            ));
+        self.hooks.event(
             V5ReceiptRuntimeEventKind::ReceiptTerminalCommitted,
             epoch_ms,
         );
-        #[cfg(feature = "receipt-ledger-test-support")]
-        self.telemetry
-            .record_event(V5ReceiptRuntimeEventKind::FinalResultProjected, epoch_ms);
-        #[cfg(feature = "receipt-ledger-test-support")]
-        self.telemetry.record_direct_publication(
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::FinalResultProjected, epoch_ms);
+        self.hooks.direct_publication(
             &publication,
             "direct",
             "immediate_publication",
-            candidate_result_override,
+            oversized_candidate,
         );
         Ok(V5RuntimeReply::Prepared(publication.into_parts().1))
     }
@@ -6148,14 +4370,12 @@ impl V5ReceiptRuntime {
     fn publish_bound_terminal_reply(
         &self,
         bound: &TaskBoundReceipt,
-        task_record: V5StoredInvocationRecord,
+        task_record: &V5StoredInvocationRecord,
         terminal: &crate::application::receipt_ledger::V5CanonicalTerminal,
         epoch_ms: u64,
         deadline: Instant,
     ) -> Result<V5RuntimeReply, ReceiptLedgerError> {
-        #[cfg(feature = "receipt-ledger-test-support")]
-        let provisional_record = task_record.clone();
-        let (terminal_record, _terminal_link) = self
+        let (terminal_record, terminal_link) = self
             .task_projection
             .publish_bound_task_terminal(
                 bound,
@@ -6163,47 +4383,58 @@ impl V5ReceiptRuntime {
                 terminal,
                 epoch_ms,
                 deadline,
-                #[cfg(feature = "receipt-ledger-test-support")]
-                &self.telemetry,
-                #[cfg(feature = "receipt-ledger-test-support")]
-                self.scenario_control.as_ref(),
+                self.hooks.as_ref(),
             )
             .map_err(|failure| self.project_task_failure(failure))?;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        {
-            self.telemetry.record_event(
-                V5ReceiptRuntimeEventKind::TaskStoreTerminalCommitted,
-                epoch_ms,
-            );
-            self.telemetry.record_event(
-                V5ReceiptRuntimeEventKind::TaskStoreTerminalReadback,
-                epoch_ms,
-            );
-            self.telemetry.record_event(
-                V5ReceiptRuntimeEventKind::TaskTerminalBoundCommitted,
-                epoch_ms,
-            );
-            if let Some(control) = &self.scenario_control {
-                control
-                    .record_bound_terminal_publication(
-                        bound,
-                        &provisional_record,
-                        &terminal_record,
-                        &_terminal_link,
-                        terminal,
-                        epoch_ms,
-                    )
-                    .map_err(|_| {
-                        ReceiptLedgerError::Corrupt("record bound terminal publication")
-                    })?;
-                control.record_terminal_bound_task(terminal_record.clone(), _terminal_link);
-            }
-        }
+        self.fail_stop_watchdogs
+            .disarm(&task_record.receipt_key_digest);
+        self.hooks.event(
+            V5ReceiptRuntimeEventKind::TaskStoreTerminalCommitted,
+            epoch_ms,
+        );
+        self.hooks.event(
+            V5ReceiptRuntimeEventKind::TaskStoreTerminalReadback,
+            epoch_ms,
+        );
+        self.hooks.event(
+            V5ReceiptRuntimeEventKind::TaskTerminalBoundCommitted,
+            epoch_ms,
+        );
+        self.hooks.bound_terminal_publication(
+            bound,
+            task_record,
+            &terminal_record,
+            &terminal_link,
+            terminal,
+            epoch_ms,
+        )?;
+        self.hooks
+            .terminal_bound_task(&terminal_record, &terminal_link);
         Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
             outcome: V5InvocationResponse::Task {
                 snapshot: task_store_snapshot(&terminal_record),
             },
         }))
+    }
+
+    /// Re-reads a handoff receipt after a pause that another owner could have
+    /// used to stage a terminal onto it. A no-op without an observer: nothing
+    /// pauses in production, so the receipt cannot have moved.
+    fn reread_handoff_after_pause(
+        &self,
+        handoff: TaskHandoffActorBoundReceipt,
+        deadline: Instant,
+    ) -> Result<TaskHandoffActorBoundReceipt, ReceiptLedgerError> {
+        if !self.hooks.observing() {
+            return Ok(handoff);
+        }
+        match self
+            .receipt_ledger
+            .recover(handoff.key().clone(), deadline)?
+        {
+            ReceiptState::TaskHandoffActorBound(fresh) => Ok(fresh),
+            _ => Ok(handoff),
+        }
     }
 
     fn publish_staged_handoff_terminal_reply(
@@ -6228,34 +4459,20 @@ impl V5ReceiptRuntime {
             certificate,
             deadline,
         )?;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        if let Some(control) = &self.scenario_control {
-            control
-                .record_staged_terminal_preparation(&staged)
-                .map_err(|_| ReceiptLedgerError::Corrupt("record staged terminal preparation"))?;
-        }
-        #[cfg(feature = "receipt-ledger-test-support")]
-        self.telemetry.record_event(
+        self.hooks.staged_terminal_preparation(&staged)?;
+        self.hooks.event(
             V5ReceiptRuntimeEventKind::BoundHandoffTerminalStaged,
             epoch_ms,
         );
         let reservation = self
             .task_projection
-            .reserve_bound_handoff_link(
-                &staged,
-                epoch_ms,
-                deadline,
-                #[cfg(feature = "receipt-ledger-test-support")]
-                &self.telemetry,
-            )
+            .reserve_bound_handoff_link(&staged, epoch_ms, deadline, self.hooks.as_ref())
             .map_err(|failure| self.project_task_failure(failure))?;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        if let Some(control) = &self.scenario_control {
-            control.pause(
-                receipt_scenario_v5::ScenarioBarrierPoint::BeforeTaskStoreCreate,
-                Instant::now() + receipt_scenario_v5::SCENARIO_BULK_OPERATION_TIMEOUT,
-            )?;
-        }
+        self.hooks.pause(
+            V5PausePoint::BeforeTaskStoreCreate,
+            self.hooks
+                .commit_deadline_at(V5PausePoint::BeforeTaskStoreCreate, deadline),
+        )?;
         let (task_record, task_bound) = self
             .task_projection
             .materialize_staged_bound_handoff(
@@ -6263,66 +4480,115 @@ impl V5ReceiptRuntime {
                 &reservation,
                 epoch_ms,
                 deadline,
-                #[cfg(feature = "receipt-ledger-test-support")]
-                &self.telemetry,
+                self.hooks.as_ref(),
             )
             .map_err(|failure| self.project_task_failure(failure))?;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        let provisional_record = task_record.clone();
         let (terminal_record, terminal_link) = self
             .task_projection
             .publish_bound_task_terminal(
                 &task_bound,
-                task_record,
+                &task_record,
                 &terminal,
                 epoch_ms,
                 deadline,
-                #[cfg(feature = "receipt-ledger-test-support")]
-                &self.telemetry,
-                #[cfg(feature = "receipt-ledger-test-support")]
-                self.scenario_control.as_ref(),
+                self.hooks.as_ref(),
             )
             .map_err(|failure| self.project_task_failure(failure))?;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        {
-            self.telemetry.record_event(
-                V5ReceiptRuntimeEventKind::TaskStoreTerminalCommitted,
-                epoch_ms,
-            );
-            self.telemetry.record_event(
-                V5ReceiptRuntimeEventKind::TaskStoreTerminalReadback,
-                epoch_ms,
-            );
-        }
-        let _terminal_link = self.receipt_ledger.complete_staged_task_handoff(
+        self.hooks.event(
+            V5ReceiptRuntimeEventKind::TaskStoreTerminalCommitted,
+            epoch_ms,
+        );
+        self.hooks.event(
+            V5ReceiptRuntimeEventKind::TaskStoreTerminalReadback,
+            epoch_ms,
+        );
+        let terminal_link = self.receipt_ledger.complete_staged_task_handoff(
             staged.key().clone(),
             staged.record_version(),
             terminal_link,
             deadline,
         )?;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        if let Some(control) = &self.scenario_control {
-            control
-                .record_staged_terminal_publication(
-                    &staged,
-                    &provisional_record,
-                    &terminal_record,
-                    &_terminal_link,
-                )
-                .map_err(|_| ReceiptLedgerError::Corrupt("record staged terminal publication"))?;
-        }
-        #[cfg(feature = "receipt-ledger-test-support")]
-        self.telemetry.record_event(
+        self.hooks.staged_terminal_publication(
+            &staged,
+            &task_record,
+            &terminal_record,
+            &terminal_link,
+        )?;
+        self.hooks.event(
             V5ReceiptRuntimeEventKind::TaskTerminalBoundCommitted,
             epoch_ms,
         );
-        #[cfg(feature = "receipt-ledger-test-support")]
-        if let Some(control) = &self.scenario_control {
-            control.record_terminal_bound_task(terminal_record.clone(), _terminal_link);
-        }
+        self.hooks
+            .terminal_bound_task(&terminal_record, &terminal_link);
         Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
             outcome: V5InvocationResponse::Task {
                 snapshot: task_store_snapshot(&terminal_record),
+            },
+        }))
+    }
+
+    /// Publishes the terminal of a failed validation or admission and, when
+    /// the failure poisons the process, latches fail-stop so the reply is the
+    /// last one this daemon admits.
+    fn admission_failure_reply(
+        &self,
+        reservation: crate::application::receipt_ledger::ReservedReceipt,
+        outcome: ReceiptTerminalOutcome,
+        fail_stop: bool,
+        epoch_ms: u64,
+        deadline: Instant,
+    ) -> Result<V5RuntimeReply, ReceiptLedgerError> {
+        let terminal = canonical_v5_terminal(&outcome)
+            .map_err(|_| ReceiptLedgerError::Corrupt("canonical v5 terminal failed"))?;
+        let reply = self.publish_pre_actor_terminal(reservation, epoch_ms, terminal, deadline);
+        if fail_stop {
+            self.hooks.restart_requested();
+            self.external_store_fail_stop.store(true, Ordering::Release);
+        }
+        match (fail_stop, reply) {
+            (true, Ok(V5RuntimeReply::Prepared(frame))) => {
+                Ok(V5RuntimeReply::PreparedFailStop(frame))
+            }
+            (true, Ok(V5RuntimeReply::Json(response))) => {
+                Ok(V5RuntimeReply::JsonFailStop(response))
+            }
+            (_, reply) => reply,
+        }
+    }
+
+    /// A begun receipt an observer promoted to a handoff while this handler
+    /// was paused: materialize the Task and answer with it.
+    fn continue_promoted_begun_handoff(
+        &self,
+        handoff: TaskHandoffActorBoundReceipt,
+        epoch_ms: u64,
+        deadline: Instant,
+    ) -> Result<V5RuntimeReply, ReceiptLedgerError> {
+        if self.hooks.prepare_rejects() {
+            let terminal = injected_rejection_terminal("scenario prepare rejected invocation")?;
+            return self
+                .publish_staged_handoff_terminal_reply(handoff, terminal, epoch_ms, deadline);
+        }
+        let (task_record, task_bound) = self
+            .task_projection
+            .materialize_bound_handoff(&handoff, epoch_ms, deadline, self.hooks.as_ref())
+            .map_err(|failure| self.project_task_failure(failure))?;
+        self.receipt_ledger.complete_bound_task_handoff(
+            handoff.key().clone(),
+            handoff.record_version(),
+            task_bound.clone(),
+            deadline,
+        )?;
+        let (task_record, task_bound) = self
+            .task_projection
+            .start_bound_task(&task_bound, task_record, deadline)
+            .map_err(|failure| self.project_task_failure(failure))?;
+        self.hooks.bound_task(&task_record, &task_bound);
+        self.hooks
+            .event(V5ReceiptRuntimeEventKind::TaskBoundCommitted, epoch_ms);
+        Ok(V5RuntimeReply::Json(V5ServerResponse::Invocation {
+            outcome: V5InvocationResponse::Task {
+                snapshot: task_store_snapshot(&task_record),
             },
         }))
     }
@@ -6343,25 +4609,16 @@ impl V5ReceiptRuntime {
             }
             ReceiptState::TaskPromisedUnbound(promised) => {
                 let task_id = promised.task().task_id();
-                let _receipt = self.receipt_ledger.publish_receipt_backed_task_terminal(
+                let receipt = self.receipt_ledger.publish_receipt_backed_task_terminal(
                     promised.key().clone(),
                     TaskCancellationReceipt::PromisedUnbound(promised),
                     epoch_ms,
                     terminal,
                     deadline,
                 )?;
-                #[cfg(feature = "receipt-ledger-test-support")]
-                if let Some(control) = &self.scenario_control {
-                    control
-                        .record_receipt_backed_terminal(_receipt)
-                        .map_err(|_| {
-                            ReceiptLedgerError::Corrupt(
-                                "capture receipt-backed terminal evidence failed",
-                            )
-                        })?;
-                }
-                #[cfg(feature = "receipt-ledger-test-support")]
-                self.telemetry.record_event(
+                self.fail_stop_watchdogs.disarm(receipt.key_digest());
+                self.hooks.receipt_backed_terminal(&receipt)?;
+                self.hooks.event(
                     V5ReceiptRuntimeEventKind::ReceiptTerminalCommitted,
                     epoch_ms,
                 );
@@ -6387,18 +4644,14 @@ impl V5ReceiptRuntime {
                 pending_reserved_response(&reservation),
             )),
             CancelReservedSubmitDecision::PublishCancelledDirect(intent) => {
-                #[cfg(feature = "receipt-ledger-test-support")]
-                self.telemetry.record_event(
+                self.hooks.event(
                     V5ReceiptRuntimeEventKind::CancelReservationConverted,
                     epoch_ms,
                 );
-                #[cfg(feature = "receipt-ledger-test-support")]
-                if let Some(control) = &self.scenario_control {
-                    control.pause(
-                        receipt_scenario_v5::ScenarioBarrierPoint::AfterCancelReservationConvertedBeforeTerminal,
-                        deadline,
-                    )?;
-                }
+                self.hooks.pause(
+                    V5PausePoint::AfterCancelReservationConvertedBeforeTerminal,
+                    deadline,
+                )?;
                 let publication = self.receipt_ledger.publish_direct_terminal(
                     intent.reservation().key().clone(),
                     intent.reservation().record_version(),
@@ -6406,13 +4659,11 @@ impl V5ReceiptRuntime {
                     intent.terminal().clone(),
                     deadline,
                 )?;
-                #[cfg(feature = "receipt-ledger-test-support")]
-                self.telemetry.record_event(
+                self.hooks.event(
                     V5ReceiptRuntimeEventKind::ReceiptTerminalCommitted,
                     epoch_ms,
                 );
-                #[cfg(feature = "receipt-ledger-test-support")]
-                self.telemetry.record_direct_publication(
+                self.hooks.direct_publication(
                     &publication,
                     "cancelled",
                     "immediate_publication",
@@ -6529,8 +4780,7 @@ impl V5ReceiptRuntime {
         let acknowledged =
             self.receipt_ledger
                 .acknowledge_direct(key, terminal_digest, epoch_ms, deadline)?;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        self.telemetry.record_event(
+        self.hooks.event(
             V5ReceiptRuntimeEventKind::AcknowledgementCommitted,
             epoch_ms,
         );
@@ -6547,7 +4797,7 @@ impl V5ReceiptRuntime {
         deadline: Instant,
     ) -> Result<super::protocol_v5::V5DaemonTaskSnapshot, ReceiptLedgerError> {
         self.task_projection
-            .retire_expired_terminal_tasks(deadline)
+            .retire_expired_terminal_tasks(deadline, self.hooks.as_ref())
             .map_err(|failure| self.project_task_failure(failure))?;
         if let Some(record) = self
             .task_projection
@@ -6679,7 +4929,7 @@ impl V5ReceiptRuntime {
         deadline: Instant,
     ) -> Result<super::protocol_v5::V5DaemonTaskSnapshot, ReceiptLedgerError> {
         self.task_projection
-            .retire_expired_terminal_tasks(deadline)
+            .retire_expired_terminal_tasks(deadline, self.hooks.as_ref())
             .map_err(|failure| self.project_task_failure(failure))?;
         {
             let _task_terminal_gate = self
@@ -6692,6 +4942,7 @@ impl V5ReceiptRuntime {
                 .map_err(|failure| self.project_task_failure(failure))?
             {
                 self.active_task_cancellations.cancel(task_id);
+                self.arm_cancel_grace(&record);
                 let provider_deadline =
                     crate::domain::code_intelligence::ProviderDeadline::new(deadline);
                 let link = self
@@ -6707,41 +4958,31 @@ impl V5ReceiptRuntime {
                             .map_err(|_| {
                                 ReceiptLedgerError::Corrupt("canonical v5 terminal failed")
                             })?;
-                        let (terminal_record, _terminal_link) = self
+                        let (terminal_record, terminal_link) = self
                             .task_projection
                             .publish_bound_task_terminal(
                                 &bound,
-                                record,
+                                &record,
                                 &terminal,
                                 self.epoch_ms(),
                                 deadline,
-                                #[cfg(feature = "receipt-ledger-test-support")]
-                                &self.telemetry,
-                                #[cfg(feature = "receipt-ledger-test-support")]
-                                self.scenario_control.as_ref(),
+                                self.hooks.as_ref(),
                             )
                             .map_err(|failure| self.project_task_failure(failure))?;
-                        #[cfg(feature = "receipt-ledger-test-support")]
-                        {
-                            self.telemetry.record_event(
-                                V5ReceiptRuntimeEventKind::TaskStoreTerminalCommitted,
-                                self.epoch_ms(),
-                            );
-                            self.telemetry.record_event(
-                                V5ReceiptRuntimeEventKind::TaskStoreTerminalReadback,
-                                self.epoch_ms(),
-                            );
-                            self.telemetry.record_event(
-                                V5ReceiptRuntimeEventKind::TaskTerminalBoundCommitted,
-                                self.epoch_ms(),
-                            );
-                            if let Some(control) = &self.scenario_control {
-                                control.record_terminal_bound_task(
-                                    terminal_record.clone(),
-                                    _terminal_link,
-                                );
-                            }
-                        }
+                        self.hooks.event(
+                            V5ReceiptRuntimeEventKind::TaskStoreTerminalCommitted,
+                            self.epoch_ms(),
+                        );
+                        self.hooks.event(
+                            V5ReceiptRuntimeEventKind::TaskStoreTerminalReadback,
+                            self.epoch_ms(),
+                        );
+                        self.hooks.event(
+                            V5ReceiptRuntimeEventKind::TaskTerminalBoundCommitted,
+                            self.epoch_ms(),
+                        );
+                        self.hooks
+                            .terminal_bound_task(&terminal_record, &terminal_link);
                         return Ok(task_store_snapshot(&terminal_record));
                     }
                 }
@@ -6778,30 +5019,20 @@ impl V5ReceiptRuntime {
         if terminalize_without_started_attempt {
             let terminal = canonical_v5_terminal(&ReceiptTerminalOutcome::Cancelled)
                 .map_err(|_| ReceiptLedgerError::Corrupt("canonical v5 terminal failed"))?;
-            let _committed = self.receipt_ledger.publish_receipt_backed_task_terminal(
+            let committed = self.receipt_ledger.publish_receipt_backed_task_terminal(
                 cancelled.key().clone(),
                 cancelled,
                 self.epoch_ms(),
                 terminal,
                 deadline,
             )?;
-            #[cfg(feature = "receipt-ledger-test-support")]
-            {
-                if let Some(control) = &self.scenario_control {
-                    control
-                        .record_receipt_backed_terminal(_committed)
-                        .map_err(|_| {
-                            ReceiptLedgerError::Corrupt(
-                                "capture receipt-backed terminal evidence failed",
-                            )
-                        })?;
-                    control.release_pre_actor_barriers();
-                }
-                self.telemetry.record_event(
-                    V5ReceiptRuntimeEventKind::ReceiptTerminalCommitted,
-                    self.epoch_ms(),
-                );
-            }
+            self.fail_stop_watchdogs.disarm(committed.key_digest());
+            self.hooks.receipt_backed_terminal(&committed)?;
+            self.hooks.release_pre_actor_pauses();
+            self.hooks.event(
+                V5ReceiptRuntimeEventKind::ReceiptTerminalCommitted,
+                self.epoch_ms(),
+            );
             return self.resolve_task(task_id, deadline);
         }
         Ok(queued_receipt_task_snapshot(
@@ -6826,8 +5057,6 @@ impl V5ReceiptRuntime {
         origin: &'static str,
         response_kind: &'static str,
     ) -> Result<V5RuntimeReply, ReceiptLedgerError> {
-        #[cfg(not(feature = "receipt-ledger-test-support"))]
-        let _ = (origin, response_kind);
         match state {
             ReceiptState::CancelReserved(receipt) => {
                 Ok(V5RuntimeReply::Json(pending_cancel_response(&receipt)))
@@ -6848,9 +5077,8 @@ impl V5ReceiptRuntime {
                     receipt.terminal().clone(),
                     deadline,
                 )?;
-                #[cfg(feature = "receipt-ledger-test-support")]
-                self.telemetry
-                    .record_direct_publication(&publication, response_kind, origin, None);
+                self.hooks
+                    .direct_publication(&publication, response_kind, origin, None);
                 Ok(V5RuntimeReply::Prepared(publication.into_parts().1))
             }
             ReceiptState::AcknowledgedTombstone(receipt) => {
@@ -6880,94 +5108,56 @@ impl V5ReceiptRuntime {
         }
         Ok(())
     }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn observe_missing_executor_writer(
-        &self,
-        action: V5ExecutorReachabilityAction,
-    ) -> Result<V5ExecutorReachability, String> {
-        self.ensure_named_authority()?;
-        let observation = self.initial_receipt_observation.clone();
-        Ok(self
-            .invocation_executor
-            .observe_missing_writer(action, observation))
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn observe_missing_task_projection_writer(
-        &self,
-    ) -> Result<V5TaskProjectionReachability, String> {
-        self.ensure_named_authority()?;
-        self.task_projection.validate_named_identity()?;
-        let observation = self.initial_receipt_observation.clone();
-        Ok(self
-            .task_projection
-            .observe_missing_seed_writer(observation))
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn with_evidence_capture(
-        mut self,
-        capture: SyncSender<ProductionMissingTransitionEvidence>,
-    ) -> Self {
-        self.evidence_capture = Some(capture);
-        self
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn capture_protocol_transition_after_frame(
-        &self,
-        decoded: &DecodedV5Request,
-    ) -> Result<(), String> {
-        let Some(capture) = &self.evidence_capture else {
-            return Ok(());
-        };
-        self.ensure_named_authority()?;
-        let evidence = ProductionMissingTransitionEvidence::protocol_behavior_unavailable(decoded);
-        capture
-            .try_send(evidence)
-            .map_err(|_| "capture protocol-v5 reachability evidence".to_string())
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    fn capture_missing_submit_writer_after_reserve(
-        &self,
-        reply: &V5RuntimeReply,
-        deadline: Instant,
-    ) -> Result<(), String> {
-        let Some(capture) = &self.evidence_capture else {
-            return Ok(());
-        };
-        if !matches!(
-            reply,
-            V5RuntimeReply::Json(V5ServerResponse::Invocation {
-                outcome: V5InvocationResponse::ReceiptPending {
-                    phase: V5InvocationPhase::ReservedUnbound,
-                    ..
-                }
-            })
-        ) {
-            return Ok(());
-        }
-        self.ensure_named_authority_before(deadline)?;
-        let token = self.invocation_executor.observe_missing_writer(
-            V5ExecutorReachabilityAction::SubmitInvocation,
-            self.initial_receipt_observation.clone(),
-        );
-        let evidence = ProductionMissingTransitionEvidence::writer_path_unavailable(token);
-        capture
-            .try_send(evidence)
-            .map_err(|_| "capture protocol-v5 submit writer evidence".to_string())
-    }
 }
 
 enum V5RuntimeReply {
     Json(V5ServerResponse),
-    #[cfg(feature = "receipt-ledger-test-support")]
+    /// A closed reply written after the process latched fail-stop: the
+    /// daemon answers this request and admits nothing further.
     JsonFailStop(V5ServerResponse),
     Prepared(PreparedWireFrame),
-    #[cfg(feature = "receipt-ledger-test-support")]
     PreparedFailStop(PreparedWireFrame),
+}
+
+impl V5RuntimeReply {
+    /// The same reply as the closed one a fail-stopped process writes.
+    fn after_fail_stop(self) -> Self {
+        match self {
+            Self::Json(response) => Self::JsonFailStop(response),
+            Self::Prepared(frame) => Self::PreparedFailStop(frame),
+            closed @ (Self::JsonFailStop(_) | Self::PreparedFailStop(_)) => closed,
+        }
+    }
+}
+
+/// The terminal an injected rejection publishes in place of the real stage.
+fn injected_rejection_terminal(
+    summary: &'static str,
+) -> Result<crate::application::receipt_ledger::V5CanonicalTerminal, ReceiptLedgerError> {
+    canonical_v5_terminal(&ReceiptTerminalOutcome::Completed {
+        result: Box::new(
+            crate::domain::invocation::DomainResult::canonical_rejection(
+                None,
+                RefusalCode::BadValue,
+                summary,
+            ),
+        ),
+    })
+    .map_err(|_| ReceiptLedgerError::Corrupt("canonical v5 terminal failed"))
+}
+
+fn reservation_is_still_unbound(state: &ReceiptState) -> bool {
+    matches!(
+        state,
+        ReceiptState::Reserved(receipt) if matches!(receipt.phase(), ReservedPhase::Unbound)
+    ) || matches!(state, ReceiptState::TaskPromisedUnbound(_))
+}
+
+fn reservation_is_begun(state: &ReceiptState) -> bool {
+    matches!(
+        state,
+        ReceiptState::Reserved(receipt) if matches!(receipt.phase(), ReservedPhase::Begun { .. })
+    )
 }
 
 fn queued_receipt_task_snapshot(
@@ -7082,13 +5272,6 @@ fn receipt_state_task_snapshot(
             terminal_digest: receipt.terminal().digest().clone(),
         },
     })
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-pub(super) fn receipt_state_task_snapshot_for_test(
-    state: ReceiptState,
-) -> Result<super::protocol_v5::V5DaemonTaskSnapshot, ReceiptLedgerError> {
-    receipt_state_task_snapshot(state)
 }
 
 fn task_store_snapshot(
@@ -7259,10 +5442,7 @@ fn run_daemon_configured_until(
     // Receipt ownership and the initial durable generation are established before
     // a listener can become discoverable.
     let runtime = Arc::new(configure_runtime(V5ReceiptRuntime::open(&state, &config)?));
-    #[cfg(feature = "receipt-ledger-test-support")]
-    if let Some(control) = &runtime.scenario_control {
-        control.record_runtime(&runtime);
-    }
+    runtime.hooks.runtime_opened(&runtime);
     if let Err(error) = runtime.ensure_named_authority() {
         if runtime.restart_required() {
             std::mem::forget(runtime);
@@ -7289,8 +5469,27 @@ fn run_daemon_configured_until(
         let _ = state.remove_v5_endpoint_if_owned(&published);
         return Err(error);
     }
-    #[cfg(feature = "receipt-ledger-test-support")]
-    let listener_telemetry = runtime.telemetry.listener_lease();
+    // A losing startup process never opens or rewrites the observation state.
+    // The writer begins only after the endpoint's second authority check.
+    let authority = Arc::downgrade(&runtime);
+    let observation_authority: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+        authority.upgrade().is_some_and(|runtime| {
+            !runtime.restart_required() && runtime.ensure_named_authority().is_ok()
+        })
+    });
+    let mut capacity_writer =
+        match crate::infrastructure::capacity_observation::start_background_writer(
+            &state,
+            Arc::clone(&config.capacity_observer),
+            observation_authority,
+        ) {
+            Ok(writer) => Some(writer),
+            Err(_) => {
+                eprintln!("local capacity observation disabled: storage unavailable");
+                None
+            }
+        };
+    let listener_lease = runtime.hooks.listener_lease();
     let active_leases = Arc::new(V5LeaseRegistry::default());
     let admitted_connections = Arc::new(AtomicUsize::new(0));
     let shutting_down = Arc::new(AtomicBool::new(false));
@@ -7308,10 +5507,24 @@ fn run_daemon_configured_until(
         // request's own response budget elapses. Mutations and session admission validate the
         // named authority themselves; the accept loop only observes their process-owned
         // fail-stop latch.
+        if let Some(elapsed) = runtime
+            .fail_stop_watchdogs
+            .due(runtime.invocation_executor.now())
+        {
+            // A promised attempt without its actor, or a cancelled attempt
+            // without its terminal, outlived the grace: the process stops
+            // admitting and dies, and the successor terminalizes it.
+            runtime
+                .external_store_fail_stop
+                .store(true, Ordering::Release);
+            runtime.hooks.restart_requested();
+            restart_requested = true;
+            runtime.hooks.forced_process_exit(Some(elapsed));
+            break;
+        }
         if runtime.restart_required() {
             restart_requested = true;
-            #[cfg(feature = "receipt-ledger-test-support")]
-            runtime.telemetry.record_forced_process_exit();
+            runtime.hooks.forced_process_exit(None);
             break;
         }
         match listener.accept() {
@@ -7319,8 +5532,7 @@ fn run_daemon_configured_until(
                 if runtime.restart_required() {
                     drop(stream);
                     restart_requested = true;
-                    #[cfg(feature = "receipt-ledger-test-support")]
-                    runtime.telemetry.record_forced_process_exit();
+                    runtime.hooks.forced_process_exit(None);
                     break;
                 }
                 let connection = V5AcceptedConnection {
@@ -7365,26 +5577,24 @@ fn run_daemon_configured_until(
 
     shutting_down.store(true, Ordering::Release);
     drop(listener);
-    #[cfg(feature = "receipt-ledger-test-support")]
-    drop(listener_telemetry);
+    drop(listener_lease);
     if restart_requested {
         // INV.APP.DAEMON-STORE-FAIL-STOP: keep both the PID-bound endpoint and
         // receipt authority alive until process death. A detached worker may
         // still be inside an uninterruptible adapter or syscall.
-        #[cfg(all(feature = "receipt-ledger-test-support", not(test)))]
-        {
-            // Integration scenarios run the feature-only daemon in a thread;
-            // joining that thread is their simulated process-death boundary.
-            // Release its authority so unrelated scenarios do not share resources
-            // that production releases at PID exit.
+        if runtime.hooks.releases_authority_on_fail_stop() {
+            // The contract harness runs the daemon in a thread; joining that
+            // thread is its simulated process-death boundary. Release the
+            // authority so unrelated scenarios do not share resources that
+            // production releases at PID exit. A promoted attempt the owner
+            // handed to a worker still holds an `Arc` to this runtime; join
+            // those workers first so the drop actually releases the authority
+            // an off-thread continuation would otherwise keep alive.
             join_v5_handlers(sessions);
+            runtime.join_task_executions();
+            drop(capacity_writer.take());
             drop(runtime);
-        }
-        #[cfg(any(
-            not(feature = "receipt-ledger-test-support"),
-            all(feature = "receipt-ledger-test-support", test)
-        ))]
-        {
+        } else {
             drop(sessions);
             std::mem::forget(runtime);
         }
@@ -7392,6 +5602,7 @@ fn run_daemon_configured_until(
     }
     join_v5_handlers(sessions);
     runtime.join_task_executions();
+    drop(capacity_writer.take());
     state.remove_v5_endpoint_if_owned(&published)?;
     Ok(())
 }
@@ -7512,7 +5723,7 @@ struct V5ConnectionSlot {
 impl V5ConnectionSlot {
     fn acquire(admitted: Arc<AtomicUsize>) -> Option<Self> {
         admitted
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < MAX_HANDSHAKES).then_some(current + 1)
             })
             .ok()
@@ -7673,64 +5884,47 @@ fn handle_probe_connection(
                 }
                 Err(V5RequestFrameError::Read(_)) => break,
             };
-        let deadlines = v5_request_deadlines(&decoded, request_received_at)?;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        let mut deadlines = deadlines;
-        #[cfg(feature = "receipt-ledger-test-support")]
-        if runtime
-            .scenario_control
-            .as_ref()
-            .is_some_and(|control| control.has_precomputed_terminal())
-        {
-            let bulk_deadline = Instant::now()
-                .checked_add(receipt_scenario_v5::SCENARIO_BULK_OPERATION_TIMEOUT)
-                .ok_or_else(|| "protocol-v5 scenario bulk deadline overflow".to_owned())?;
-            deadlines.operation = bulk_deadline;
-            deadlines.response = bulk_deadline;
-        }
-        #[cfg(feature = "receipt-ledger-test-support")]
-        runtime.telemetry.record_event(
+        let deadlines = match runtime.hooks.session_deadline_override() {
+            Some(bulk_deadline) => V5RequestDeadlines {
+                operation: bulk_deadline,
+                response: bulk_deadline,
+            },
+            None => v5_request_deadlines(&decoded, request_received_at)?,
+        };
+        runtime.hooks.event(
             V5ReceiptRuntimeEventKind::StrictEnvelopeParsed,
             runtime.epoch_ms(),
         );
-        #[cfg(feature = "receipt-ledger-test-support")]
-        runtime.telemetry.record_event(
+        runtime.hooks.event(
             V5ReceiptRuntimeEventKind::V5ReceiptRuntimeEntered,
             runtime.epoch_ms(),
         );
         runtime.ensure_named_authority_before(deadlines.operation)?;
         let kind = decoded.request().kind();
-        #[cfg(feature = "receipt-ledger-test-support")]
-        let _actor_telemetry_lease = (kind == V5ClientRequestKind::SubmitInvocation)
-            .then(|| runtime.telemetry.actor_lease());
+        let _actor_lease =
+            (kind == V5ClientRequestKind::SubmitInvocation).then(|| runtime.hooks.actor_lease());
         let result = match kind {
-            V5ClientRequestKind::Ping => {
-                #[cfg(feature = "receipt-ledger-test-support")]
-                runtime.capture_protocol_transition_after_frame(&decoded)?;
-                write_runtime_json_line_before(
-                    &mut stream,
-                    runtime,
-                    &V5ProbeServerResponse::Pong {},
-                    deadlines.response,
-                )
-            }
+            V5ClientRequestKind::Ping => write_runtime_json_line_before(
+                &mut stream,
+                runtime,
+                &V5ProbeServerResponse::Pong {},
+                deadlines.response,
+            ),
             V5ClientRequestKind::SubmitInvocation => {
                 let epoch_ms = runtime.epoch_ms();
                 match runtime.submit_invocation(decoded, epoch_ms, deadlines.operation) {
                     Ok(reply) => {
-                        #[cfg(feature = "receipt-ledger-test-support")]
-                        runtime.capture_missing_submit_writer_after_reserve(
-                            &reply,
-                            deadlines.operation,
-                        )?;
-                        #[cfg(feature = "receipt-ledger-test-support")]
-                        if runtime
-                            .scenario_control
-                            .as_ref()
-                            .is_some_and(|control| control.take_submit_response_disconnect())
-                        {
+                        if runtime.hooks.submit_response_disconnect() {
                             return Ok(());
                         }
+                        // The process may have latched fail-stop while this
+                        // attempt ran: its reply is still written, as the
+                        // closed one this daemon admits nothing after.
+                        let reply = if runtime.restart_required() {
+                            reply.after_fail_stop()
+                        } else {
+                            reply
+                        };
                         write_runtime_reply_before(&mut stream, runtime, reply, deadlines.response)
                     }
                     Err(error) => write_runtime_ledger_error_before(
@@ -7794,12 +5988,7 @@ fn handle_probe_connection(
                     deadlines.operation,
                 ) {
                     Ok(reply) => {
-                        #[cfg(feature = "receipt-ledger-test-support")]
-                        if runtime
-                            .scenario_control
-                            .as_ref()
-                            .is_some_and(|control| control.take_ack_response_disconnect())
-                        {
+                        if runtime.hooks.ack_response_disconnect() {
                             return Ok(());
                         }
                         write_runtime_reply_before(&mut stream, runtime, reply, deadlines.response)
@@ -7993,8 +6182,7 @@ fn write_runtime_ledger_error_before(
         code: daemon_error_code(error),
     };
     if error.requires_reopen() {
-        #[cfg(feature = "receipt-ledger-test-support")]
-        runtime.telemetry.record_forced_process_exit();
+        runtime.hooks.forced_process_exit(None);
         // The actor has already latched fail-stop, so asking it for another
         // generation check would turn the required closed response into EOF.
         // The runtime still owns the authenticated stream, PID endpoint,
@@ -8050,7 +6238,6 @@ fn write_runtime_reply_before(
         V5RuntimeReply::Json(response) => {
             write_runtime_json_line_before(stream, runtime, &response, deadline)
         }
-        #[cfg(feature = "receipt-ledger-test-support")]
         V5RuntimeReply::JsonFailStop(response) => {
             write_fail_stop_json_line(stream, &response, deadline)
         }
@@ -8075,7 +6262,6 @@ fn write_runtime_reply_before(
                 .map(|_| ())
                 .ok_or_else(|| "protocol-v5 response deadline expired".to_string())
         }
-        #[cfg(feature = "receipt-ledger-test-support")]
         V5RuntimeReply::PreparedFailStop(frame) => {
             if frame.jsonl().len() > MAX_V5_RESPONSE_LINE_BYTES {
                 return Err("prepared protocol-v5 response exceeds the byte limit".to_string());
@@ -8182,3027 +6368,5 @@ fn daemon_io_error(operation: &str, error: io::Error) -> String {
     format!("{operation}: {error}")
 }
 
-#[cfg(feature = "receipt-ledger-test-support")]
-pub(crate) fn run_protocol_ping_reachability_probe_for_test(
-) -> Result<ProductionMissingTransitionEvidence, String> {
-    run_v5_reachability_probe_for_test(V5ClientRequest::Ping {}, ReachabilityExpectedResponse::Pong)
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-pub(crate) fn run_submit_reachability_probe_for_test(
-) -> Result<ProductionMissingTransitionEvidence, String> {
-    run_v5_reachability_probe_for_test(
-        fixed_submit_request_for_test()?,
-        ReachabilityExpectedResponse::ReceiptPending(V5InvocationPhase::ReservedUnbound),
-    )
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-pub(crate) fn run_direct_load_reachability_probe_for_test(
-) -> Result<ProductionMissingTransitionEvidence, String> {
-    run_executor_reachability_probe_for_test(V5ExecutorReachabilityAction::RunDirectLoad)
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-pub(crate) fn run_lazy_cancel_storm_reachability_probe_for_test(
-) -> Result<ProductionMissingTransitionEvidence, String> {
-    run_executor_reachability_probe_for_test(V5ExecutorReachabilityAction::RunLazyCancelStorm)
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-pub(crate) fn run_seed_task_reachability_probe_for_test(
-) -> Result<ProductionMissingTransitionEvidence, String> {
-    let root =
-        tempfile::tempdir().map_err(|error| format!("create v5 task projection state: {error}"))?;
-    let state_root = std::fs::canonicalize(root.path())
-        .map_err(|error| format!("canonicalize v5 task projection state: {error}"))?;
-    let identity = CoreIdentity::production_v5();
-    let state = DaemonStateDirectory::open(&state_root, &identity)?;
-    let runtime = V5ReceiptRuntime::open(
-        &state,
-        &DaemonServerConfig::new(state_root, identity, Duration::from_millis(50)),
-    )?;
-    let token = runtime.observe_missing_task_projection_writer()?;
-    Ok(ProductionMissingTransitionEvidence::task_projection_unavailable(token))
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn run_executor_reachability_probe_for_test(
-    action: V5ExecutorReachabilityAction,
-) -> Result<ProductionMissingTransitionEvidence, String> {
-    let root = tempfile::tempdir().map_err(|error| format!("create v5 executor state: {error}"))?;
-    let state_root = std::fs::canonicalize(root.path())
-        .map_err(|error| format!("canonicalize v5 executor state: {error}"))?;
-    let identity = CoreIdentity::production_v5();
-    let state = DaemonStateDirectory::open(&state_root, &identity)?;
-    let runtime = V5ReceiptRuntime::open(
-        &state,
-        &DaemonServerConfig::new(state_root, identity, Duration::from_millis(50)),
-    )?;
-    let token = runtime.observe_missing_executor_writer(action)?;
-    Ok(ProductionMissingTransitionEvidence::writer_path_unavailable(token))
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn fixed_submit_request_for_test() -> Result<V5ClientRequest, String> {
-    use crate::application::receipt_ledger::V5ToolIdentity;
-    use crate::domain::invocation::{InvocationId, TaskId};
-    use std::str::FromStr;
-
-    let invocation = V5InvocationRequest::new(
-        InvocationId::from_str("11111111-1111-4111-8111-111111111111")
-            .map_err(|_| "invalid fixed v5 reachability invocation id".to_string())?,
-        TaskId::from_str("22222222-2222-4222-8222-222222222222")
-            .map_err(|_| "invalid fixed v5 reachability task id".to_string())?,
-        V5ToolIdentity::View,
-        serde_json::Map::new(),
-        "workspace-a".to_string(),
-        7_000,
-    )?;
-    Ok(V5ClientRequest::SubmitInvocation { invocation })
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-#[derive(Clone, Copy)]
-enum ReachabilityExpectedResponse {
-    Pong,
-    ReceiptPending(V5InvocationPhase),
-}
-
-#[cfg(feature = "receipt-ledger-test-support")]
-fn run_v5_reachability_probe_for_test(
-    request: V5ClientRequest,
-    expected_response: ReachabilityExpectedResponse,
-) -> Result<ProductionMissingTransitionEvidence, String> {
-    let root = tempfile::tempdir().map_err(|error| format!("create v5 probe state: {error}"))?;
-    let state_root = std::fs::canonicalize(root.path())
-        .map_err(|error| format!("canonicalize v5 probe state: {error}"))?;
-    let identity = CoreIdentity::production_v5();
-    let config = DaemonServerConfig::new(
-        state_root.clone(),
-        identity.clone(),
-        Duration::from_millis(50),
-    );
-    let (evidence_tx, evidence_rx) = sync_channel(1);
-    let server = thread::spawn(move || {
-        run_daemon_configured(config, |runtime| runtime.with_evidence_capture(evidence_tx))
-    });
-
-    let startup_deadline = Instant::now() + Duration::from_secs(5);
-    let record = loop {
-        let state = DaemonStateDirectory::open(&state_root, &identity)?;
-        if let Some(record) = state.read_v5_endpoint_record()? {
-            break record;
-        }
-        if Instant::now() >= startup_deadline {
-            return Err("protocol-v5 reachability endpoint was not published".to_string());
-        }
-        thread::sleep(Duration::from_millis(5));
-    };
-
-    let mut stream = TcpStream::connect(record.loopback_addr()?)
-        .map_err(|error| daemon_io_error("connect protocol-v5 reachability endpoint", error))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .map_err(|error| daemon_io_error("bound protocol-v5 reachability read", error))?;
-    write_json_line_before(
-        &mut stream,
-        &V5ClientRequest::Hello {
-            protocol_version: DAEMON_PROTOCOL_VERSION,
-            token: record.token().to_string(),
-            core_identity: identity,
-            owner_lease: uuid::Uuid::new_v4().to_string(),
-        },
-        Instant::now() + Duration::from_secs(2),
-    )?;
-    let mut reader = BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|error| daemon_io_error("clone protocol-v5 reachability stream", error))?,
-    );
-    let ready_frame = read_bounded_v5_probe_response_frame(&mut reader)
-        .map_err(|error| daemon_io_error("read protocol-v5 reachability ready", error))?;
-    let ready: V5HandshakeServerResponse = serde_json::from_slice(&ready_frame)
-        .map_err(|_| "protocol-v5 reachability ready is not strict JSON".to_string())?;
-    if !ready.matches_record(&record) {
-        return Err("protocol-v5 reachability ready does not match endpoint".to_string());
-    }
-
-    write_json_line_before(
-        &mut stream,
-        &request,
-        Instant::now() + Duration::from_secs(2),
-    )?;
-    let response_frame = read_bounded_v5_probe_response_frame(&mut reader)
-        .map_err(|error| daemon_io_error("read protocol-v5 reachability response", error))?;
-    let response = decode_v5_server_response(&response_frame).map_err(|error| {
-        format!("protocol-v5 reachability response is not strict JSON: {error}")
-    })?;
-    let response_matches = match expected_response {
-        ReachabilityExpectedResponse::Pong => matches!(response, V5ServerResponse::Pong),
-        ReachabilityExpectedResponse::ReceiptPending(expected_phase) => matches!(
-            response,
-            V5ServerResponse::Invocation {
-                outcome: V5InvocationResponse::ReceiptPending { phase, .. }
-            } if phase == expected_phase
-        ),
-    };
-    if !response_matches {
-        return Err("protocol-v5 reachability probe received an unexpected response".to_string());
-    }
-    let evidence = evidence_rx
-        .recv_timeout(Duration::from_secs(2))
-        .map_err(|_| "protocol-v5 reachability evidence was not captured".to_string())?;
-    drop(stream);
-    server
-        .join()
-        .map_err(|_| "protocol-v5 reachability daemon panicked".to_string())??;
-    Ok(evidence)
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::application::invocation::normalized_arguments_hash;
-    use crate::application::operation_descriptors::{ExecutionClass, KnownLongReason};
-    use crate::application::receipt_ledger::{
-        receipt_key_digest, request_scope_hash, CancelExpiryOutcome, CancelResolution,
-        CommittedDirectPublication, OriginalCutoffDescriptor, ReceiptKey, ReceiptLedgerPort,
-        ReceiptRecordHeader, ReceiptState, ReceiptTaskProjection, ReceiptTerminalOutcome,
-        ReceiptVersion, RequestIdentity, ReserveOutcome, ReservedPhase, ReservedReceipt,
-        V5CanonicalTerminal, V5ToolIdentity, CANCEL_RESERVATION_TTL_MS,
-        MAX_RECEIPT_ENTITLEMENT_BYTES,
-    };
-    use crate::domain::invocation::{DomainResult, InvocationFailure};
-    use crate::domain::invocation::{InvocationId, SafeIdentityHash, TaskId};
-    use crate::infrastructure::daemon::client_v5::V5DaemonProcessOwner;
-    use crate::infrastructure::daemon::identity::{CoreIdentity, DaemonStateDirectory};
-    use crate::infrastructure::daemon::protocol_v5::V5InvocationRequest;
-    use crate::infrastructure::daemon::protocol_v5::{
-        decode_v5_server_response, read_bounded_v5_probe_response_frame, V5EndpointRecord,
-        V5ProbeResponseKind, V5ProbeServerResponse,
-    };
-    use crate::infrastructure::platform::testing::{
-        attempt_retained_directory_replacement_for_test, RetainedDirectoryReplacementOutcome,
-    };
-    use serde_json::json;
-    use sha2::{Digest, Sha256};
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::TcpStream;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::mpsc;
-    use std::thread;
-    use std::time::{Duration, Instant};
-
-    struct CooperativeKnownLongService {
-        entered: mpsc::Sender<()>,
-    }
-
-    impl CanonicalInvocationService for CooperativeKnownLongService {
-        fn prepare(
-            &self,
-            _invocation: &super::super::server::ActorBoundInvocation,
-        ) -> Result<ExecutionClass, Box<DomainResult>> {
-            Ok(ExecutionClass::KnownLong(KnownLongReason::ExternalProcess))
-        }
-
-        fn execute(
-            &self,
-            _invocation: &super::super::server::ActorBoundExecution,
-            cancellation: CancellationToken,
-        ) -> Result<DomainResult, InvocationFailure> {
-            self.entered.send(()).expect("report task execution");
-            while !cancellation.is_cancelled() {
-                thread::yield_now();
-            }
-            Err(InvocationFailure::new(
-                "cancelled",
-                "cooperative task observed cancellation",
-            ))
-        }
-    }
-
-    #[test]
-    fn cancel_task_signals_the_running_v5_canonical_execution() {
-        let root = tempfile::tempdir().expect("temporary cancellation state root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-        let workspace = tempfile::tempdir().expect("temporary cancellation workspace");
-        let source = workspace.path().join("src");
-        std::fs::create_dir_all(&source).expect("create source root");
-        std::fs::write(
-            workspace.path().join("v8project.yaml"),
-            "format: DESIGNER\nsource-set:\n  - name: main\n    type: CONFIGURATION\n    path: src\n",
-        )
-        .expect("write workspace descriptor");
-        std::fs::write(
-            source.join("Configuration.xml"),
-            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Configuration><Properties><Name>Store</Name></Properties><ChildObjects/></Configuration></MetaDataObject>"#,
-        )
-        .expect("write configuration root");
-        let workspace = std::fs::canonicalize(workspace.path()).expect("physical workspace");
-        let identity = CoreIdentity::production_v5();
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_millis(80),
-        )
-        .with_invocation_service(Arc::new(CooperativeKnownLongService {
-            entered: entered_tx,
-        }));
-        let server = thread::spawn(move || run_daemon(config));
-        let _record = wait_for_v5_record(&state_root, &identity);
-        let invocation = V5InvocationRequest::new(
-            InvocationId::new(),
-            TaskId::new(),
-            V5ToolIdentity::View,
-            serde_json::Map::from_iter([(
-                "at".to_owned(),
-                serde_json::Value::String("main:Configuration".to_owned()),
-            )]),
-            workspace.to_string_lossy().into_owned(),
-            7_000,
-        )
-        .expect("valid known-long invocation");
-        let mut owner = V5DaemonProcessOwner::connect_or_spawn(
-            &state_root,
-            identity,
-            std::path::PathBuf::from("unused-existing-v5-endpoint"),
-            Duration::from_millis(300),
-        )
-        .expect("connect v5 owner");
-        let submitted = owner
-            .submit_invocation(invocation)
-            .expect("submit known-long invocation");
-        let task_id = match submitted {
-            V5ServerResponse::Invocation {
-                outcome:
-                    V5InvocationResponse::Task {
-                        snapshot:
-                            super::super::protocol_v5::V5DaemonTaskSnapshot::Working { task_id, .. },
-                    },
-            } => task_id,
-            other => panic!("known-long submission did not return Working: {other:?}"),
-        };
-        if entered_rx.recv_timeout(Duration::from_secs(10)).is_err() {
-            let snapshot = owner.get_task(task_id).expect("inspect stalled Task");
-            panic!("canonical execution did not enter: {snapshot:?}");
-        }
-
-        owner.cancel_task(task_id).expect("cancel running Task");
-        let terminal = owner
-            .wait_task(task_id, 7_000)
-            .expect("wait for cancellation");
-        assert!(matches!(
-            terminal,
-            V5ServerResponse::Task {
-                snapshot: super::super::protocol_v5::V5DaemonTaskSnapshot::Cancelled { .. }
-            }
-        ));
-
-        drop(owner);
-        server
-            .join()
-            .expect("v5 cancellation daemon did not panic")
-            .expect("v5 cancellation daemon exited cleanly");
-    }
-
-    #[test]
-    fn promised_receipt_projects_the_exact_stable_queued_task() {
-        let task = ReceiptTaskProjection::new(
-            "11111111-1111-4111-8111-111111111111"
-                .parse()
-                .expect("valid TaskId"),
-            "22222222-2222-4222-8222-222222222222"
-                .parse()
-                .expect("valid InvocationId"),
-            1_000,
-            1_000,
-            3_600_000,
-            250,
-            1,
-        )
-        .expect("valid Task projection");
-        let digest: crate::application::receipt_ledger::ReceiptKeyDigest =
-            "33".repeat(32).parse().expect("valid receipt digest");
-
-        let snapshot = queued_receipt_task_snapshot(&task, digest.clone(), true);
-
-        assert_eq!(
-            snapshot,
-            super::super::protocol_v5::V5DaemonTaskSnapshot::Queued {
-                task_id: task.task_id(),
-                invocation_id: task.invocation_id(),
-                receipt_key_digest: digest,
-                created_at_epoch_ms: 1_000,
-                updated_at_epoch_ms: 1_000,
-                ttl_ms: 3_600_000,
-                poll_interval_ms: 250,
-                version: 1,
-                cancel_requested: true,
-            }
-        );
-    }
-
-    fn write_json_line(stream: &mut TcpStream, value: &serde_json::Value) {
-        let mut bytes = serde_json::to_vec(value).expect("serialize v5 frame");
-        bytes.push(b'\n');
-        stream.write_all(&bytes).expect("write v5 frame");
-    }
-
-    enum CancelPortFailure {
-        ImmediateCommitUncertain,
-        ImmediateStoreUnavailable,
-        WaitPastOperationDeadline {
-            observed_deadline: mpsc::Sender<Instant>,
-        },
-    }
-
-    struct FailingCancelPort {
-        failure: CancelPortFailure,
-    }
-
-    impl ReceiptLedgerPort for FailingCancelPort {
-        fn generation(&mut self, _deadline: Instant) -> Result<u64, ReceiptLedgerError> {
-            Ok(0)
-        }
-
-        fn reserve(
-            &mut self,
-            _key: ReceiptKey,
-            _original_cutoff: OriginalCutoffDescriptor,
-            _deadline: Instant,
-        ) -> Result<ReserveOutcome, ReceiptLedgerError> {
-            Err(ReceiptLedgerError::StoreUnavailable)
-        }
-
-        fn request_cancel_or_reserve(
-            &mut self,
-            key: ReceiptKey,
-            _cancel_reserved_at_epoch_ms: u64,
-            deadline: Instant,
-        ) -> Result<CancelResolution, ReceiptLedgerError> {
-            match self.failure {
-                CancelPortFailure::ImmediateCommitUncertain => {
-                    Err(ReceiptLedgerError::CommitUncertain {
-                        receipt_key_digest: receipt_key_digest(&key),
-                    })
-                }
-                CancelPortFailure::ImmediateStoreUnavailable => {
-                    Err(ReceiptLedgerError::StoreUnavailable)
-                }
-                CancelPortFailure::WaitPastOperationDeadline {
-                    ref observed_deadline,
-                } => {
-                    observed_deadline
-                        .send(deadline)
-                        .expect("publish live cancel operation deadline");
-                    thread::sleep(
-                        deadline.saturating_duration_since(Instant::now())
-                            + Duration::from_millis(10),
-                    );
-                    Err(ReceiptLedgerError::StoreUnavailable)
-                }
-            }
-        }
-
-        fn expire_cancel_reserved(
-            &mut self,
-            _key: ReceiptKey,
-            _expected_version: ReceiptVersion,
-            _expected_mutation_sequence: u64,
-            _observed_at_epoch_ms: u64,
-            _deadline: Instant,
-        ) -> Result<CancelExpiryOutcome, ReceiptLedgerError> {
-            Err(ReceiptLedgerError::StoreUnavailable)
-        }
-
-        fn publish_direct_terminal(
-            &mut self,
-            _key: &ReceiptKey,
-            _expected_version: ReceiptVersion,
-            _terminal_epoch_ms: u64,
-            _terminal: V5CanonicalTerminal,
-            _deadline: Instant,
-        ) -> Result<CommittedDirectPublication, ReceiptLedgerError> {
-            Err(ReceiptLedgerError::StoreUnavailable)
-        }
-
-        fn recover(
-            &mut self,
-            _key: &ReceiptKey,
-            _deadline: Instant,
-        ) -> Result<ReceiptState, ReceiptLedgerError> {
-            Err(ReceiptLedgerError::StoreUnavailable)
-        }
-    }
-
-    struct SlowReservePort {
-        delay: Duration,
-    }
-
-    impl ReceiptLedgerPort for SlowReservePort {
-        fn generation(&mut self, _deadline: Instant) -> Result<u64, ReceiptLedgerError> {
-            Ok(0)
-        }
-
-        fn reserve(
-            &mut self,
-            key: ReceiptKey,
-            original_cutoff: OriginalCutoffDescriptor,
-            _deadline: Instant,
-        ) -> Result<ReserveOutcome, ReceiptLedgerError> {
-            thread::sleep(self.delay);
-            Ok(ReserveOutcome::Created(ReservedReceipt::new(
-                ReceiptRecordHeader::new(
-                    key.clone(),
-                    receipt_key_digest(&key),
-                    ReceiptVersion::initial(),
-                    1,
-                    512,
-                ),
-                original_cutoff.accepted_epoch_ms(),
-                original_cutoff,
-                ReservedPhase::Unbound,
-                false,
-                MAX_RECEIPT_ENTITLEMENT_BYTES - 512,
-            )))
-        }
-
-        fn request_cancel_or_reserve(
-            &mut self,
-            _key: ReceiptKey,
-            _cancel_reserved_at_epoch_ms: u64,
-            _deadline: Instant,
-        ) -> Result<CancelResolution, ReceiptLedgerError> {
-            Err(ReceiptLedgerError::StoreUnavailable)
-        }
-
-        fn expire_cancel_reserved(
-            &mut self,
-            _key: ReceiptKey,
-            _expected_version: ReceiptVersion,
-            _expected_mutation_sequence: u64,
-            _observed_at_epoch_ms: u64,
-            _deadline: Instant,
-        ) -> Result<CancelExpiryOutcome, ReceiptLedgerError> {
-            Err(ReceiptLedgerError::StoreUnavailable)
-        }
-
-        fn publish_direct_terminal(
-            &mut self,
-            _key: &ReceiptKey,
-            _expected_version: ReceiptVersion,
-            _terminal_epoch_ms: u64,
-            _terminal: V5CanonicalTerminal,
-            _deadline: Instant,
-        ) -> Result<CommittedDirectPublication, ReceiptLedgerError> {
-            Err(ReceiptLedgerError::StoreUnavailable)
-        }
-
-        fn recover(
-            &mut self,
-            _key: &ReceiptKey,
-            _deadline: Instant,
-        ) -> Result<ReceiptState, ReceiptLedgerError> {
-            Err(ReceiptLedgerError::StoreUnavailable)
-        }
-    }
-
-    #[test]
-    fn seven_second_submit_budget_is_not_truncated_by_transport_timeouts() {
-        let root = tempfile::tempdir().expect("temporary long-submit state root");
-        let state_root =
-            std::fs::canonicalize(root.path()).expect("physical long-submit state root");
-        let identity = CoreIdentity::production_v5();
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_millis(80),
-        );
-        let server = thread::spawn(move || {
-            run_daemon_configured(config, |mut runtime| {
-                runtime.receipt_ledger = ReceiptLedgerActor::spawn(SlowReservePort {
-                    delay: Duration::from_millis(5_100),
-                });
-                runtime
-            })
-        });
-        let _record = wait_for_v5_record(&state_root, &identity);
-        let invocation = V5InvocationRequest::new(
-            InvocationId::new(),
-            TaskId::new(),
-            V5ToolIdentity::View,
-            serde_json::Map::new(),
-            "workspace-a".to_owned(),
-            7_000,
-        )
-        .expect("valid long-submit request");
-        let mut owner = V5DaemonProcessOwner::connect_or_spawn(
-            &state_root,
-            identity,
-            std::path::PathBuf::from("unused-existing-v5-endpoint"),
-            Duration::from_millis(300),
-        )
-        .expect("connect long-submit owner");
-        let response = owner.submit_invocation(invocation);
-        drop(owner);
-        let server_result = server.join().expect("join long-submit runtime");
-
-        assert!(
-            matches!(
-                response,
-                Ok(V5ServerResponse::Invocation { .. })
-                    | Ok(V5ServerResponse::Error {
-                        code: V5DaemonErrorCode::StoreFailed
-                    })
-            ),
-            "seven-second reserve must reach the next runtime transition: {response:?}"
-        );
-        assert_eq!(server_result, Ok(()));
-    }
-
-    #[test]
-    fn commit_uncertain_is_returned_before_process_owned_fail_stop_retains_endpoint() {
-        let root = tempfile::tempdir().expect("temporary fail-stop state root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical fail-stop state root");
-        let identity = CoreIdentity::production_v5();
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_secs(30),
-        );
-        let server = thread::spawn(move || {
-            run_daemon_configured(config, |mut runtime| {
-                runtime.receipt_ledger = ReceiptLedgerActor::spawn(FailingCancelPort {
-                    failure: CancelPortFailure::ImmediateCommitUncertain,
-                });
-                runtime
-            })
-        });
-        let record = wait_for_v5_record(&state_root, &identity);
-        let key = ReceiptKey::new(
-            InvocationId::new(),
-            TaskId::new(),
-            RequestIdentity::new(
-                identity.digest().clone(),
-                V5ToolIdentity::View,
-                normalized_arguments_hash(&serde_json::Map::new()),
-                request_scope_hash("workspace-a").expect("request scope"),
-            ),
-        );
-        let mut owner = V5DaemonProcessOwner::connect_or_spawn(
-            &state_root,
-            identity.clone(),
-            std::path::PathBuf::from("unused-existing-v5-endpoint"),
-            Duration::from_millis(300),
-        )
-        .expect("connect fail-stop owner");
-        let response = owner.cancel_invocation(key);
-        drop(owner);
-        let server_result = server.join().expect("join fail-stop runtime");
-        let state = DaemonStateDirectory::open(&state_root, &identity)
-            .expect("reopen fail-stop daemon state");
-        let retained = state
-            .read_v5_endpoint_record()
-            .expect("read retained fail-stop endpoint");
-        let competing_authority = state.acquire_receipt_authority(Duration::from_millis(30));
-
-        assert_eq!(
-            response,
-            Ok(V5ServerResponse::Error {
-                code: V5DaemonErrorCode::StoreCommitUncertain,
-            })
-        );
-        assert_eq!(server_result, Ok(()));
-        assert_eq!(retained, Some(record));
-        assert!(
-            competing_authority.is_err(),
-            "fail-stop released receipt authority before process death"
-        );
-    }
-
-    #[test]
-    fn running_mutation_timeout_preserves_response_margin_or_closes_after_it() {
-        let root = tempfile::tempdir().expect("temporary timeout fail-stop state root");
-        let state_root =
-            std::fs::canonicalize(root.path()).expect("physical timeout fail-stop state root");
-        let identity = CoreIdentity::production_v5();
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_secs(30),
-        );
-        let (operation_deadline_tx, operation_deadline_rx) = mpsc::channel();
-        let server = thread::spawn(move || {
-            run_daemon_configured(config, |mut runtime| {
-                runtime.receipt_ledger = ReceiptLedgerActor::spawn(FailingCancelPort {
-                    failure: CancelPortFailure::WaitPastOperationDeadline {
-                        observed_deadline: operation_deadline_tx,
-                    },
-                });
-                runtime
-            })
-        });
-        let record = wait_for_v5_record(&state_root, &identity);
-        let key = ReceiptKey::new(
-            InvocationId::new(),
-            TaskId::new(),
-            RequestIdentity::new(
-                identity.digest().clone(),
-                V5ToolIdentity::View,
-                normalized_arguments_hash(&serde_json::Map::new()),
-                request_scope_hash("workspace-a").expect("request scope"),
-            ),
-        );
-        let decoded = decode_v5_request_frame(
-            serde_json::to_vec(&V5ClientRequest::CancelInvocation {
-                receipt_key: key.clone(),
-            })
-            .expect("serialize timeout deadline fixture"),
-        )
-        .expect("decode timeout deadline fixture");
-        let request_received_at = Instant::now();
-        let deadlines = v5_request_deadlines(&decoded, request_received_at)
-            .expect("derive timeout response deadlines");
-        assert_eq!(
-            deadlines.operation.duration_since(request_received_at),
-            SESSION_READ_TIMEOUT,
-            "cancel operation keeps its original bounded session budget"
-        );
-        assert_eq!(
-            deadlines.response.duration_since(deadlines.operation),
-            RESPONSE_SERIALIZATION_MARGIN,
-            "response serialization gets exactly one non-renewable margin"
-        );
-        let mut owner = V5DaemonProcessOwner::connect_or_spawn(
-            &state_root,
-            identity.clone(),
-            std::path::PathBuf::from("unused-existing-v5-endpoint"),
-            Duration::from_millis(300),
-        )
-        .expect("connect timeout fail-stop owner");
-        let response = owner.cancel_invocation(key);
-        let response_completed_at = Instant::now();
-        let operation_deadline = operation_deadline_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("observe the live cancel operation deadline");
-        drop(owner);
-        let server_result = server.join().expect("join timeout fail-stop runtime");
-        let state = DaemonStateDirectory::open(&state_root, &identity)
-            .expect("reopen timeout fail-stop daemon state");
-        let retained = state
-            .read_v5_endpoint_record()
-            .expect("read retained timeout fail-stop endpoint");
-        let competing_authority = state.acquire_receipt_authority(Duration::from_millis(30));
-
-        match response {
-            Ok(V5ServerResponse::Error {
-                code: V5DaemonErrorCode::StoreCommitUncertain,
-            }) => {}
-            Err(error) => {
-                assert_eq!(
-                    error, "read protocol-v5 cancel invocation: v5 JSON line ended before data",
-                    "only expiry of the bounded response margin may replace the closed error"
-                );
-                let final_response_deadline = operation_deadline
-                    .checked_add(RESPONSE_SERIALIZATION_MARGIN)
-                    .expect("bounded response deadline");
-                assert!(
-                    response_completed_at >= final_response_deadline,
-                    "transport closed before the live operation deadline and response margin expired"
-                );
-            }
-            unexpected => panic!("unexpected timed-out mutation response: {unexpected:?}"),
-        }
-        assert_eq!(server_result, Ok(()));
-        assert_eq!(retained, Some(record));
-        assert!(
-            competing_authority.is_err(),
-            "timed-out mutation released receipt authority before process death"
-        );
-    }
-
-    #[test]
-    fn fail_stop_transport_margin_starts_after_response_serialization() {
-        struct DelayedResponse(V5ServerResponse);
-
-        impl Serialize for DelayedResponse {
-            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: serde::Serializer,
-            {
-                thread::sleep(RESPONSE_SERIALIZATION_MARGIN + Duration::from_millis(10));
-                self.0.serialize(serializer)
-            }
-        }
-
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind response listener");
-        let address = listener.local_addr().expect("response listener address");
-        let reader = thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept response stream");
-            let mut line = String::new();
-            BufReader::new(stream)
-                .read_line(&mut line)
-                .expect("read fail-stop response");
-            line
-        });
-        let mut stream = TcpStream::connect(address).expect("connect response stream");
-        let observed_at = Instant::now();
-        let expired_response_deadline = observed_at
-            .checked_sub(Duration::from_millis(1))
-            .expect("response deadline can precede the observation");
-        let response = DelayedResponse(V5ServerResponse::Error {
-            code: V5DaemonErrorCode::DurabilityUncertain,
-        });
-
-        assert_eq!(
-            fail_stop_response_write_timeout(expired_response_deadline, observed_at),
-            RESPONSE_SERIALIZATION_MARGIN
-        );
-        write_fail_stop_json_line(&mut stream, &response, expired_response_deadline)
-            .expect("serialized fail-stop response retains a fresh transport margin");
-        assert_eq!(
-            reader.join().expect("join response reader"),
-            "{\"kind\":\"error\",\"code\":\"durability_uncertain\"}\n"
-        );
-    }
-
-    #[test]
-    fn every_fail_stop_store_error_is_written_without_reentering_the_actor() {
-        let root = tempfile::tempdir().expect("temporary store-failure state root");
-        let state_root =
-            std::fs::canonicalize(root.path()).expect("physical store-failure state root");
-        let identity = CoreIdentity::production_v5();
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_secs(30),
-        );
-        let server = thread::spawn(move || {
-            run_daemon_configured(config, |mut runtime| {
-                runtime.receipt_ledger = ReceiptLedgerActor::spawn(FailingCancelPort {
-                    failure: CancelPortFailure::ImmediateStoreUnavailable,
-                });
-                runtime
-            })
-        });
-        let record = wait_for_v5_record(&state_root, &identity);
-        let key = ReceiptKey::new(
-            InvocationId::new(),
-            TaskId::new(),
-            RequestIdentity::new(
-                identity.digest().clone(),
-                V5ToolIdentity::View,
-                normalized_arguments_hash(&serde_json::Map::new()),
-                request_scope_hash("workspace-a").expect("request scope"),
-            ),
-        );
-        let mut owner = V5DaemonProcessOwner::connect_or_spawn(
-            &state_root,
-            identity.clone(),
-            std::path::PathBuf::from("unused-existing-v5-endpoint"),
-            Duration::from_millis(300),
-        )
-        .expect("connect store-failure owner");
-        let response = owner.cancel_invocation(key);
-        drop(owner);
-        let server_result = server.join().expect("join store-failure runtime");
-        let state = DaemonStateDirectory::open(&state_root, &identity)
-            .expect("reopen store-failure daemon state");
-        let retained = state
-            .read_v5_endpoint_record()
-            .expect("read retained store-failure endpoint");
-        let competing_authority = state.acquire_receipt_authority(Duration::from_millis(30));
-
-        assert_eq!(
-            response,
-            Ok(V5ServerResponse::Error {
-                code: V5DaemonErrorCode::StoreFailed,
-            })
-        );
-        assert_eq!(server_result, Ok(()));
-        assert_eq!(retained, Some(record));
-        assert!(
-            competing_authority.is_err(),
-            "store failure released receipt authority before process death"
-        );
-    }
-
-    #[test]
-    fn healthy_runtime_drops_the_actor_store_before_releasing_named_authority() {
-        let source = include_str!("runtime_v5.rs");
-        let start = source
-            .find("struct V5ReceiptRuntime {")
-            .expect("runtime owner declaration");
-        let body = source[start..]
-            .split_once("\n}")
-            .expect("runtime owner declaration end")
-            .0;
-
-        assert!(
-            body.find("receipt_ledger: ReceiptLedgerActor")
-                < body.find("_stable_authority: ReceiptAuthorityLock"),
-            "healthy Rust drop order must join actor/store before authority release"
-        );
-    }
-
-    #[test]
-    fn authenticated_release_closes_only_its_owner_session() {
-        let root = tempfile::tempdir().expect("temporary release state root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-        let identity = CoreIdentity::production_v5();
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_millis(500),
-        );
-        let server = thread::spawn(move || run_daemon(config));
-        let record = wait_for_v5_record(&state_root, &identity);
-        let mut stream = TcpStream::connect(record.loopback_addr().expect("loopback address"))
-            .expect("connect release owner");
-        let mut reader = BufReader::new(stream.try_clone().expect("clone release stream"));
-        write_json_line(
-            &mut stream,
-            &json!({
-                "kind": "hello",
-                "protocolVersion": 5,
-                "token": record.token(),
-                "coreIdentity": identity.as_str(),
-                "ownerLease": "77777777-7777-4777-8777-777777777777"
-            }),
-        );
-        read_bounded_v5_probe_response_frame(&mut reader).expect("read release ready");
-
-        write_json_line(&mut stream, &json!({"kind": "release"}));
-        let released =
-            read_bounded_v5_probe_response_frame(&mut reader).expect("read release response");
-        let released = decode_v5_server_response(&released).expect("decode release response");
-        drop(stream);
-
-        let mut successor = TcpStream::connect(record.loopback_addr().expect("loopback address"))
-            .expect("release must leave the daemon listener available");
-        successor
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("bound successor session read");
-        let mut successor_reader =
-            BufReader::new(successor.try_clone().expect("clone successor stream"));
-        write_json_line(
-            &mut successor,
-            &json!({
-                "kind": "hello",
-                "protocolVersion": 5,
-                "token": record.token(),
-                "coreIdentity": identity.as_str(),
-                "ownerLease": "88888888-8888-4888-8888-888888888888"
-            }),
-        );
-        let successor_ready = read_bounded_v5_probe_response_frame(&mut successor_reader)
-            .expect("released owner must not close successor admission");
-        let successor_ready: V5HandshakeServerResponse =
-            serde_json::from_slice(&successor_ready).expect("decode successor ready response");
-        assert!(successor_ready.matches_record(&record));
-        write_json_line(&mut successor, &json!({"kind": "ping"}));
-        let successor_pong = read_bounded_v5_probe_response_frame(&mut successor_reader)
-            .expect("successor session ping");
-        let successor_pong: V5ProbeServerResponse =
-            serde_json::from_slice(&successor_pong).expect("decode successor pong");
-        assert_eq!(successor_pong.kind(), V5ProbeResponseKind::Pong);
-        write_json_line(&mut successor, &json!({"kind": "release"}));
-        let successor_released = read_bounded_v5_probe_response_frame(&mut successor_reader)
-            .expect("release successor session");
-        assert_eq!(
-            decode_v5_server_response(&successor_released),
-            Ok(V5ServerResponse::Released)
-        );
-        drop(successor);
-
-        server
-            .join()
-            .expect("join released v5 runtime")
-            .expect("released v5 runtime");
-
-        assert_eq!(released, V5ServerResponse::Released);
-    }
-
-    struct ManualEpochClock {
-        epoch_ms: AtomicU64,
-    }
-
-    impl ManualEpochClock {
-        fn new(epoch_ms: u64) -> Self {
-            Self {
-                epoch_ms: AtomicU64::new(epoch_ms),
-            }
-        }
-
-        fn set(&self, epoch_ms: u64) {
-            self.epoch_ms.store(epoch_ms, Ordering::SeqCst);
-        }
-    }
-
-    impl EpochMillisClock for ManualEpochClock {
-        fn now_epoch_millis(&self) -> u64 {
-            self.epoch_ms.load(Ordering::SeqCst)
-        }
-    }
-
-    fn exchange_once_with_epoch(
-        state_root: &std::path::Path,
-        identity: &CoreIdentity,
-        clock: Arc<ManualEpochClock>,
-        exchange: impl FnOnce(&mut V5DaemonProcessOwner) -> Result<V5ServerResponse, String>,
-    ) -> V5ServerResponse {
-        let config = DaemonServerConfig::new(
-            state_root.to_path_buf(),
-            identity.clone(),
-            Duration::from_millis(80),
-        );
-        let server = thread::spawn(move || {
-            run_daemon_configured(config, move |mut runtime| {
-                runtime.epoch_clock = clock;
-                runtime
-            })
-        });
-        let _record = wait_for_v5_record(state_root, identity);
-        let mut owner = V5DaemonProcessOwner::connect_or_spawn(
-            state_root,
-            identity.clone(),
-            std::path::PathBuf::from("unused-existing-v5-endpoint"),
-            Duration::from_millis(300),
-        )
-        .expect("connect authenticated one-shot owner");
-        let response = exchange(&mut owner).expect("exchange one protocol-v5 request");
-        drop(owner);
-        server
-            .join()
-            .expect("join one-shot v5 runtime")
-            .expect("one-shot v5 runtime");
-        response
-    }
-
-    #[test]
-    fn receipt_digest_collision_is_a_fail_stop_store_error_not_caller_identity_mismatch() {
-        let error = ReceiptLedgerError::ReceiptDigestCollision;
-
-        assert!(error.requires_reopen());
-        assert_eq!(daemon_error_code(&error), V5DaemonErrorCode::StoreFailed);
-    }
-
-    #[test]
-    fn cancel_existing_reserved_receipt_returns_the_typed_pending_winner() {
-        let root = tempfile::tempdir().expect("temporary existing-winner state root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-        let identity = CoreIdentity::production_v5();
-        let state = DaemonStateDirectory::open(&state_root, &identity)
-            .expect("open existing-winner daemon state");
-        let runtime = V5ReceiptRuntime::open(
-            &state,
-            &DaemonServerConfig::new(state_root, identity.clone(), Duration::from_millis(50)),
-        )
-        .expect("open protocol-v5 runtime");
-        let key = ReceiptKey::new(
-            InvocationId::new(),
-            TaskId::new(),
-            RequestIdentity::new(
-                identity.digest().clone(),
-                V5ToolIdentity::View,
-                normalized_arguments_hash(&serde_json::Map::new()),
-                request_scope_hash("workspace-a").expect("request scope"),
-            ),
-        );
-        let cutoff = OriginalCutoffDescriptor::new(1_000, 7_000).expect("valid cutoff");
-        runtime
-            .receipt_ledger
-            .reserve(key.clone(), cutoff, Instant::now() + Duration::from_secs(2))
-            .expect("reserve exact receipt");
-
-        let reply = runtime
-            .cancel_invocation(key.clone(), 2_000, Instant::now() + Duration::from_secs(2))
-            .expect("return the existing reserved winner");
-
-        assert!(matches!(
-            reply,
-            V5RuntimeReply::Json(V5ServerResponse::Invocation {
-                outcome: V5InvocationResponse::ReceiptPending {
-                    receipt_key,
-                    phase: V5InvocationPhase::ReservedUnbound,
-                    accepted_epoch_ms: 1_000,
-                    original_budget_ms: 7_000,
-                    cancel_requested: true,
-                },
-            }) if receipt_key == key
-        ));
-    }
-
-    #[test]
-    fn startup_terminalizes_pre_task_receipts_without_replaying_domain_work() {
-        for (phase, cancel_requested, expected) in [
-            (
-                ReservedPhase::Unbound,
-                false,
-                ReceiptTerminalOutcome::Failed {
-                    reason: V5SafeFailureReason::Interrupted,
-                },
-            ),
-            (
-                ReservedPhase::ActorBound {
-                    bound_workspace_identity: SafeIdentityHash::from_sha256(
-                        Sha256::digest(b"startup-actor").into(),
-                    ),
-                },
-                true,
-                ReceiptTerminalOutcome::Cancelled,
-            ),
-            (
-                ReservedPhase::Begun {
-                    bound_workspace_identity: SafeIdentityHash::from_sha256(
-                        Sha256::digest(b"startup-begun").into(),
-                    ),
-                },
-                true,
-                ReceiptTerminalOutcome::Failed {
-                    reason: V5SafeFailureReason::OutcomeUncertain,
-                },
-            ),
-        ] {
-            let root = tempfile::tempdir().expect("temporary startup recovery root");
-            let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-            let identity = CoreIdentity::production_v5();
-            let state = DaemonStateDirectory::open(&state_root, &identity)
-                .expect("open startup recovery daemon state");
-            let config = DaemonServerConfig::new(
-                state_root.clone(),
-                identity.clone(),
-                Duration::from_millis(50),
-            );
-            let runtime = V5ReceiptRuntime::open(&state, &config).expect("open initial runtime");
-            let key = ReceiptKey::new(
-                InvocationId::new(),
-                TaskId::new(),
-                RequestIdentity::new(
-                    identity.digest().clone(),
-                    V5ToolIdentity::View,
-                    normalized_arguments_hash(&serde_json::Map::new()),
-                    request_scope_hash("workspace-a").expect("request scope"),
-                ),
-            );
-            let deadline = Instant::now() + Duration::from_secs(2);
-            let reserved = runtime
-                .receipt_ledger
-                .reserve(
-                    key.clone(),
-                    OriginalCutoffDescriptor::new(1_000, 7_000).expect("valid cutoff"),
-                    deadline,
-                )
-                .expect("reserve startup receipt")
-                .into_reservation()
-                .expect("new startup receipt");
-            let mut current_version = reserved.record_version();
-            match phase {
-                ReservedPhase::Unbound => {}
-                ReservedPhase::ActorBound {
-                    bound_workspace_identity,
-                } => {
-                    current_version = runtime
-                        .receipt_ledger
-                        .bind_reserved_actor(
-                            key.clone(),
-                            current_version,
-                            bound_workspace_identity,
-                            deadline,
-                        )
-                        .expect("bind startup actor")
-                        .record_version();
-                }
-                ReservedPhase::Begun {
-                    bound_workspace_identity,
-                } => {
-                    let bound = runtime
-                        .receipt_ledger
-                        .bind_reserved_actor(
-                            key.clone(),
-                            current_version,
-                            bound_workspace_identity,
-                            deadline,
-                        )
-                        .expect("bind begun startup actor");
-                    runtime
-                        .receipt_ledger
-                        .mark_reserved_begun(key.clone(), bound.record_version(), deadline)
-                        .expect("mark startup receipt begun");
-                }
-            }
-            if cancel_requested {
-                runtime
-                    .receipt_ledger
-                    .request_cancel_or_reserve(key.clone(), 2_000, deadline)
-                    .expect("persist startup cancellation");
-            }
-            drop(runtime);
-
-            let reopened = V5ReceiptRuntime::open(&state, &config).expect("reconcile startup");
-            let recovered = reopened
-                .receipt_ledger
-                .recover(key, Instant::now() + Duration::from_secs(2))
-                .expect("read reconciled startup receipt");
-            let ReceiptState::DirectTerminalUnacked(receipt) = recovered else {
-                panic!("startup must publish one direct terminal")
-            };
-            assert_eq!(receipt.terminal().outcome(), &expected);
-        }
-    }
-
-    #[test]
-    fn startup_terminalizes_unbound_promised_task_without_task_store_create() {
-        for (cancel_requested, expected) in [
-            (
-                false,
-                ReceiptTerminalOutcome::Failed {
-                    reason: V5SafeFailureReason::Interrupted,
-                },
-            ),
-            (true, ReceiptTerminalOutcome::Cancelled),
-        ] {
-            let root = tempfile::tempdir().expect("temporary promised recovery root");
-            let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-            let identity = CoreIdentity::production_v5();
-            let state = DaemonStateDirectory::open(&state_root, &identity)
-                .expect("open promised recovery daemon state");
-            let config = DaemonServerConfig::new(
-                state_root.clone(),
-                identity.clone(),
-                Duration::from_millis(50),
-            );
-            let runtime = V5ReceiptRuntime::open(&state, &config).expect("open initial runtime");
-            let key = ReceiptKey::new(
-                InvocationId::new(),
-                TaskId::new(),
-                RequestIdentity::new(
-                    identity.digest().clone(),
-                    V5ToolIdentity::View,
-                    normalized_arguments_hash(&serde_json::Map::new()),
-                    request_scope_hash("workspace-a").expect("request scope"),
-                ),
-            );
-            let deadline = Instant::now() + Duration::from_secs(2);
-            let reserved = runtime
-                .receipt_ledger
-                .reserve(
-                    key.clone(),
-                    OriginalCutoffDescriptor::new(1_000, 7_000).expect("valid cutoff"),
-                    deadline,
-                )
-                .expect("reserve promised startup receipt")
-                .into_reservation()
-                .expect("new promised startup receipt");
-            let promised = runtime
-                .receipt_ledger
-                .promise_task_unbound(
-                    key.clone(),
-                    reserved.record_version(),
-                    1_007,
-                    3_600_000,
-                    V5_TASK_POLL_INTERVAL_MS,
-                    deadline,
-                )
-                .expect("promise startup Task");
-            if cancel_requested {
-                runtime
-                    .receipt_ledger
-                    .request_task_cancel(
-                        key.clone(),
-                        TaskCancellationReceipt::PromisedUnbound(promised),
-                        deadline,
-                    )
-                    .expect("persist promised Task cancellation");
-            }
-            drop(runtime);
-
-            let reopened = V5ReceiptRuntime::open(&state, &config).expect("reconcile startup");
-            let recovered = reopened
-                .receipt_ledger
-                .recover(key, Instant::now() + Duration::from_secs(2))
-                .expect("read reconciled promised Task receipt");
-            let ReceiptState::TaskTerminalReceiptBacked(receipt) = recovered else {
-                panic!("startup must publish one receipt-backed Task terminal")
-            };
-            assert_eq!(receipt.terminal().outcome(), &expected);
-            assert_eq!(reopened.task_projection.recovery.entries().len(), 0);
-        }
-    }
-
-    #[test]
-    fn startup_materializes_and_terminalizes_actor_bound_promised_task() {
-        for cancel_requested in [false, true] {
-            let root = tempfile::tempdir().expect("temporary actor-bound recovery root");
-            let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-            let identity = CoreIdentity::production_v5();
-            let state = DaemonStateDirectory::open(&state_root, &identity)
-                .expect("open actor-bound recovery daemon state");
-            let config = DaemonServerConfig::new(
-                state_root.clone(),
-                identity.clone(),
-                Duration::from_millis(50),
-            );
-            let runtime = V5ReceiptRuntime::open(&state, &config).expect("open initial runtime");
-            let key = ReceiptKey::new(
-                InvocationId::new(),
-                TaskId::new(),
-                RequestIdentity::new(
-                    identity.digest().clone(),
-                    V5ToolIdentity::View,
-                    normalized_arguments_hash(&serde_json::Map::new()),
-                    request_scope_hash("workspace-a").expect("request scope"),
-                ),
-            );
-            let deadline = Instant::now() + Duration::from_secs(2);
-            let reserved = runtime
-                .receipt_ledger
-                .reserve(
-                    key.clone(),
-                    OriginalCutoffDescriptor::new(1_000, 7_000).expect("valid cutoff"),
-                    deadline,
-                )
-                .expect("reserve actor-bound startup receipt")
-                .into_reservation()
-                .expect("new actor-bound startup receipt");
-            let promised = runtime
-                .receipt_ledger
-                .promise_task_unbound(
-                    key.clone(),
-                    reserved.record_version(),
-                    1_007,
-                    3_600_000,
-                    V5_TASK_POLL_INTERVAL_MS,
-                    deadline,
-                )
-                .expect("promise startup Task");
-            let actor_bound = runtime
-                .receipt_ledger
-                .bind_promised_task_actor(
-                    key.clone(),
-                    promised.record_version(),
-                    SafeIdentityHash::from_sha256(Sha256::digest(b"startup-actor").into()),
-                    deadline,
-                )
-                .expect("bind promised startup Task actor");
-            if cancel_requested {
-                runtime
-                    .receipt_ledger
-                    .request_task_cancel(
-                        key.clone(),
-                        TaskCancellationReceipt::PromisedActorBound(actor_bound),
-                        deadline,
-                    )
-                    .expect("persist actor-bound startup cancellation");
-            }
-            drop(runtime);
-
-            let reopened = V5ReceiptRuntime::open(&state, &config).expect("reconcile startup");
-            assert_eq!(
-                reopened
-                    .receipt_ledger
-                    .recover(key.clone(), Instant::now() + Duration::from_secs(2)),
-                Err(ReceiptLedgerError::ReceiptNotFound)
-            );
-            let snapshot = reopened
-                .resolve_task(
-                    key.reserved_task_id(),
-                    Instant::now() + Duration::from_secs(2),
-                )
-                .expect("resolve recovered actor-bound Task");
-            match (cancel_requested, snapshot) {
-                (
-                    false,
-                    crate::infrastructure::daemon::protocol_v5::V5DaemonTaskSnapshot::Failed {
-                        reason: V5SafeFailureReason::Interrupted,
-                        cancel_requested: false,
-                        ..
-                    },
-                )
-                | (
-                    true,
-                    crate::infrastructure::daemon::protocol_v5::V5DaemonTaskSnapshot::Cancelled {
-                        cancel_requested: true,
-                        ..
-                    },
-                ) => {}
-                (_, other) => panic!("unexpected recovered actor-bound Task: {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn startup_materializes_handoff_without_replaying_begun_work() {
-        for (phase, cancel_requested) in [
-            (AttemptPhase::NotBegun, false),
-            (AttemptPhase::NotBegun, true),
-            (AttemptPhase::Begun, false),
-            (AttemptPhase::Begun, true),
-        ] {
-            let root = tempfile::tempdir().expect("temporary handoff recovery root");
-            let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-            let identity = CoreIdentity::production_v5();
-            let state = DaemonStateDirectory::open(&state_root, &identity)
-                .expect("open handoff recovery daemon state");
-            let config = DaemonServerConfig::new(
-                state_root.clone(),
-                identity.clone(),
-                Duration::from_millis(50),
-            );
-            let runtime = V5ReceiptRuntime::open(&state, &config).expect("open initial runtime");
-            let key = ReceiptKey::new(
-                InvocationId::new(),
-                TaskId::new(),
-                RequestIdentity::new(
-                    identity.digest().clone(),
-                    V5ToolIdentity::View,
-                    normalized_arguments_hash(&serde_json::Map::new()),
-                    request_scope_hash("workspace-a").expect("request scope"),
-                ),
-            );
-            let deadline = Instant::now() + Duration::from_secs(2);
-            let reserved = runtime
-                .receipt_ledger
-                .reserve(
-                    key.clone(),
-                    OriginalCutoffDescriptor::new(1_000, 7_000).expect("valid cutoff"),
-                    deadline,
-                )
-                .expect("reserve handoff startup receipt")
-                .into_reservation()
-                .expect("new handoff startup receipt");
-            let bound = runtime
-                .receipt_ledger
-                .bind_reserved_actor(
-                    key.clone(),
-                    reserved.record_version(),
-                    SafeIdentityHash::from_sha256(Sha256::digest(b"startup-handoff").into()),
-                    deadline,
-                )
-                .expect("bind handoff startup actor");
-            let version = match phase {
-                AttemptPhase::NotBegun => bound.record_version(),
-                AttemptPhase::Begun => runtime
-                    .receipt_ledger
-                    .mark_reserved_begun(key.clone(), bound.record_version(), deadline)
-                    .expect("mark startup handoff begun")
-                    .record_version(),
-            };
-            let handoff = runtime
-                .receipt_ledger
-                .begin_bound_task_handoff(
-                    key.clone(),
-                    version,
-                    1_009,
-                    3_600_000,
-                    V5_TASK_POLL_INTERVAL_MS,
-                    deadline,
-                )
-                .expect("persist startup Task handoff");
-            if cancel_requested {
-                runtime
-                    .receipt_ledger
-                    .request_task_cancel(
-                        key.clone(),
-                        TaskCancellationReceipt::HandoffActorBound(handoff),
-                        deadline,
-                    )
-                    .expect("persist startup handoff cancellation");
-            }
-            drop(runtime);
-
-            let reopened = V5ReceiptRuntime::open(&state, &config).expect("reconcile startup");
-            assert_eq!(
-                reopened
-                    .receipt_ledger
-                    .recover(key.clone(), Instant::now() + Duration::from_secs(2)),
-                Err(ReceiptLedgerError::ReceiptNotFound)
-            );
-            let snapshot = reopened
-                .resolve_task(
-                    key.reserved_task_id(),
-                    Instant::now() + Duration::from_secs(2),
-                )
-                .expect("resolve recovered handoff Task");
-            match (phase, cancel_requested, snapshot) {
-                (
-                    AttemptPhase::NotBegun,
-                    false,
-                    crate::infrastructure::daemon::protocol_v5::V5DaemonTaskSnapshot::Failed {
-                        reason: V5SafeFailureReason::Interrupted,
-                        cancel_requested: false,
-                        ..
-                    },
-                )
-                | (
-                    AttemptPhase::NotBegun,
-                    true,
-                    crate::infrastructure::daemon::protocol_v5::V5DaemonTaskSnapshot::Cancelled {
-                        cancel_requested: true,
-                        ..
-                    },
-                )
-                | (
-                    AttemptPhase::Begun,
-                    false,
-                    crate::infrastructure::daemon::protocol_v5::V5DaemonTaskSnapshot::Failed {
-                        reason: V5SafeFailureReason::OutcomeUncertain,
-                        cancel_requested: false,
-                        ..
-                    },
-                )
-                | (
-                    AttemptPhase::Begun,
-                    true,
-                    crate::infrastructure::daemon::protocol_v5::V5DaemonTaskSnapshot::Failed {
-                        reason: V5SafeFailureReason::OutcomeUncertain,
-                        cancel_requested: true,
-                        ..
-                    },
-                ) => {}
-                (_, _, other) => panic!("unexpected recovered handoff Task: {other:?}"),
-            }
-        }
-    }
-
-    fn materialize_startup_task_bound(
-        runtime: &V5ReceiptRuntime,
-        identity: &CoreIdentity,
-        phase: AttemptPhase,
-    ) -> (ReceiptKey, V5StoredInvocationRecord, TaskBoundReceipt) {
-        let key = ReceiptKey::new(
-            InvocationId::new(),
-            TaskId::new(),
-            RequestIdentity::new(
-                identity.digest().clone(),
-                V5ToolIdentity::View,
-                normalized_arguments_hash(&serde_json::Map::new()),
-                request_scope_hash("workspace-a").expect("request scope"),
-            ),
-        );
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let reserved = runtime
-            .receipt_ledger
-            .reserve(
-                key.clone(),
-                OriginalCutoffDescriptor::new(1_000, 7_000).expect("valid cutoff"),
-                deadline,
-            )
-            .expect("reserve materialized startup receipt")
-            .into_reservation()
-            .expect("new materialized startup receipt");
-        let actor_bound = runtime
-            .receipt_ledger
-            .bind_reserved_actor(
-                key.clone(),
-                reserved.record_version(),
-                SafeIdentityHash::from_sha256(Sha256::digest(b"materialized-startup").into()),
-                deadline,
-            )
-            .expect("bind materialized startup actor");
-        let receipt_version = match phase {
-            AttemptPhase::NotBegun => actor_bound.record_version(),
-            AttemptPhase::Begun => runtime
-                .receipt_ledger
-                .mark_reserved_begun(key.clone(), actor_bound.record_version(), deadline)
-                .expect("mark materialized startup receipt begun")
-                .record_version(),
-        };
-        let handoff = runtime
-            .receipt_ledger
-            .begin_bound_task_handoff(
-                key.clone(),
-                receipt_version,
-                1_009,
-                3_600_000,
-                V5_TASK_POLL_INTERVAL_MS,
-                deadline,
-            )
-            .expect("begin materialized startup handoff");
-        let (record, task_bound) = runtime
-            .task_projection
-            .materialize_bound_handoff(
-                &handoff,
-                1_009,
-                deadline,
-                #[cfg(feature = "receipt-ledger-test-support")]
-                &runtime.telemetry,
-            )
-            .unwrap_or_else(|failure| panic!("materialize startup TaskBound: {}", failure.error));
-        let task_bound = runtime
-            .receipt_ledger
-            .complete_bound_task_handoff(
-                key.clone(),
-                handoff.record_version(),
-                task_bound,
-                deadline,
-            )
-            .expect("complete startup TaskBound ownership");
-        (key, record, task_bound)
-    }
-
-    #[cfg(feature = "receipt-ledger-test-support")]
-    #[test]
-    fn concurrent_terminal_retirement_is_idempotent() {
-        let root = tempfile::tempdir().expect("temporary retirement-race state root");
-        let state_root =
-            std::fs::canonicalize(root.path()).expect("physical retirement-race state root");
-        let identity = CoreIdentity::production_v5();
-        let clock = Arc::new(ManualEpochClock::new(1_000));
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_millis(50),
-        )
-        .with_v5_epoch_clock_for_test(clock.clone());
-        let state = DaemonStateDirectory::open(&state_root, &identity)
-            .expect("open retirement-race daemon state");
-        let runtime =
-            V5ReceiptRuntime::open(&state, &config).expect("open retirement-race runtime");
-        let (_key, queued, task_bound) =
-            materialize_startup_task_bound(&runtime, &identity, AttemptPhase::NotBegun);
-        clock.set(2_000);
-        let provider_deadline = crate::domain::code_intelligence::ProviderDeadline::new(
-            Instant::now() + Duration::from_secs(2),
-        );
-        let terminal = runtime
-            .task_projection
-            .task_store
-            .terminalize_recovered_exact(
-                &queued.identity(),
-                queued.version,
-                RecoveryTerminalReason::InterruptedBeforeExecution,
-                provider_deadline,
-            )
-            .expect("terminalize retirement-race Task");
-        let V5StoredTask::Failed {
-            terminal_epoch_ms,
-            terminal_digest,
-            ..
-        } = &terminal.task
-        else {
-            panic!("retirement-race Task must be terminal")
-        };
-        runtime
-            .task_projection
-            .lifecycle_links
-            .publish_task_terminal_bound(
-                &task_bound,
-                receipt_task_projection_from_store(&terminal)
-                    .unwrap_or_else(|failure| panic!("project terminal Task: {}", failure.error)),
-                terminal.version,
-                ClosedTerminalStatus::Failed,
-                terminal_digest.clone(),
-                *terminal_epoch_ms,
-                provider_deadline,
-            )
-            .expect("publish retirement-race terminal link");
-        clock.set(4_000_000);
-
-        let barrier = Arc::new(std::sync::Barrier::new(2));
-        runtime
-            .task_projection
-            .install_retirement_snapshot_barrier_for_test(barrier);
-        let runtime = Arc::new(runtime);
-        let workers = (0..2)
-            .map(|_| {
-                let runtime = Arc::clone(&runtime);
-                thread::spawn(move || {
-                    runtime
-                        .task_projection
-                        .retire_expired_terminal_tasks(Instant::now() + Duration::from_secs(2))
-                })
-            })
-            .collect::<Vec<_>>();
-        let outcomes = workers
-            .into_iter()
-            .map(|worker| worker.join().expect("join retirement worker"))
-            .collect::<Vec<_>>();
-
-        assert!(
-            outcomes.iter().all(Result::is_ok),
-            "ordinary concurrent retirement produced a fail-stop failure"
-        );
-    }
-
-    #[test]
-    fn startup_terminalizes_already_materialized_not_begun_task_bound() {
-        for cancel_requested in [false, true] {
-            let root = tempfile::tempdir().expect("temporary materialized TaskBound root");
-            let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-            let identity = CoreIdentity::production_v5();
-            let state = DaemonStateDirectory::open(&state_root, &identity)
-                .expect("open materialized TaskBound daemon state");
-            let config = DaemonServerConfig::new(
-                state_root.clone(),
-                identity.clone(),
-                Duration::from_millis(50),
-            );
-            let runtime = V5ReceiptRuntime::open(&state, &config).expect("open initial runtime");
-            let (key, _record, _task_bound) =
-                materialize_startup_task_bound(&runtime, &identity, AttemptPhase::NotBegun);
-            if cancel_requested {
-                runtime
-                    .task_projection
-                    .cancel_bound_task(
-                        key.reserved_task_id(),
-                        Instant::now() + Duration::from_secs(2),
-                    )
-                    .unwrap_or_else(|failure| {
-                        panic!("request materialized Task cancellation: {}", failure.error)
-                    })
-                    .expect("materialized Task exists");
-            }
-            drop(runtime);
-
-            let reopened = V5ReceiptRuntime::open(&state, &config)
-                .expect("reconcile already materialized TaskBound");
-            let snapshot = reopened
-                .resolve_task(
-                    key.reserved_task_id(),
-                    Instant::now() + Duration::from_secs(2),
-                )
-                .expect("resolve reconciled materialized Task");
-            match (cancel_requested, snapshot) {
-                (
-                    false,
-                    crate::infrastructure::daemon::protocol_v5::V5DaemonTaskSnapshot::Failed {
-                        reason: V5SafeFailureReason::Interrupted,
-                        ..
-                    },
-                )
-                | (
-                    true,
-                    crate::infrastructure::daemon::protocol_v5::V5DaemonTaskSnapshot::Cancelled {
-                        cancel_requested: true,
-                        ..
-                    },
-                ) => {}
-                (_, other) => panic!("unexpected materialized TaskBound recovery: {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn startup_terminalizes_exact_working_begun_task_bound_as_outcome_uncertain() {
-        let root = tempfile::tempdir().expect("temporary begun TaskBound root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-        let identity = CoreIdentity::production_v5();
-        let state = DaemonStateDirectory::open(&state_root, &identity)
-            .expect("open begun TaskBound daemon state");
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_millis(50),
-        );
-        let runtime = V5ReceiptRuntime::open(&state, &config).expect("open initial runtime");
-        let (key, record, task_bound) =
-            materialize_startup_task_bound(&runtime, &identity, AttemptPhase::Begun);
-        let (_working, _working_bound) = runtime
-            .task_projection
-            .start_bound_task(&task_bound, record, Instant::now() + Duration::from_secs(2))
-            .unwrap_or_else(|failure| panic!("start exact begun Task: {}", failure.error));
-        drop(runtime);
-
-        let reopened =
-            V5ReceiptRuntime::open(&state, &config).expect("reconcile exact begun TaskBound");
-        assert!(matches!(
-            reopened
-                .resolve_task(
-                    key.reserved_task_id(),
-                    Instant::now() + Duration::from_secs(2)
-                )
-                .expect("resolve reconciled begun Task"),
-            crate::infrastructure::daemon::protocol_v5::V5DaemonTaskSnapshot::Failed {
-                reason: V5SafeFailureReason::OutcomeUncertain,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn startup_rejects_queued_begun_task_bound_without_mutation() {
-        let root = tempfile::tempdir().expect("temporary invalid begun TaskBound root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-        let identity = CoreIdentity::production_v5();
-        let state = DaemonStateDirectory::open(&state_root, &identity)
-            .expect("open invalid begun TaskBound daemon state");
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_millis(50),
-        );
-        let runtime = V5ReceiptRuntime::open(&state, &config).expect("open initial runtime");
-        let (key, queued, task_bound) =
-            materialize_startup_task_bound(&runtime, &identity, AttemptPhase::NotBegun);
-        assert_eq!(queued.task, V5StoredTask::Queued);
-        runtime
-            .task_projection
-            .lifecycle_links
-            .mark_task_bound_begun(
-                &task_bound,
-                queued.version,
-                queued.updated_at_epoch_ms,
-                crate::domain::code_intelligence::ProviderDeadline::new(
-                    Instant::now() + Duration::from_secs(2),
-                ),
-            )
-            .expect("mark lifecycle link begun without advancing the queued Task fixture");
-        drop(runtime);
-
-        let error = match V5ReceiptRuntime::open(&state, &config) {
-            Ok(_) => panic!("queued begun TaskBound must fail-stop startup"),
-            Err(error) => error,
-        };
-        assert!(error.contains("TaskBound Begun requires exact Working Task"));
-
-        let task_root = RetainedDirectoryCapability::open(&state.path().join("tasks"))
-            .expect("retain TaskStore after failed startup");
-        let (store, recovery) = FileInvocationStoreV5::open_retained_directory_inspect_only(
-            task_root,
-            Arc::new(SystemEpochMillisClock),
-            crate::domain::code_intelligence::ProviderDeadline::new(
-                Instant::now() + Duration::from_secs(2),
-            ),
-        )
-        .expect("inspect TaskStore after failed startup");
-        assert_eq!(
-            store
-                .get(
-                    key.reserved_task_id(),
-                    crate::domain::code_intelligence::ProviderDeadline::new(
-                        Instant::now() + Duration::from_secs(2),
-                    ),
-                )
-                .expect("read unchanged queued Task"),
-            queued
-        );
-        assert_eq!(recovery.entries().len(), 1);
-    }
-
-    #[test]
-    fn startup_rejects_active_task_without_lifecycle_link_without_mutation() {
-        let root = tempfile::tempdir().expect("temporary orphan Task root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-        let identity = CoreIdentity::production_v5();
-        let state = DaemonStateDirectory::open(&state_root, &identity)
-            .expect("open orphan Task daemon state");
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_millis(50),
-        );
-        let runtime = V5ReceiptRuntime::open(&state, &config).expect("open initial runtime");
-        let key = ReceiptKey::new(
-            InvocationId::new(),
-            TaskId::new(),
-            RequestIdentity::new(
-                identity.digest().clone(),
-                V5ToolIdentity::View,
-                normalized_arguments_hash(&serde_json::Map::new()),
-                request_scope_hash("workspace-a").expect("request scope"),
-            ),
-        );
-        let workspace_identity =
-            SafeIdentityHash::from_sha256(Sha256::digest(b"orphan-startup").into());
-        let orphan = runtime
-            .task_projection
-            .task_store
-            .create_exact(
-                NewV5InvocationRecord::new(
-                    V5TaskIdentity::new(
-                        key.reserved_task_id(),
-                        key.invocation_id(),
-                        receipt_key_digest(&key),
-                    ),
-                    key.tool(),
-                    key.normalized_arguments_hash().clone(),
-                    workspace_identity,
-                    V5_TASK_POLL_INTERVAL_MS,
-                    3_600_000,
-                )
-                .with_initial_epoch_ms(1_009),
-                crate::domain::code_intelligence::ProviderDeadline::new(
-                    Instant::now() + Duration::from_secs(2),
-                ),
-            )
-            .expect("create orphan startup Task");
-        drop(runtime);
-
-        let error = match V5ReceiptRuntime::open(&state, &config) {
-            Ok(_) => panic!("active Task without lifecycle link must fail-stop startup"),
-            Err(error) => error,
-        };
-        assert!(
-            error.contains("TaskStore Task has no exact lifecycle link"),
-            "unexpected startup failure: {error}"
-        );
-
-        let task_root = RetainedDirectoryCapability::open(&state.path().join("tasks"))
-            .expect("retain orphan TaskStore after failed startup");
-        let (store, recovery) = FileInvocationStoreV5::open_retained_directory_inspect_only(
-            task_root,
-            Arc::new(SystemEpochMillisClock),
-            crate::domain::code_intelligence::ProviderDeadline::new(
-                Instant::now() + Duration::from_secs(2),
-            ),
-        )
-        .expect("inspect orphan TaskStore after failed startup");
-        assert_eq!(
-            store
-                .get(
-                    key.reserved_task_id(),
-                    crate::domain::code_intelligence::ProviderDeadline::new(
-                        Instant::now() + Duration::from_secs(2),
-                    ),
-                )
-                .expect("read unchanged orphan Task"),
-            orphan
-        );
-        assert_eq!(recovery.entries().len(), 1);
-    }
-
-    #[test]
-    fn startup_receipt_loop_completes_exact_reserved_link_with_preexisting_queued_task() {
-        let root = tempfile::tempdir().expect("temporary preexisting handoff root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-        let identity = CoreIdentity::production_v5();
-        let state = DaemonStateDirectory::open(&state_root, &identity)
-            .expect("open preexisting handoff daemon state");
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_millis(50),
-        );
-        let runtime = V5ReceiptRuntime::open(&state, &config).expect("open initial runtime");
-        let key = ReceiptKey::new(
-            InvocationId::new(),
-            TaskId::new(),
-            RequestIdentity::new(
-                identity.digest().clone(),
-                V5ToolIdentity::View,
-                normalized_arguments_hash(&serde_json::Map::new()),
-                request_scope_hash("workspace-a").expect("request scope"),
-            ),
-        );
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let reserved = runtime
-            .receipt_ledger
-            .reserve(
-                key.clone(),
-                OriginalCutoffDescriptor::new(1_000, 7_000).expect("valid cutoff"),
-                deadline,
-            )
-            .expect("reserve preexisting handoff receipt")
-            .into_reservation()
-            .expect("new preexisting handoff receipt");
-        let workspace_identity =
-            SafeIdentityHash::from_sha256(Sha256::digest(b"preexisting-handoff").into());
-        let actor_bound = runtime
-            .receipt_ledger
-            .bind_reserved_actor(
-                key.clone(),
-                reserved.record_version(),
-                workspace_identity.clone(),
-                deadline,
-            )
-            .expect("bind preexisting handoff actor");
-        let handoff = runtime
-            .receipt_ledger
-            .begin_bound_task_handoff(
-                key.clone(),
-                actor_bound.record_version(),
-                1_009,
-                3_600_000,
-                V5_TASK_POLL_INTERVAL_MS,
-                deadline,
-            )
-            .expect("begin preexisting handoff");
-        runtime
-            .task_projection
-            .lifecycle_links
-            .reserve_task_link(
-                key.clone(),
-                handoff.link().clone(),
-                crate::domain::code_intelligence::ProviderDeadline::new(deadline),
-            )
-            .expect("reserve exact preexisting Task link");
-        runtime
-            .task_projection
-            .task_store
-            .create_exact(
-                NewV5InvocationRecord::new(
-                    V5TaskIdentity::new(
-                        key.reserved_task_id(),
-                        key.invocation_id(),
-                        receipt_key_digest(&key),
-                    ),
-                    key.tool(),
-                    key.normalized_arguments_hash().clone(),
-                    workspace_identity,
-                    V5_TASK_POLL_INTERVAL_MS,
-                    3_600_000,
-                )
-                .with_initial_epoch_ms(1_009),
-                crate::domain::code_intelligence::ProviderDeadline::new(deadline),
-            )
-            .expect("create exact preexisting queued Task");
-        drop(runtime);
-
-        let reopened = V5ReceiptRuntime::open(&state, &config)
-            .expect("receipt loop completes preexisting handoff");
-        assert!(matches!(
-            reopened
-                .resolve_task(
-                    key.reserved_task_id(),
-                    Instant::now() + Duration::from_secs(2)
-                )
-                .expect("resolve preexisting handoff Task"),
-            crate::infrastructure::daemon::protocol_v5::V5DaemonTaskSnapshot::Failed {
-                reason: V5SafeFailureReason::Interrupted,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn startup_rejects_preexisting_handoff_task_without_prior_link_reservation() {
-        let root = tempfile::tempdir().expect("temporary missing handoff reservation root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-        let identity = CoreIdentity::production_v5();
-        let state = DaemonStateDirectory::open(&state_root, &identity)
-            .expect("open missing handoff reservation daemon state");
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_millis(50),
-        );
-        let runtime = V5ReceiptRuntime::open(&state, &config).expect("open initial runtime");
-        let key = ReceiptKey::new(
-            InvocationId::new(),
-            TaskId::new(),
-            RequestIdentity::new(
-                identity.digest().clone(),
-                V5ToolIdentity::View,
-                normalized_arguments_hash(&serde_json::Map::new()),
-                request_scope_hash("workspace-a").expect("request scope"),
-            ),
-        );
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let reserved = runtime
-            .receipt_ledger
-            .reserve(
-                key.clone(),
-                OriginalCutoffDescriptor::new(1_000, 7_000).expect("valid cutoff"),
-                deadline,
-            )
-            .expect("reserve missing-reservation handoff receipt")
-            .into_reservation()
-            .expect("new missing-reservation handoff receipt");
-        let workspace_identity =
-            SafeIdentityHash::from_sha256(Sha256::digest(b"missing-handoff-reservation").into());
-        let actor_bound = runtime
-            .receipt_ledger
-            .bind_reserved_actor(
-                key.clone(),
-                reserved.record_version(),
-                workspace_identity.clone(),
-                deadline,
-            )
-            .expect("bind missing-reservation handoff actor");
-        runtime
-            .receipt_ledger
-            .begin_bound_task_handoff(
-                key.clone(),
-                actor_bound.record_version(),
-                1_009,
-                3_600_000,
-                V5_TASK_POLL_INTERVAL_MS,
-                deadline,
-            )
-            .expect("begin missing-reservation handoff");
-        let queued = runtime
-            .task_projection
-            .task_store
-            .create_exact(
-                NewV5InvocationRecord::new(
-                    V5TaskIdentity::new(
-                        key.reserved_task_id(),
-                        key.invocation_id(),
-                        receipt_key_digest(&key),
-                    ),
-                    key.tool(),
-                    key.normalized_arguments_hash().clone(),
-                    workspace_identity,
-                    V5_TASK_POLL_INTERVAL_MS,
-                    3_600_000,
-                )
-                .with_initial_epoch_ms(1_009),
-                crate::domain::code_intelligence::ProviderDeadline::new(deadline),
-            )
-            .expect("create preexisting handoff Task without reservation");
-        drop(runtime);
-
-        let error = match V5ReceiptRuntime::open(&state, &config) {
-            Ok(_) => panic!("handoff Task without prior reservation must fail-stop startup"),
-            Err(error) => error,
-        };
-        assert!(error.contains("preexisting handoff Task has no exact prior link reservation"));
-
-        let task_root = RetainedDirectoryCapability::open(&state.path().join("tasks"))
-            .expect("retain handoff TaskStore after failed startup");
-        let (store, _) = FileInvocationStoreV5::open_retained_directory_inspect_only(
-            task_root,
-            Arc::new(SystemEpochMillisClock),
-            crate::domain::code_intelligence::ProviderDeadline::new(
-                Instant::now() + Duration::from_secs(2),
-            ),
-        )
-        .expect("inspect handoff TaskStore after failed startup");
-        assert_eq!(
-            store
-                .get(
-                    key.reserved_task_id(),
-                    crate::domain::code_intelligence::ProviderDeadline::new(
-                        Instant::now() + Duration::from_secs(2),
-                    ),
-                )
-                .expect("read unchanged handoff Task"),
-            queued
-        );
-        let links = TaskLifecycleLinkStoreV5::open(
-            state.path().join("task-lifecycle-links"),
-            crate::domain::code_intelligence::ProviderDeadline::new(
-                Instant::now() + Duration::from_secs(2),
-            ),
-        )
-        .expect("inspect lifecycle store after failed startup")
-        .catalog_snapshot(crate::domain::code_intelligence::ProviderDeadline::new(
-            Instant::now() + Duration::from_secs(2),
-        ))
-        .expect("snapshot unchanged lifecycle store");
-        assert!(links.entries().is_empty());
-    }
-
-    #[test]
-    fn startup_rejects_task_terminal_bound_that_does_not_confirm_exact_terminal_task() {
-        let root = tempfile::tempdir().expect("temporary terminal mismatch root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-        let identity = CoreIdentity::production_v5();
-        let state = DaemonStateDirectory::open(&state_root, &identity)
-            .expect("open terminal mismatch daemon state");
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_millis(50),
-        );
-        let runtime = V5ReceiptRuntime::open(&state, &config).expect("open initial runtime");
-        let (key, queued, task_bound) =
-            materialize_startup_task_bound(&runtime, &identity, AttemptPhase::NotBegun);
-        let deadline = crate::domain::code_intelligence::ProviderDeadline::new(
-            Instant::now() + Duration::from_secs(2),
-        );
-        let terminal = runtime
-            .task_projection
-            .task_store
-            .terminalize_recovered_exact(
-                &queued.identity(),
-                queued.version,
-                RecoveryTerminalReason::InterruptedBeforeExecution,
-                deadline,
-            )
-            .expect("terminalize exact TaskStore record");
-        let V5StoredTask::Failed {
-            terminal_epoch_ms, ..
-        } = &terminal.task
-        else {
-            panic!("recovery terminal must be Failed")
-        };
-        let wrong_digest: TerminalDigest = "ff".repeat(32).parse().expect("wrong terminal digest");
-        runtime
-            .task_projection
-            .lifecycle_links
-            .publish_task_terminal_bound(
-                &task_bound,
-                receipt_task_projection_from_store(&terminal).unwrap_or_else(|failure| {
-                    panic!("project exact terminal Task: {}", failure.error)
-                }),
-                terminal.version,
-                ClosedTerminalStatus::Failed,
-                wrong_digest,
-                *terminal_epoch_ms,
-                deadline,
-            )
-            .expect("publish deliberately mismatched TaskTerminalBound");
-        drop(runtime);
-
-        let error = match V5ReceiptRuntime::open(&state, &config) {
-            Ok(_) => panic!("mismatched TaskTerminalBound must fail-stop startup"),
-            Err(error) => error,
-        };
-        assert!(error.contains("TaskTerminalBound does not confirm the exact terminal Task"));
-
-        let task_root = RetainedDirectoryCapability::open(&state.path().join("tasks"))
-            .expect("retain terminal TaskStore after failed startup");
-        let (store, _) = FileInvocationStoreV5::open_retained_directory_inspect_only(
-            task_root,
-            Arc::new(SystemEpochMillisClock),
-            crate::domain::code_intelligence::ProviderDeadline::new(
-                Instant::now() + Duration::from_secs(2),
-            ),
-        )
-        .expect("inspect terminal TaskStore after failed startup");
-        assert_eq!(
-            store
-                .get(
-                    key.reserved_task_id(),
-                    crate::domain::code_intelligence::ProviderDeadline::new(
-                        Instant::now() + Duration::from_secs(2),
-                    ),
-                )
-                .expect("read unchanged terminal Task"),
-            terminal
-        );
-    }
-
-    #[test]
-    fn cancel_reserved_reopens_with_the_original_absolute_7125ms_expiry() {
-        let root = tempfile::tempdir().expect("temporary restart-stable receipt root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-        let identity = CoreIdentity::production_v5();
-        let clock = Arc::new(ManualEpochClock::new(1_000));
-        let arguments = serde_json::Map::new();
-        let request_identity = RequestIdentity::new(
-            identity.digest().clone(),
-            V5ToolIdentity::View,
-            normalized_arguments_hash(&arguments),
-            request_scope_hash("workspace-a").expect("request scope"),
-        );
-        let key = ReceiptKey::new(InvocationId::new(), TaskId::new(), request_identity);
-
-        let initial =
-            exchange_once_with_epoch(&state_root, &identity, Arc::clone(&clock), |owner| {
-                owner.cancel_invocation(key.clone())
-            });
-        assert!(matches!(
-            initial,
-            V5ServerResponse::Invocation {
-                outcome: V5InvocationResponse::ReceiptPending {
-                    accepted_epoch_ms: 1_000,
-                    phase: V5InvocationPhase::CancelReserved,
-                    ..
-                }
-            }
-        ));
-
-        clock.set(4_000);
-        let duplicate =
-            exchange_once_with_epoch(&state_root, &identity, Arc::clone(&clock), |owner| {
-                owner.cancel_invocation(key.clone())
-            });
-        assert_eq!(duplicate, initial, "reopen extended the cancellation TTL");
-
-        clock.set(1_000 + CANCEL_RESERVATION_TTL_MS - 1);
-        let before_expiry =
-            exchange_once_with_epoch(&state_root, &identity, Arc::clone(&clock), |owner| {
-                owner.recover_invocation_receipt(key.clone())
-            });
-        assert_eq!(before_expiry, initial);
-
-        clock.set(1_000 + CANCEL_RESERVATION_TTL_MS);
-        let expired = exchange_once_with_epoch(&state_root, &identity, clock, |owner| {
-            owner.recover_invocation_receipt(key)
-        });
-        assert_eq!(
-            expired,
-            V5ServerResponse::Error {
-                code: V5DaemonErrorCode::ReceiptNotFound,
-            }
-        );
-    }
-
-    #[test]
-    fn authenticated_pre_cancel_submit_and_recover_cross_the_actor_owned_runtime() {
-        let root = tempfile::tempdir().expect("temporary state root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-        let identity = CoreIdentity::production_v5();
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_millis(300),
-        );
-        let server = thread::spawn(move || run_daemon(config));
-        let _record = wait_for_v5_record(&state_root, &identity);
-
-        let arguments = serde_json::Map::new();
-        let invocation_id = InvocationId::new();
-        let reserved_task_id = TaskId::new();
-        let request_identity = RequestIdentity::new(
-            identity.digest().clone(),
-            V5ToolIdentity::View,
-            normalized_arguments_hash(&arguments),
-            request_scope_hash("workspace-a").expect("request scope"),
-        );
-        let key = ReceiptKey::new(invocation_id, reserved_task_id, request_identity);
-        let invocation = V5InvocationRequest::new(
-            invocation_id,
-            reserved_task_id,
-            V5ToolIdentity::View,
-            arguments,
-            "workspace-a".to_string(),
-            7_000,
-        )
-        .expect("strict invocation");
-        let unused_executable = std::path::PathBuf::from("unused-existing-v5-endpoint");
-
-        let mut cancel_owner = V5DaemonProcessOwner::connect_or_spawn(
-            &state_root,
-            identity.clone(),
-            unused_executable.clone(),
-            Duration::from_millis(300),
-        )
-        .expect("connect authenticated cancel owner");
-        let cancel = cancel_owner
-            .cancel_invocation(key.clone())
-            .expect("durably reserve pre-submit cancellation");
-        assert!(matches!(
-            cancel,
-            V5ServerResponse::Invocation {
-                outcome: V5InvocationResponse::ReceiptPending {
-                    phase: V5InvocationPhase::CancelReserved,
-                    cancel_requested: true,
-                    ..
-                }
-            }
-        ));
-
-        let mut submit_owner = V5DaemonProcessOwner::connect_or_spawn(
-            &state_root,
-            identity.clone(),
-            unused_executable.clone(),
-            Duration::from_millis(300),
-        )
-        .expect("connect authenticated submit owner");
-        let submit = submit_owner
-            .submit_invocation(invocation)
-            .expect("terminalize exact pre-cancelled submit");
-        assert!(matches!(
-            &submit,
-            V5ServerResponse::Invocation {
-                outcome: V5InvocationResponse::Direct { receipt }
-            } if matches!(receipt.terminal(), ReceiptTerminalOutcome::Cancelled)
-                && receipt.receipt_key() == &key
-        ));
-
-        let mut recover_owner = V5DaemonProcessOwner::connect_or_spawn(
-            &state_root,
-            identity,
-            unused_executable,
-            Duration::from_millis(300),
-        )
-        .expect("connect authenticated recovery owner");
-        let recovered = recover_owner
-            .recover_invocation_receipt(key)
-            .expect("recover committed direct terminal");
-        assert_eq!(recovered, submit, "recovery changed the prepared response");
-        drop(cancel_owner);
-        drop(submit_owner);
-        drop(recover_owner);
-
-        server.join().expect("join v5 runtime").expect("v5 runtime");
-    }
-
-    fn wait_for_v5_record(
-        state_root: &std::path::Path,
-        core_identity: &CoreIdentity,
-    ) -> V5EndpointRecord {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let state = DaemonStateDirectory::open(state_root, core_identity)
-                .expect("open v5 daemon state while waiting");
-            if let Some(record) = state
-                .read_v5_endpoint_record()
-                .expect("read v5 endpoint record")
-            {
-                return record;
-            }
-            assert!(Instant::now() < deadline, "v5 endpoint was not published");
-            thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    fn connect_v5_owner(
-        record: &V5EndpointRecord,
-        identity: &CoreIdentity,
-        owner_lease: &str,
-    ) -> (TcpStream, BufReader<TcpStream>) {
-        let mut stream = TcpStream::connect(record.loopback_addr().expect("v5 loopback address"))
-            .expect("connect v5 daemon owner");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("bound v5 owner response read");
-        let mut reader = BufReader::new(stream.try_clone().expect("clone v5 owner stream"));
-        write_json_line(
-            &mut stream,
-            &json!({
-                "kind": "hello",
-                "protocolVersion": 5,
-                "token": record.token(),
-                "coreIdentity": identity.as_str(),
-                "ownerLease": owner_lease
-            }),
-        );
-        let ready = read_bounded_v5_probe_response_frame(&mut reader).expect("read v5 owner ready");
-        assert!(matches!(
-            decode_v5_server_response(&ready),
-            Ok(V5ServerResponse::Ready { .. })
-        ));
-        (stream, reader)
-    }
-
-    #[test]
-    fn v5_owner_session_accepts_ping_then_release() {
-        let root = tempfile::tempdir().expect("temporary session state root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical session state root");
-        let identity = CoreIdentity::production_v5();
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_millis(100),
-        );
-        let server = thread::spawn(move || run_daemon(config));
-        let record = wait_for_v5_record(&state_root, &identity);
-        let (mut stream, mut reader) =
-            connect_v5_owner(&record, &identity, "44444444-4444-4444-8444-444444444444");
-
-        write_json_line(&mut stream, &json!({"kind": "ping"}));
-        let pong = read_bounded_v5_probe_response_frame(&mut reader).expect("read v5 pong");
-        assert_eq!(decode_v5_server_response(&pong), Ok(V5ServerResponse::Pong));
-
-        write_json_line(&mut stream, &json!({"kind": "release"}));
-        let released =
-            read_bounded_v5_probe_response_frame(&mut reader).expect("read v5 release response");
-        assert_eq!(
-            decode_v5_server_response(&released),
-            Ok(V5ServerResponse::Released)
-        );
-        drop(stream);
-
-        server
-            .join()
-            .expect("join v5 session runtime")
-            .expect("v5 session runtime");
-    }
-
-    #[test]
-    fn seven_second_wait_task_keeps_its_requested_operation_window() {
-        let task_id = TaskId::new();
-        let frame = serde_json::to_vec(&json!({
-            "kind": "wait_task",
-            "taskId": task_id.to_string(),
-            "waitMs": 7_000
-        }))
-        .expect("serialize v5 wait request");
-        let decoded = decode_v5_request_frame(frame).expect("decode v5 wait request");
-        let received_at = Instant::now();
-
-        let deadlines =
-            v5_request_deadlines(&decoded, received_at).expect("derive v5 wait deadlines");
-
-        assert_eq!(
-            deadlines.operation.duration_since(received_at),
-            Duration::from_secs(9)
-        );
-    }
-
-    #[test]
-    fn v5_duplicate_live_owner_lease_is_rejected() {
-        let root = tempfile::tempdir().expect("temporary duplicate-lease state root");
-        let state_root =
-            std::fs::canonicalize(root.path()).expect("physical duplicate-lease state root");
-        let identity = CoreIdentity::production_v5();
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_millis(100),
-        );
-        let server = thread::spawn(move || run_daemon(config));
-        let record = wait_for_v5_record(&state_root, &identity);
-        let lease = "55555555-5555-4555-8555-555555555555";
-        let (mut first, mut first_reader) = connect_v5_owner(&record, &identity, lease);
-
-        let mut duplicate =
-            TcpStream::connect(record.loopback_addr().expect("v5 loopback address"))
-                .expect("connect duplicate v5 owner");
-        duplicate
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("bound duplicate response read");
-        let mut duplicate_reader =
-            BufReader::new(duplicate.try_clone().expect("clone duplicate stream"));
-        write_json_line(
-            &mut duplicate,
-            &json!({
-                "kind": "hello",
-                "protocolVersion": 5,
-                "token": record.token(),
-                "coreIdentity": identity.as_str(),
-                "ownerLease": lease
-            }),
-        );
-        let response = read_bounded_v5_probe_response_frame(&mut duplicate_reader)
-            .expect("read duplicate owner rejection");
-        assert_eq!(
-            decode_v5_server_response(&response),
-            Ok(V5ServerResponse::Error {
-                code: V5DaemonErrorCode::DuplicateLease,
-            })
-        );
-
-        write_json_line(&mut first, &json!({"kind": "release"}));
-        let released = read_bounded_v5_probe_response_frame(&mut first_reader)
-            .expect("release original v5 owner");
-        assert_eq!(
-            decode_v5_server_response(&released),
-            Ok(V5ServerResponse::Released)
-        );
-        drop(first);
-        drop(duplicate);
-
-        server
-            .join()
-            .expect("join duplicate-lease runtime")
-            .expect("duplicate-lease runtime");
-    }
-
-    #[test]
-    fn v5_rejects_connections_above_handshake_limit() {
-        let root = tempfile::tempdir().expect("temporary handshake-limit state root");
-        let state_root =
-            std::fs::canonicalize(root.path()).expect("physical handshake-limit state root");
-        let identity = CoreIdentity::production_v5();
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_millis(100),
-        );
-        let server = thread::spawn(move || run_daemon(config));
-        let record = wait_for_v5_record(&state_root, &identity);
-        let address = record.loopback_addr().expect("v5 loopback address");
-        let blockers = (0..MAX_HANDSHAKES)
-            .map(|_| TcpStream::connect(address).expect("occupy v5 handshake slot"))
-            .collect::<Vec<_>>();
-        thread::sleep(Duration::from_millis(100));
-
-        let overflow = TcpStream::connect(address).expect("connect overflow v5 handshake");
-        overflow
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("bound overflow response read");
-        let mut overflow_reader = BufReader::new(overflow);
-        let response = read_bounded_v5_probe_response_frame(&mut overflow_reader)
-            .expect("read overloaded v5 handshake response");
-        assert_eq!(
-            decode_v5_server_response(&response),
-            Ok(V5ServerResponse::Error {
-                code: V5DaemonErrorCode::Overloaded,
-            })
-        );
-
-        drop(blockers);
-        server
-            .join()
-            .expect("join handshake-limit runtime")
-            .expect("handshake-limit runtime");
-    }
-
-    #[test]
-    fn live_v5_owner_prevents_idle_listener_shutdown() {
-        let root = tempfile::tempdir().expect("temporary owner-idle state root");
-        let state_root =
-            std::fs::canonicalize(root.path()).expect("physical owner-idle state root");
-        let identity = CoreIdentity::production_v5();
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_millis(80),
-        );
-        let server = thread::spawn(move || run_daemon(config));
-        let record = wait_for_v5_record(&state_root, &identity);
-        let (mut first, mut first_reader) =
-            connect_v5_owner(&record, &identity, "66666666-6666-4666-8666-666666666666");
-
-        thread::sleep(Duration::from_millis(200));
-        let (mut successor, mut successor_reader) =
-            connect_v5_owner(&record, &identity, "77777777-7777-4777-8777-777777777777");
-        write_json_line(&mut successor, &json!({"kind": "release"}));
-        let successor_released = read_bounded_v5_probe_response_frame(&mut successor_reader)
-            .expect("release successor v5 owner");
-        assert_eq!(
-            decode_v5_server_response(&successor_released),
-            Ok(V5ServerResponse::Released)
-        );
-        drop(successor);
-
-        write_json_line(&mut first, &json!({"kind": "release"}));
-        let first_released = read_bounded_v5_probe_response_frame(&mut first_reader)
-            .expect("release original idle-fencing owner");
-        assert_eq!(
-            decode_v5_server_response(&first_released),
-            Ok(V5ServerResponse::Released)
-        );
-        drop(first);
-
-        server
-            .join()
-            .expect("join owner-idle runtime")
-            .expect("owner-idle runtime");
-    }
-
-    #[test]
-    fn exact_v5_runtime_opens_receipt_ledger_and_serves_real_handshake_and_ping() {
-        let root = tempfile::tempdir().expect("temporary state root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-        let identity = CoreIdentity::production_v5();
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_millis(80),
-        );
-        let server = thread::spawn(move || run_daemon(config));
-        let record = wait_for_v5_record(&state_root, &identity);
-
-        let mut stream = TcpStream::connect(record.loopback_addr().expect("v5 loopback address"))
-            .expect("connect v5 daemon");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("bound v5 response read");
-        write_json_line(
-            &mut stream,
-            &json!({
-                "kind": "hello",
-                "protocolVersion": 5,
-                "token": record.token(),
-                "coreIdentity": identity.as_str(),
-                "ownerLease": "33333333-3333-4333-8333-333333333333"
-            }),
-        );
-        let mut reader = BufReader::new(stream.try_clone().expect("clone v5 stream"));
-        let ready = read_bounded_v5_probe_response_frame(&mut reader).expect("read v5 ready");
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&ready).expect("decode v5 ready"),
-            json!({
-                "kind": "ready",
-                "protocolVersion": 5,
-                "coreIdentity": identity.as_str(),
-                "daemonPid": std::process::id(),
-                "instanceId": record.instance_id()
-            })
-        );
-
-        write_json_line(&mut stream, &json!({"kind": "ping"}));
-        let pong = read_bounded_v5_probe_response_frame(&mut reader).expect("read v5 pong");
-        let pong: V5ProbeServerResponse =
-            serde_json::from_slice(&pong).expect("decode strict v5 pong");
-        assert_eq!(pong.kind(), V5ProbeResponseKind::Pong);
-        write_json_line(&mut stream, &json!({"kind": "release"}));
-        let released =
-            read_bounded_v5_probe_response_frame(&mut reader).expect("read v5 release response");
-        assert_eq!(
-            decode_v5_server_response(&released),
-            Ok(V5ServerResponse::Released)
-        );
-        drop(stream);
-
-        server.join().expect("join v5 runtime").expect("v5 runtime");
-        let state = DaemonStateDirectory::open(&state_root, &identity).expect("reopen v5 state");
-        assert!(state.read_v5_endpoint_record().unwrap().is_none());
-        let receipts = state
-            .create_private_retained_subdirectory("receipts")
-            .expect("retain production receipts directory");
-        assert_eq!(
-            std::fs::read(receipts.path().join("generation")).expect("read v5 generation"),
-            b"0\n"
-        );
-    }
-
-    #[test]
-    fn direct_runtime_entry_rejects_every_non_v5_identity_before_state_creation() {
-        use std::str::FromStr;
-
-        for identity in [
-            CoreIdentity::from_str(
-                "2f4dd5713d11e5211a92c5fa01b1ec5722dc3a3160b9b1e0b667f8d8da3d9c28",
-            )
-            .expect("the retired protocol-v3 digest still parses as a canonical identity"),
-            CoreIdentity::from_str(
-                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-            )
-            .expect("arbitrary accepted identity"),
-        ] {
-            let root = tempfile::tempdir().expect("temporary state root");
-            let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-            let result = run_daemon(DaemonServerConfig::new(
-                state_root,
-                identity,
-                Duration::from_millis(10),
-            ));
-
-            assert_eq!(
-                result,
-                Err(
-                    "protocol-v5 runtime requires the exact production-v5 core identity"
-                        .to_string()
-                )
-            );
-            assert_eq!(
-                std::fs::read_dir(root.path())
-                    .expect("read untouched root")
-                    .count(),
-                0
-            );
-        }
-    }
-
-    #[test]
-    fn partial_handshake_bytes_cannot_replenish_the_absolute_frame_deadline() {
-        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .expect("bind slowloris fixture");
-        let address = listener.local_addr().expect("slowloris address");
-        let (done_tx, done_rx) = mpsc::channel();
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept slowloris fixture");
-            stream
-                .set_nonblocking(false)
-                .expect("blocking fixture stream");
-            let mut reader = BufReader::new(stream);
-            let started = Instant::now();
-            let result = read_v5_request_before(&mut reader, started + Duration::from_millis(60));
-            done_tx
-                .send((result.is_err(), started.elapsed()))
-                .expect("report bounded read");
-        });
-        let mut client = TcpStream::connect(address).expect("connect slowloris fixture");
-        for byte in b"{\"kind\":\"ping\"}\n" {
-            if client.write_all(&[*byte]).is_err() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        let (rejected, elapsed) = done_rx
-            .recv_timeout(Duration::from_millis(250))
-            .expect("absolute frame deadline must release the reader");
-        assert!(rejected);
-        assert!(elapsed < Duration::from_millis(180), "elapsed={elapsed:?}");
-        server.join().expect("join slowloris fixture");
-    }
-
-    #[test]
-    fn expired_partial_handshake_closes_transport_without_a_late_protocol_response() {
-        let root = tempfile::tempdir().expect("temporary state root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-        let identity = CoreIdentity::production_v5();
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            HANDSHAKE_READ_TIMEOUT + Duration::from_secs(1),
-        );
-        let server = thread::spawn(move || run_daemon(config));
-        let record = wait_for_v5_record(&state_root, &identity);
-
-        let mut stream = TcpStream::connect(record.loopback_addr().expect("v5 loopback address"))
-            .expect("connect v5 daemon");
-        stream
-            .set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT + Duration::from_secs(1)))
-            .expect("bound expired-handshake read");
-        stream.write_all(b"{").expect("write partial handshake");
-        let started = Instant::now();
-        let mut response = Vec::new();
-        if let Err(error) = stream.read_to_end(&mut response) {
-            assert_eq!(
-                error.kind(),
-                io::ErrorKind::ConnectionReset,
-                "expired handshake must close the transport: {error}"
-            );
-        }
-
-        assert!(
-            response.is_empty(),
-            "transport timeout was misclassified as protocol response: {}",
-            String::from_utf8_lossy(&response)
-        );
-        assert!(
-            started.elapsed() < HANDSHAKE_READ_TIMEOUT + Duration::from_millis(500),
-            "expired handshake received a replenished response budget: {:?}",
-            started.elapsed()
-        );
-        server.join().expect("join v5 runtime").expect("v5 runtime");
-    }
-
-    #[test]
-    fn complete_v5_frame_near_cutoff_cannot_receive_a_fresh_response_budget() {
-        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .expect("bind response-deadline fixture");
-        let address = listener.local_addr().expect("response-deadline address");
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept response-deadline fixture");
-            let original_deadline = Instant::now() + Duration::from_millis(30);
-            thread::sleep(Duration::from_millis(45));
-            let result = write_json_line_before(
-                &mut stream,
-                &V5ProbeServerResponse::Pong {},
-                original_deadline,
-            );
-            drop(stream);
-            result
-        });
-        let mut client = TcpStream::connect(address).expect("connect response-deadline fixture");
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("bound response-deadline read");
-        let mut response = Vec::new();
-        client
-            .read_to_end(&mut response)
-            .expect("expired response deadline closes transport");
-
-        assert!(
-            server
-                .join()
-                .expect("join response-deadline fixture")
-                .is_err(),
-            "expired original deadline granted a new response-write budget"
-        );
-        assert!(response.is_empty(), "late response escaped: {response:?}");
-    }
-
-    #[test]
-    fn displaced_receipt_authority_fail_stops_until_process_death() {
-        let root = tempfile::tempdir().expect("temporary state root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-        let identity = CoreIdentity::production_v5();
-        let config = DaemonServerConfig::new(
-            state_root.clone(),
-            identity.clone(),
-            Duration::from_millis(80),
-        );
-        let server = thread::spawn(move || run_daemon(config));
-        let record = wait_for_v5_record(&state_root, &identity);
-        let state = DaemonStateDirectory::open(&state_root, &identity).expect("open daemon state");
-        let receipts = state.path().join("receipts");
-        let displaced = state.path().join("receipts-displaced");
-
-        match attempt_retained_directory_replacement_for_test(&receipts, &displaced)
-            .expect("attempt receipt authority replacement")
-        {
-            RetainedDirectoryReplacementOutcome::PreventedByRetainedHandle => {
-                server.join().expect("join v5 runtime").expect("v5 runtime");
-            }
-            RetainedDirectoryReplacementOutcome::Replaced => {
-                let displaced_still_ready =
-                    match TcpStream::connect(record.loopback_addr().expect("old v5 address")) {
-                        Ok(mut stream) => {
-                            stream
-                                .set_read_timeout(Some(Duration::from_secs(1)))
-                                .expect("bound displaced-daemon read");
-                            let hello = json!({
-                                "kind": "hello",
-                                "protocolVersion": 5,
-                                "token": record.token(),
-                                "coreIdentity": identity.as_str(),
-                                "ownerLease": "33333333-3333-4333-8333-333333333333"
-                            });
-                            if serde_json::to_writer(&mut stream, &hello).is_ok()
-                                && stream.write_all(b"\n").is_ok()
-                            {
-                                let mut reader = BufReader::new(
-                                    stream.try_clone().expect("clone displaced v5 stream"),
-                                );
-                                read_bounded_v5_probe_response_frame(&mut reader).is_ok()
-                            } else {
-                                false
-                            }
-                        }
-                        Err(_) => false,
-                    };
-                let server_result = server.join().expect("join displaced v5 runtime");
-                assert!(
-                    !displaced_still_ready,
-                    "displaced receipt owner still accepted a handshake"
-                );
-                assert!(
-                    server_result.is_ok(),
-                    "process-owned fail-stop is a controlled daemon shutdown: {server_result:?}"
-                );
-                let retained_record = state
-                    .read_v5_endpoint_record()
-                    .expect("read fail-stop endpoint")
-                    .expect("fail-stop keeps the PID-bound endpoint until process death");
-                assert_eq!(retained_record, record);
-                assert!(
-                    V5ReceiptRuntime::open(
-                        &state,
-                        &DaemonServerConfig::new(state_root, identity, Duration::from_millis(120),),
-                    )
-                    .is_err(),
-                    "same-process successor bypassed the retained fail-stop authority"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn displaced_runtime_retains_stable_authority_until_the_old_owner_drops() {
-        let root = tempfile::tempdir().expect("temporary state root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-        let identity = CoreIdentity::production_v5();
-        let state = DaemonStateDirectory::open(&state_root, &identity).expect("open daemon state");
-        let first = V5ReceiptRuntime::open(
-            &state,
-            &DaemonServerConfig::new(
-                state_root.clone(),
-                identity.clone(),
-                Duration::from_millis(80),
-            ),
-        )
-        .expect("open first runtime owner");
-        let receipts = state.path().join("receipts");
-        let displaced = state.path().join("receipts-displaced");
-
-        match attempt_retained_directory_replacement_for_test(&receipts, &displaced)
-            .expect("attempt receipt authority replacement")
-        {
-            RetainedDirectoryReplacementOutcome::PreventedByRetainedHandle => return,
-            RetainedDirectoryReplacementOutcome::Replaced => {}
-        }
-
-        let successor_state =
-            DaemonStateDirectory::open(&state_root, &identity).expect("open successor state");
-        let successor_while_old_is_live = V5ReceiptRuntime::open(
-            &successor_state,
-            &DaemonServerConfig::new(
-                state_root.clone(),
-                identity.clone(),
-                Duration::from_millis(80),
-            ),
-        );
-        assert!(
-            successor_while_old_is_live.is_err(),
-            "replacement receipts directory created a second live runtime authority"
-        );
-
-        drop(first);
-        V5ReceiptRuntime::open(
-            &successor_state,
-            &DaemonServerConfig::new(state_root, identity, Duration::from_millis(80)),
-        )
-        .expect("successor acquires the stable authority after old owner drops");
-    }
-
-    #[test]
-    fn replacement_receipt_authority_directory_alone_cannot_create_a_successor_runtime() {
-        let root = tempfile::tempdir().expect("temporary state root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-        let identity = CoreIdentity::production_v5();
-        let state = DaemonStateDirectory::open(&state_root, &identity).expect("open daemon state");
-        let first = V5ReceiptRuntime::open(
-            &state,
-            &DaemonServerConfig::new(
-                state_root.clone(),
-                identity.clone(),
-                Duration::from_millis(80),
-            ),
-        )
-        .expect("open first runtime owner");
-        let authority = state.path().join(".receipt-authority");
-        let displaced = state.path().join(".receipt-authority-displaced");
-
-        match attempt_retained_directory_replacement_for_test(&authority, &displaced)
-            .expect("attempt stable receipt-authority replacement")
-        {
-            RetainedDirectoryReplacementOutcome::PreventedByRetainedHandle => return,
-            RetainedDirectoryReplacementOutcome::Replaced => {}
-        }
-
-        let successor_state =
-            DaemonStateDirectory::open(&state_root, &identity).expect("open successor state");
-        let successor_while_old_is_live = V5ReceiptRuntime::open(
-            &successor_state,
-            &DaemonServerConfig::new(
-                state_root.clone(),
-                identity.clone(),
-                Duration::from_millis(80),
-            ),
-        );
-
-        let error = match successor_while_old_is_live {
-            Ok(_) => {
-                panic!("replacement receipt-authority directory created a second live runtime")
-            }
-            Err(error) => error,
-        };
-        assert_eq!(
-            error,
-            "open protocol-v5 receipt ledger: receipt ledger is already owned"
-        );
-        first
-            .ensure_named_authority()
-            .expect("unchanged receipt ledger keeps the original runtime authoritative");
-
-        drop(first);
-        V5ReceiptRuntime::open(
-            &successor_state,
-            &DaemonServerConfig::new(state_root, identity, Duration::from_millis(80)),
-        )
-        .expect("successor acquires both authority layers after old owner drops");
-    }
-
-    #[test]
-    fn displaced_runtime_cannot_write_a_response_after_the_final_authority_check() {
-        let root = tempfile::tempdir().expect("temporary state root");
-        let state_root = std::fs::canonicalize(root.path()).expect("physical state root");
-        let identity = CoreIdentity::production_v5();
-        let state = DaemonStateDirectory::open(&state_root, &identity).expect("open daemon state");
-        let runtime = V5ReceiptRuntime::open(
-            &state,
-            &DaemonServerConfig::new(state_root, identity, Duration::from_millis(80)),
-        )
-        .expect("open runtime owner");
-        let receipts = state.path().join("receipts");
-        let displaced = state.path().join("receipts-displaced");
-        match attempt_retained_directory_replacement_for_test(&receipts, &displaced)
-            .expect("attempt receipt authority replacement")
-        {
-            RetainedDirectoryReplacementOutcome::PreventedByRetainedHandle => return,
-            RetainedDirectoryReplacementOutcome::Replaced => {}
-        }
-
-        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .expect("bind displaced response fixture");
-        let address = listener.local_addr().expect("displaced response address");
-        let client = TcpStream::connect(address).expect("connect displaced response fixture");
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("bound displaced response read");
-        let (mut server, _) = listener
-            .accept()
-            .expect("accept displaced response fixture");
-        let result = write_runtime_json_line_before(
-            &mut server,
-            &runtime,
-            &V5ProbeServerResponse::Pong {},
-            Instant::now() + Duration::from_secs(1),
-        );
-        drop(server);
-        let mut reader = BufReader::new(client);
-        let mut response = Vec::new();
-        reader
-            .read_to_end(&mut response)
-            .expect("read displaced response transport");
-
-        assert!(result.is_err(), "displaced runtime wrote a response");
-        assert!(
-            response.is_empty(),
-            "displaced response escaped: {response:?}"
-        );
-    }
-}
+mod tests;

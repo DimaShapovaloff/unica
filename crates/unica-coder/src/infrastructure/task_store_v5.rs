@@ -53,7 +53,7 @@ struct StoreCatalog {
     records: HashMap<TaskId, V5StoredInvocationRecord>,
 }
 
-#[cfg(any(test, feature = "receipt-ledger-test-support"))]
+/// A commit fault a test injects exactly once; production never arms one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PublicationFailure {
     AfterRenameBeforeSync,
@@ -69,7 +69,6 @@ pub(crate) struct FileInvocationStoreV5 {
     clock: Arc<dyn EpochMillisClock>,
     writer: Mutex<StoreCatalog>,
     limits: StoreLimits,
-    #[cfg(any(test, feature = "receipt-ledger-test-support"))]
     next_publication_failure: Mutex<Option<PublicationFailure>>,
 }
 
@@ -227,7 +226,6 @@ impl FileInvocationStoreV5 {
             clock,
             writer: Mutex::new(StoreCatalog::default()),
             limits,
-            #[cfg(any(test, feature = "receipt-ledger-test-support"))]
             next_publication_failure: Mutex::new(None),
         };
         let catalog = store.inspect_only(deadline)?;
@@ -507,7 +505,6 @@ impl FileInvocationStoreV5 {
         }
 
         catalog.records.insert(record.task_id, record.clone());
-        #[cfg(any(test, feature = "receipt-ledger-test-support"))]
         if self.take_publication_failure()? == Some(PublicationFailure::AfterRenameBeforeSync) {
             return Err(V5TaskStoreError::CommitUncertain {
                 task_id: record.task_id,
@@ -558,7 +555,6 @@ impl FileInvocationStoreV5 {
         .map_err(|error| storage_error("delete protocol-v5 terminal task record", error))?;
         catalog.records.remove(&task_id);
 
-        #[cfg(any(test, feature = "receipt-ledger-test-support"))]
         if self.take_publication_failure()? == Some(PublicationFailure::AfterDeleteBeforeSync) {
             return Err(V5TaskStoreError::CommitUncertain {
                 task_id,
@@ -610,7 +606,8 @@ impl FileInvocationStoreV5 {
             .ok_or(V5TaskStoreError::Corrupt("task record version overflow"))
     }
 
-    #[cfg(any(test, feature = "receipt-ledger-test-support"))]
+    /// Arms one commit fault for the next publication; only the runtime
+    /// hooks and store tests arm it.
     pub(crate) fn inject_next_publication_failure(&self, failure: PublicationFailure) {
         *self
             .next_publication_failure
@@ -618,7 +615,6 @@ impl FileInvocationStoreV5 {
             .expect("publication failure lock") = Some(failure);
     }
 
-    #[cfg(any(test, feature = "receipt-ledger-test-support"))]
     fn take_publication_failure(&self) -> Result<Option<PublicationFailure>, V5TaskStoreError> {
         self.next_publication_failure
             .lock()
@@ -1657,6 +1653,58 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn completed_provider_receipt_survives_a_late_task_cancel_request() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = physical_root(&root);
+        let (store, _) = FileInvocationStoreV5::open_inspect_only(
+            &root_path,
+            Arc::new(ManualEpochClock::at(6_000)),
+            deadline(),
+        )
+        .unwrap();
+        let created = store
+            .create_exact(
+                new_record(
+                    task_id("27272727-2727-4727-8727-272727272727"),
+                    invocation_id("28282828-2828-4828-8828-282828282828"),
+                    0x1b,
+                ),
+                deadline(),
+            )
+            .unwrap();
+        let identity = created.identity();
+        let V5StartWorkingOutcome::Started(working) = store
+            .start_working_if_not_cancel_requested(&identity, created.version, deadline())
+            .unwrap()
+        else {
+            panic!("task did not enter working");
+        };
+        let cancelled = store
+            .request_cancel_exact(&identity, working.version, deadline())
+            .unwrap();
+        let completed = store
+            .publish_terminal_exact(
+                &identity,
+                cancelled.version,
+                V5TerminalPublication::Completed {
+                    terminal_epoch_ms: 6_100,
+                    terminal_digest: terminal_digest(0xbb),
+                    result: Box::new(DomainResult::success("provider confirmed mutation")),
+                },
+                deadline(),
+            )
+            .unwrap();
+        assert!(completed.cancel_requested);
+        match completed.task {
+            V5StoredTask::Completed { result, .. } => {
+                assert!(result.ok);
+                assert_eq!(result.summary, "provider confirmed mutation");
+            }
+            other => panic!("late cancellation hid the provider receipt: {other:?}"),
+        }
     }
 
     #[test]

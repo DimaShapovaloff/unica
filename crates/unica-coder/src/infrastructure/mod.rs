@@ -4,6 +4,7 @@ pub(crate) mod bsl_outline;
 #[allow(dead_code)]
 pub(crate) mod bsl_module_projection;
 pub(crate) mod bundled_tools;
+pub(crate) mod capacity_observation;
 pub(crate) mod code_intelligence;
 pub(crate) mod configuration_help;
 pub(crate) mod daemon;
@@ -44,17 +45,12 @@ pub(crate) mod redaction;
 // The v5 runtime consumes this production store in the following W0a slice.
 #[allow(dead_code)]
 pub(crate) mod receipt_ledger;
-#[cfg(feature = "receipt-ledger-test-support")]
-#[allow(dead_code)]
-pub(crate) mod receipt_ledger_reachability;
-#[cfg(feature = "receipt-ledger-test-support")]
-#[allow(dead_code)]
-pub(crate) mod receipt_ledger_test_evidence;
 mod revision_artifact_policy;
 pub(crate) mod rlm_navigation;
 pub(crate) mod runtime_build_fallback;
 pub(crate) mod runtime_build_preflight;
 pub(crate) mod runtime_jobs;
+#[cfg(test)]
 pub(crate) mod source_revision;
 pub(crate) mod source_roots;
 mod source_selection_evidence;
@@ -70,6 +66,7 @@ pub(crate) mod task_store_v5;
 #[allow(dead_code)]
 pub(crate) mod task_lifecycle_link_store_v5;
 // Hidden v0.13 typed read adapter remains unreachable from the v0.12 tool ledger.
+mod v13_large_configuration;
 #[allow(dead_code)]
 pub(crate) mod v13_read;
 #[allow(dead_code)]
@@ -90,6 +87,7 @@ pub(crate) mod workspace_config;
 pub mod workspace_index;
 pub mod workspace_services;
 pub mod workspace_state;
+pub(crate) mod workspace_state_scope;
 
 #[cfg(test)]
 pub(crate) static V8TR_CONFIG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

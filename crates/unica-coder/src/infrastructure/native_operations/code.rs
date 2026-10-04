@@ -28,6 +28,9 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[path = "code_module_state.rs"]
+mod module_state;
+
 #[cfg(test)]
 use crate::infrastructure::platform_xml_source_targets::platform_xml_module_identity as module_identity;
 
@@ -526,6 +529,7 @@ fn plan_one_code_operation(
         .map_err(|error| staged_code_error(error, &at_path))?;
     let postimage =
         plan_code_postimage(before.as_deref().unwrap_or_default(), operation, op_index)?;
+    module_state::stage_borrowed_module_state(staged, effects, authority, &identity, &at_path)?;
     if postimage.no_op {
         return Ok(());
     }
@@ -1872,6 +1876,10 @@ fn unified_diff(path: &str, before: &str, after: &str) -> Result<String, String>
     }
     Ok(rendered)
 }
+
+#[cfg(test)]
+#[path = "code_module_state_tests.rs"]
+mod module_state_tests;
 
 #[cfg(test)]
 pub(super) mod tests {
@@ -3728,7 +3736,6 @@ pub(super) mod tests {
         )];
         let dry_admission = staged_code_admission(&dry, true);
         let real_admission = staged_code_admission(&real, false);
-        let admitted_rev = real_admission.revision_identity();
         let (mut dry_state, dry_effects) =
             plan_admitted_code(&dry_admission, &dry.binding, &operation)
                 .expect("dry staged code planning is unavailable");
@@ -3736,8 +3743,9 @@ pub(super) mod tests {
             plan_admitted_code(&real_admission, &real.binding, &operation)
                 .expect("real staged code planning is unavailable");
         let relative = Path::new("CommonModules/Sample/Ext/Module.bsl");
+        let expected_postimage = dry_state.read(relative).unwrap().unwrap();
         assert_eq!(
-            dry_state.read(relative).unwrap(),
+            Some(expected_postimage.clone()),
             real_state.read(relative).unwrap()
         );
         assert_eq!(dry_effects.events(), real_effects.events());
@@ -3772,7 +3780,10 @@ pub(super) mod tests {
             ApplyEffectDisposition::Committed
         );
         assert_eq!(real_result.commit_count_for_test(), 1);
-        assert_ne!(real_result.rev(), admitted_rev);
+        assert_eq!(
+            fs::read(real.source.join(relative)).unwrap(),
+            expected_postimage
+        );
         assert_eq!(
             dry_result.effects().events(),
             real_result.effects().events()
@@ -3787,12 +3798,24 @@ pub(super) mod tests {
 
         let fixture = staged_code_fixture("actor-fences", b"Procedure Base()\nEndProcedure\n");
         let observed = staged_code_admission(&fixture, true);
-        let rev = observed.revision_identity();
+        let operation = [staged_insert(
+            "main:CommonModule.Sample",
+            "Procedure Added()\nEndProcedure",
+            None,
+            None,
+        )];
+
+        let (state, effects) = plan_admitted_code(&observed, &fixture.binding, &operation).unwrap();
+        let preview = fixture
+            .actor
+            .publish_prepared_apply(observed.prepare_with_effects(state, effects).unwrap())
+            .unwrap();
+        let rev = preview.rev();
         let exact = fixture
             .actor
             .admit_apply(
                 &fixture.binding,
-                Some(&rev),
+                Some(rev),
                 true,
                 crate::domain::code_intelligence::ProviderDeadline::from_budget(
                     Duration::from_secs(5),
@@ -3800,14 +3823,9 @@ pub(super) mod tests {
                 &crate::domain::cancellation::CancellationToken::new(),
             )
             .unwrap();
-        let operation = [staged_insert(
-            "main:CommonModule.Sample",
-            "Procedure Added()\nEndProcedure",
-            None,
-            None,
-        )];
+
         let (state, effects) = plan_admitted_code(&exact, &fixture.binding, &operation)
-            .expect("planner did not reuse the actor-admitted revision");
+            .expect("planner did not reproduce the previewed plan");
         let prepared = exact.prepare_with_effects(state, effects).unwrap();
 
         let stale = fixture.actor.admit_apply(
@@ -3817,7 +3835,11 @@ pub(super) mod tests {
             crate::domain::code_intelligence::ProviderDeadline::from_budget(Duration::from_secs(5)),
             &crate::domain::cancellation::CancellationToken::new(),
         );
-        assert!(stale.unwrap_err().to_string().contains("ifRev is stale"));
+        let stale = stale.unwrap();
+        let (state, effects) = plan_admitted_code(&stale, &fixture.binding, &operation).unwrap();
+        let error = stale.prepare_with_effects(state, effects).unwrap_err();
+        assert_eq!(error.kind(), crate::infrastructure::native_operations::apply::ApplyStagingErrorKind::ConcurrentRevision);
+        assert!(error.to_string().contains("ifRev is stale"));
 
         fs::write(
             fixture.source.join("CommonModules/Sample/Ext/Module.bsl"),

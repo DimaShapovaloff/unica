@@ -6,6 +6,11 @@
 //! protocol sessions, daemon processes, barriers and clocks and performs every assertion here. The
 //! bridge is not a second ReceiptLedger and must not synthesize observations from a scenario name.
 
+#[path = "support/frontend_process.rs"]
+mod frontend_process;
+#[path = "daemon_receipt_ledger/frontend_restart.rs"]
+mod frontend_restart;
+
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -233,6 +238,9 @@ enum Action {
     AttemptTaskStoreBindUnderGate {
         label: String,
     },
+    AttemptUnstagedTaskBindAgainstStagedTerminal {
+        label: String,
+    },
     ContinueReceiptOwnedAttempt {
         terminal: TerminalFixture,
         label: String,
@@ -258,265 +266,11 @@ enum Action {
     },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum ActionKind {
-    ConfigureValidation,
-    ConfigureProvider,
-    ConfigureAdmission,
-    ConfigurePrepare,
-    InstallBarrier,
-    ReleaseBarrier,
-    WaitForEvent,
-    WaitForEventCount,
-    WaitForOperation,
-    Submit,
-    SendOuterEnvelope,
-    Recover,
-    Acknowledge,
-    Cancel,
-    CancelTask,
-    SpawnSubmit,
-    SpawnCancel,
-    SpawnMarkReservedBegun,
-    SpawnStageBoundHandoffTerminal,
-    JoinOperation,
-    ReadTask,
-    AdvanceMonotonic,
-    AdvanceEpoch,
-    Crash,
-    Restart,
-    Checkpoint,
-    Reset,
-    ProbeProtocol,
-    CompareClientServerIdentity,
-    InjectPersistedIdentityCollision,
-    RunCrossStoreCrashWorkload,
-    RunTaskRetirementWorkload,
-    SeedReceipt,
-    SeedTask,
-    SeedTaskLinkReservation,
-    OpenTaskStoreInspectOnly,
-    ReconcileStartup,
-    PublishListener,
-    InvalidateActorProof,
-    AttemptBoundTaskStart,
-    RunLazyCancelStorm,
-    FillReceiptPool,
-    FillTaskLinks,
-    FillTaskLinksLeavingOneReservationSlot,
-    FillTombstones,
-    SpawnTaskStoreCreateAndBindUnderGate,
-    AttemptTaskStoreBindUnderGate,
-    ContinueReceiptOwnedAttempt,
-    AttemptStagedTerminalAgainstProvisional,
-    RunDirectLoad,
-    RotateReceiptSegments,
-    ReclaimExpiredEvidence,
-    InjectTaskStoreCapacityInvariantViolationOnce,
-    InjectStoreFault,
-}
-
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum OperationState {
     Blocked,
     Completed,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum ProductionBoundary {
-    StrictEnvelopeValidation,
-    V5ReceiptRuntime,
-    V5Executor,
-    ReceiptTransition,
-    ReceiptIdentity,
-    ProtocolNegotiation,
-    TaskProjection,
-    CrossStoreReconciliation,
-    ActorLinearization,
-    CapacityCoordination,
-    RetentionReclamation,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum EvidenceCode {
-    ProtocolVersionUnsupported,
-    ProtocolBehaviorUnavailable,
-    StrictEnvelopeObservationUnavailable,
-    ReceiptRowAbsent,
-    ReceiptTransitionUnavailable,
-    ReceiptIdentityUnavailable,
-    TaskProjectionUnavailable,
-    CrossStoreIntentUnavailable,
-    ActorFenceUnavailable,
-    CapacityLatchUnavailable,
-    RetentionIndexUnavailable,
-    WriterPathUnavailable,
-}
-
-impl Action {
-    fn kind(&self) -> ActionKind {
-        match self {
-            Self::ConfigureValidation { .. } => ActionKind::ConfigureValidation,
-            Self::ConfigureProvider { .. } => ActionKind::ConfigureProvider,
-            Self::ConfigureAdmission { .. } => ActionKind::ConfigureAdmission,
-            Self::ConfigurePrepare { .. } => ActionKind::ConfigurePrepare,
-            Self::InstallBarrier { .. } => ActionKind::InstallBarrier,
-            Self::ReleaseBarrier { .. } => ActionKind::ReleaseBarrier,
-            Self::WaitForEvent { .. } => ActionKind::WaitForEvent,
-            Self::WaitForEventCount { .. } => ActionKind::WaitForEventCount,
-            Self::WaitForOperation { .. } => ActionKind::WaitForOperation,
-            Self::Submit { .. } => ActionKind::Submit,
-            Self::SendOuterEnvelope { .. } => ActionKind::SendOuterEnvelope,
-            Self::Recover { .. } => ActionKind::Recover,
-            Self::Acknowledge { .. } => ActionKind::Acknowledge,
-            Self::Cancel { .. } => ActionKind::Cancel,
-            Self::CancelTask { .. } => ActionKind::CancelTask,
-            Self::SpawnSubmit { .. } => ActionKind::SpawnSubmit,
-            Self::SpawnCancel { .. } => ActionKind::SpawnCancel,
-            Self::SpawnMarkReservedBegun { .. } => ActionKind::SpawnMarkReservedBegun,
-            Self::SpawnStageBoundHandoffTerminal { .. } => {
-                ActionKind::SpawnStageBoundHandoffTerminal
-            }
-            Self::JoinOperation { .. } => ActionKind::JoinOperation,
-            Self::ReadTask { .. } => ActionKind::ReadTask,
-            Self::AdvanceMonotonic { .. } => ActionKind::AdvanceMonotonic,
-            Self::AdvanceEpoch { .. } => ActionKind::AdvanceEpoch,
-            Self::Crash { .. } => ActionKind::Crash,
-            Self::Restart => ActionKind::Restart,
-            Self::Checkpoint { .. } => ActionKind::Checkpoint,
-            Self::Reset => ActionKind::Reset,
-            Self::ProbeProtocol { .. } => ActionKind::ProbeProtocol,
-            Self::CompareClientServerIdentity => ActionKind::CompareClientServerIdentity,
-            Self::InjectPersistedIdentityCollision { .. } => {
-                ActionKind::InjectPersistedIdentityCollision
-            }
-            Self::RunCrossStoreCrashWorkload { .. } => ActionKind::RunCrossStoreCrashWorkload,
-            Self::RunTaskRetirementWorkload { .. } => ActionKind::RunTaskRetirementWorkload,
-            Self::SeedReceipt { .. } => ActionKind::SeedReceipt,
-            Self::SeedTask { .. } => ActionKind::SeedTask,
-            Self::SeedTaskLinkReservation { .. } => ActionKind::SeedTaskLinkReservation,
-            Self::OpenTaskStoreInspectOnly => ActionKind::OpenTaskStoreInspectOnly,
-            Self::ReconcileStartup => ActionKind::ReconcileStartup,
-            Self::PublishListener => ActionKind::PublishListener,
-            Self::InvalidateActorProof { .. } => ActionKind::InvalidateActorProof,
-            Self::AttemptBoundTaskStart { .. } => ActionKind::AttemptBoundTaskStart,
-            Self::RunLazyCancelStorm { .. } => ActionKind::RunLazyCancelStorm,
-            Self::FillReceiptPool { .. } => ActionKind::FillReceiptPool,
-            Self::FillTaskLinks => ActionKind::FillTaskLinks,
-            Self::FillTaskLinksLeavingOneReservationSlot => {
-                ActionKind::FillTaskLinksLeavingOneReservationSlot
-            }
-            Self::FillTombstones => ActionKind::FillTombstones,
-            Self::SpawnTaskStoreCreateAndBindUnderGate { .. } => {
-                ActionKind::SpawnTaskStoreCreateAndBindUnderGate
-            }
-            Self::AttemptTaskStoreBindUnderGate { .. } => ActionKind::AttemptTaskStoreBindUnderGate,
-            Self::ContinueReceiptOwnedAttempt { .. } => ActionKind::ContinueReceiptOwnedAttempt,
-            Self::AttemptStagedTerminalAgainstProvisional { .. } => {
-                ActionKind::AttemptStagedTerminalAgainstProvisional
-            }
-            Self::RunDirectLoad { .. } => ActionKind::RunDirectLoad,
-            Self::RotateReceiptSegments => ActionKind::RotateReceiptSegments,
-            Self::ReclaimExpiredEvidence => ActionKind::ReclaimExpiredEvidence,
-            Self::InjectTaskStoreCapacityInvariantViolationOnce => {
-                ActionKind::InjectTaskStoreCapacityInvariantViolationOnce
-            }
-            Self::InjectStoreFault { .. } => ActionKind::InjectStoreFault,
-        }
-    }
-
-    fn missing_boundary(&self) -> Option<(ProductionBoundary, EvidenceCode, Option<EventKind>)> {
-        use EvidenceCode as E;
-        use ProductionBoundary as B;
-        match self {
-            Self::SendOuterEnvelope { .. } => Some((
-                B::StrictEnvelopeValidation,
-                E::StrictEnvelopeObservationUnavailable,
-                None,
-            )),
-            Self::Submit { .. } | Self::SpawnSubmit { .. } => Some((
-                B::V5ReceiptRuntime,
-                E::ReceiptRowAbsent,
-                Some(EventKind::V5ReceiptRuntimeEntered),
-            )),
-            Self::Recover { .. }
-            | Self::Acknowledge { .. }
-            | Self::Cancel { .. }
-            | Self::SpawnCancel { .. }
-            | Self::SeedReceipt { .. }
-            | Self::InjectStoreFault { .. } => {
-                Some((B::ReceiptTransition, E::ReceiptTransitionUnavailable, None))
-            }
-            Self::CompareClientServerIdentity | Self::InjectPersistedIdentityCollision { .. } => {
-                Some((B::ReceiptIdentity, E::ReceiptIdentityUnavailable, None))
-            }
-            Self::ProbeProtocol { .. } => Some((
-                B::ProtocolNegotiation,
-                E::ProtocolBehaviorUnavailable,
-                Some(EventKind::ProtocolFrameRead),
-            )),
-            Self::ReadTask { .. }
-            | Self::CancelTask { .. }
-            | Self::SeedTask { .. }
-            | Self::SeedTaskLinkReservation { .. }
-            | Self::SpawnTaskStoreCreateAndBindUnderGate { .. }
-            | Self::ContinueReceiptOwnedAttempt { .. }
-            | Self::SpawnStageBoundHandoffTerminal { .. }
-            | Self::AttemptStagedTerminalAgainstProvisional { .. } => {
-                Some((B::TaskProjection, E::TaskProjectionUnavailable, None))
-            }
-            Self::RunCrossStoreCrashWorkload { .. }
-            | Self::RunTaskRetirementWorkload { .. }
-            | Self::OpenTaskStoreInspectOnly
-            | Self::ReconcileStartup => Some((
-                B::CrossStoreReconciliation,
-                E::CrossStoreIntentUnavailable,
-                None,
-            )),
-            Self::InvalidateActorProof { .. }
-            | Self::AttemptBoundTaskStart { .. }
-            | Self::SpawnMarkReservedBegun { .. } => {
-                Some((B::ActorLinearization, E::ActorFenceUnavailable, None))
-            }
-            Self::FillReceiptPool { .. }
-            | Self::FillTaskLinks
-            | Self::FillTaskLinksLeavingOneReservationSlot
-            | Self::FillTombstones
-            | Self::AttemptTaskStoreBindUnderGate { .. } => {
-                Some((B::CapacityCoordination, E::CapacityLatchUnavailable, None))
-            }
-            Self::RotateReceiptSegments | Self::ReclaimExpiredEvidence => {
-                Some((B::RetentionReclamation, E::RetentionIndexUnavailable, None))
-            }
-            Self::RunDirectLoad { .. } | Self::RunLazyCancelStorm { .. } => Some((
-                B::V5Executor,
-                E::WriterPathUnavailable,
-                Some(EventKind::V5ExecutorEntered),
-            )),
-            Self::ConfigureValidation { .. }
-            | Self::ConfigureProvider { .. }
-            | Self::ConfigureAdmission { .. }
-            | Self::ConfigurePrepare { .. }
-            | Self::InstallBarrier { .. }
-            | Self::ReleaseBarrier { .. }
-            | Self::WaitForEvent { .. }
-            | Self::WaitForEventCount { .. }
-            | Self::WaitForOperation { .. }
-            | Self::JoinOperation { .. }
-            | Self::AdvanceMonotonic { .. }
-            | Self::AdvanceEpoch { .. }
-            | Self::Crash { .. }
-            | Self::Restart
-            | Self::Checkpoint { .. }
-            | Self::Reset
-            | Self::InjectTaskStoreCapacityInvariantViolationOnce
-            | Self::PublishListener => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -1058,7 +812,7 @@ enum ToolIdentityObservation {
     View,
     #[serde(rename = "unica.apply")]
     Apply,
-    #[serde(rename = "unica.find")]
+    #[serde(rename = "unica.resolve")]
     Find,
     #[serde(rename = "unica.search")]
     Search,
@@ -1949,6 +1703,7 @@ enum OperationEventState {
     Spawned,
     Blocked,
     Completed,
+    Refused,
     Joined,
 }
 
@@ -2377,28 +2132,7 @@ struct ConcurrencySample {
 enum FacadeEnvelope {
     Observed(ScenarioReport),
     ObservedGzipBase64(String),
-    ProductionMissingTransition(ProductionMissingTransition),
     HarnessFailure(HarnessFailure),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ProductionMissingTransition {
-    action_index: u32,
-    action_kind: ActionKind,
-    reached_boundary: ProductionBoundary,
-    current_protocol: ProtocolVersion,
-    evidence: MissingEvidence,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MissingEvidence {
-    code: EvidenceCode,
-    event: Option<EventKind>,
-    generation_before: u64,
-    generation_after: u64,
-    fingerprint: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2573,53 +2307,6 @@ fn execute(scenario: Scenario) -> ScenarioReport {
                 );
             }
             report
-        }
-        FacadeEnvelope::ProductionMissingTransition(missing) => {
-            let Some(action) = scenario.actions.get(missing.action_index as usize) else {
-                panic!(
-                    "HARNESS FAILURE: missing_boundary_action_out_of_range action_index={} action_count={}",
-                    missing.action_index,
-                    scenario.actions.len()
-                );
-            };
-            let Some((expected_boundary, expected_code, expected_event)) =
-                action.missing_boundary()
-            else {
-                panic!(
-                    "HARNESS FAILURE: action_has_no_missing_boundary action_index={}",
-                    missing.action_index
-                );
-            };
-            let protocol_is_supported_red = matches!(
-                missing.current_protocol,
-                ProtocolVersion::V3 | ProtocolVersion::V5
-            );
-            let evidence_matches = missing.evidence.code == expected_code
-                && missing.evidence.event == expected_event
-                && missing.evidence.generation_before == missing.evidence.generation_after
-                && is_safe_fingerprint(&missing.evidence.fingerprint);
-            if action.kind() != missing.action_kind
-                || missing.reached_boundary != expected_boundary
-                || !protocol_is_supported_red
-                || !evidence_matches
-            {
-                panic!(
-                    "HARNESS FAILURE: missing_boundary_mismatch action_index={}",
-                    missing.action_index
-                );
-            }
-            panic!(
-                "FUNCTIONAL RED: boundary={:?} action={:?} action_index={} protocol={:?} evidence={:?} event={:?} generation_before={} generation_after={} fingerprint={}",
-                missing.reached_boundary,
-                missing.action_kind,
-                missing.action_index,
-                missing.current_protocol,
-                missing.evidence.code,
-                missing.evidence.event,
-                missing.evidence.generation_before,
-                missing.evidence.generation_after,
-                missing.evidence.fingerprint,
-            );
         }
         FacadeEnvelope::HarnessFailure(failure) => {
             if failure
@@ -2825,7 +2512,7 @@ fn tool_wire_name(tool: ToolIdentityObservation) -> &'static str {
     match tool {
         ToolIdentityObservation::View => "unica.view",
         ToolIdentityObservation::Apply => "unica.apply",
-        ToolIdentityObservation::Find => "unica.find",
+        ToolIdentityObservation::Find => "unica.resolve",
         ToolIdentityObservation::Search => "unica.search",
         ToolIdentityObservation::Check => "unica.check",
         ToolIdentityObservation::Diff => "unica.diff",
@@ -4168,15 +3855,27 @@ fn assert_snapshot_accounting(snapshot: &Snapshot) {
         snapshot.tasks.len() as u64 <= snapshot.task_link_count + snapshot.task_link_reserved_count,
         "TaskStore records cannot outnumber materialized lifecycle links plus live reservations"
     );
+    let mut links_by_digest: BTreeMap<&str, Vec<&TaskLinkObservation>> = BTreeMap::new();
+    for link in &snapshot.task_links {
+        links_by_digest
+            .entry(link.key.key_digest.as_str())
+            .or_default()
+            .push(link);
+    }
+    let matching_link_count = |task: &TaskObservation| {
+        links_by_digest
+            .get(task.receipt_key.key_digest.as_str())
+            .map_or(0, |links| {
+                links
+                    .iter()
+                    .filter(|link| link.key == task.receipt_key)
+                    .count()
+            })
+    };
     let unlinked_tasks = snapshot
         .tasks
         .iter()
-        .filter(|task| {
-            !snapshot
-                .task_links
-                .iter()
-                .any(|link| link.key == task.receipt_key)
-        })
+        .filter(|task| matching_link_count(task) == 0)
         .count() as u64;
     assert!(
         unlinked_tasks <= snapshot.task_link_reserved_count,
@@ -4184,12 +3883,7 @@ fn assert_snapshot_accounting(snapshot: &Snapshot) {
     );
     for task in &snapshot.tasks {
         assert!(
-            snapshot
-                .task_links
-                .iter()
-                .filter(|link| link.key == task.receipt_key)
-                .count()
-                <= 1,
+            matching_link_count(task) <= 1,
             "a TaskStore record cannot be owned by multiple lifecycle links"
         );
     }
@@ -4244,10 +3938,25 @@ fn assert_exact_linked_task_pool(snapshot: &Snapshot, expected_count: u64) {
     assert_eq!(snapshot.task_links.len() as u64, expected_count);
     assert_eq!(snapshot.tasks.len() as u64, expected_count);
     assert_eq!(snapshot.task_link_reserved_count, 0);
+    let mut tasks_by_digest: BTreeMap<&str, Vec<&TaskObservation>> = BTreeMap::new();
+    for task in &snapshot.tasks {
+        tasks_by_digest
+            .entry(task.receipt_key.key_digest.as_str())
+            .or_default()
+            .push(task);
+    }
+    let mut links_by_digest: BTreeMap<&str, Vec<&TaskLinkObservation>> = BTreeMap::new();
     for link in &snapshot.task_links {
-        let matching_tasks: Vec<_> = snapshot
-            .tasks
-            .iter()
+        links_by_digest
+            .entry(link.key.key_digest.as_str())
+            .or_default()
+            .push(link);
+    }
+    for link in &snapshot.task_links {
+        let matching_tasks: Vec<_> = tasks_by_digest
+            .get(link.key.key_digest.as_str())
+            .into_iter()
+            .flatten()
             .filter(|task| task.receipt_key == link.key)
             .collect();
         assert_eq!(matching_tasks.len(), 1);
@@ -4261,9 +3970,10 @@ fn assert_exact_linked_task_pool(snapshot: &Snapshot, expected_count: u64) {
     }
     for task in &snapshot.tasks {
         assert_eq!(
-            snapshot
-                .task_links
-                .iter()
+            links_by_digest
+                .get(task.receipt_key.key_digest.as_str())
+                .into_iter()
+                .flatten()
                 .filter(|link| link.key == task.receipt_key)
                 .count(),
             1,
@@ -4296,6 +4006,7 @@ fn assert_report_raw_bounds(report: &ScenarioReport) {
             OperationEventState::Spawned
             | OperationEventState::Blocked
             | OperationEventState::Completed
+            | OperationEventState::Refused
             | OperationEventState::Joined => {}
         }
     }
@@ -5495,7 +5206,7 @@ fn assert_exact_v5_request(frame: &serde_json::Value, expected_kind: &str) {
                 json_string(invocation, "tool"),
                 "unica.view"
                     | "unica.apply"
-                    | "unica.find"
+                    | "unica.resolve"
                     | "unica.search"
                     | "unica.check"
                     | "unica.diff"
@@ -12297,6 +12008,54 @@ fn link_capacity_before_begun_terminalizes_receipt_backed_without_callback() {
     assert_eq!(
         count_event(&report, EventKind::TaskLinkReservationReleased),
         0
+    );
+}
+
+#[test]
+fn unstaged_task_bind_is_refused_against_a_staged_handoff_predecessor() {
+    let report = execute(Scenario::fake(vec![
+        Action::SeedReceipt {
+            state: SeedReceiptState::TaskHandoffActorBoundBegun,
+            cancel_requested: false,
+            staged_terminal: Some(success_payload()),
+        },
+        checkpoint_action("staged"),
+        Action::AttemptUnstagedTaskBindAgainstStagedTerminal {
+            label: "unstaged-bind".to_string(),
+        },
+        checkpoint_action("after-unstaged-bind"),
+    ]));
+
+    let staged = checkpoint(&report, "staged");
+    let staged_receipt = only_receipt(staged);
+    let staged_terminal = staged_receipt
+        .staged_terminal
+        .as_ref()
+        .expect("the fixture must stage a certified terminal on the handoff");
+    assert!(completed_result(staged_terminal).ok);
+
+    // The unstaged witness carries no staged evidence: retiring a staged predecessor
+    // through it would drop the certified terminal, so the ledger must refuse and leave
+    // the receipt for the staged completion.
+    assert_operation_trace(
+        &report,
+        "unstaged-bind",
+        &[OperationEventState::Spawned, OperationEventState::Refused],
+    );
+
+    let after = checkpoint(&report, "after-unstaged-bind");
+    let retained = only_receipt(after);
+    assert_eq!(retained.key, staged_receipt.key);
+    assert_eq!(
+        retained.state,
+        SeedReceiptState::TaskHandoffActorBoundBegun,
+        "a refused bind must not retire the receipt into a deletion witness"
+    );
+    assert_eq!(retained.staged_terminal.as_ref(), Some(staged_terminal));
+    assert_eq!(retained.version, staged_receipt.version);
+    assert_eq!(
+        after.receipt_store_mutations, staged.receipt_store_mutations,
+        "a refused bind must not mutate the durable receipt store"
     );
 }
 

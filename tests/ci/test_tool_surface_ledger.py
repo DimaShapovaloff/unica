@@ -5,24 +5,23 @@ from __future__ import annotations
 import collections
 import importlib.util
 import json
+import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GENERATOR = REPO_ROOT / "scripts/ci/generate-tool-surface.py"
-LEDGER = REPO_ROOT / "arch/tool-surface.md"
-REVIEW = REPO_ROOT / "arch/tool-surface-review.json"
-RESULT_CONTRACT_INVARIANT = (
-    REPO_ROOT / "arch/invariants/INV.SURFACE.RESULT-CONTRACTS-MATCH-REVIEW.md"
-)
+LEDGER = REPO_ROOT / "docs/tool-surface.md"
+REVIEW = REPO_ROOT / "tests/fixtures/v013/tool-surface-review.json"
 BINARY = REPO_ROOT / "target/debug/unica"
 
 NATIVE_V13 = [
     "unica.view",
     "unica.apply",
-    "unica.find",
+    "unica.resolve",
     "unica.search",
     "unica.check",
     "unica.diff",
@@ -30,6 +29,8 @@ NATIVE_V13 = [
     "unica.docs",
 ]
 TASK_COMPATIBILITY = ["unica.task.get", "unica.task.result", "unica.task.cancel"]
+BOOTSTRAP_VERIFICATION = REPO_ROOT / "crates/unica-bootstrap/src/verification.rs"
+LEDGER_TOOL_HEADING = re.compile(r"^### `(unica\.[a-z0-9.]+)`$", re.M)
 
 
 def load_generator():
@@ -107,6 +108,18 @@ class ToolSurfaceLedgerTests(unittest.TestCase):
         self.assertIn(" по ветви |", row("sourceSet"))
         self.assertIn(" по ветви |", row("SubsystemPath"))
         self.assertIn(" нет |", row("cwd"))
+
+    def test_check_ledger_preserves_nullable_argument_types(self) -> None:
+        check = next(tool for tool in self.tools if tool["name"] == "unica.check")
+        rendered = "\n".join(self.module.render_arguments(check))
+        for name, kind in [("at", "string"), ("limit", "integer"), ("cursor", "string")]:
+            self.assertIn(f"| `{name}` | {kind} or null | нет |", rendered)
+
+    def test_apply_ledger_keeps_both_closed_call_forms_branch_required(self) -> None:
+        apply = next(tool for tool in self.tools if tool["name"] == "unica.apply")
+        rendered = "\n".join(self.module.render_arguments(apply))
+        for name, kind in [("at", "string"), ("ops", "array"), ("executionToken", "string")]:
+            self.assertIn(f"| `{name}` | {kind} | по ветви |", rendered)
 
     def test_discriminated_object_branches_render_their_argument_union(self) -> None:
         schema = {
@@ -188,13 +201,19 @@ class ToolSurfaceLedgerTests(unittest.TestCase):
         tools = {tool["name"]: tool for tool in self.tools}
         expected_properties = {
             "unica.view": {"at", "filter", "limit", "cursor"},
-            "unica.apply": {"at", "ops", "dryRun", "ifRev"},
-            "unica.find": {"query", "kind", "limit"},
-            "unica.search": {"query", "scope", "regex", "limit"},
-            "unica.check": {"at"},
+            "unica.apply": {"at", "ops", "executionToken"},
+            # Единственный инструмент, которому путь на входе разрешён:
+            # аварийный мост затем и заведён, чтобы путь не просачивался
+            # в частые ответы.
+            "unica.resolve": {"at", "path"},
+            # `corpus` выбирает свод — текст модулей или имена метаданных, —
+            # а `kind` сужает поиск по именам до одного вида узла. Оба входа
+            # логические: ни один не называет файл.
+            "unica.search": {"query", "corpus", "kind", "role", "scope", "regex", "limit", "cursor"},
+            "unica.check": {"at", "limit", "cursor"},
             "unica.diff": {"left", "right", "filter", "limit", "cursor"},
-            "unica.run": {"op", "args", "dryRun", "ifRev"},
-            "unica.docs": {"query", "source"},
+            "unica.run": {"op", "args", "dryRun", "infobase"},
+            "unica.docs": {"query", "source", "limit", "cursor"},
         }
         for name, properties in expected_properties.items():
             with self.subTest(tool=name):
@@ -203,7 +222,13 @@ class ToolSurfaceLedgerTests(unittest.TestCase):
                 self.assertFalse(schema["additionalProperties"])
                 self.assertEqual(set(schema["properties"]), properties)
                 encoded = json.dumps(schema, ensure_ascii=False)
-                for physical in ("cwd", "path", "sourceDir", "workdir"):
+                # Аварийный мост — единственное место, где путь законен на
+                # входе: он затем и заведён, чтобы путь не просачивался в
+                # частые ответы (DEC.2026-09-08.RESOLVE-REPLACES-FIND).
+                physical_inputs = ("cwd", "sourceDir", "workdir")
+                if name != "unica.resolve":
+                    physical_inputs += ("path",)
+                for physical in physical_inputs:
                     self.assertNotIn(f'"{physical}"', encoded)
 
     def test_every_published_tool_has_exactly_one_review_entry(self) -> None:
@@ -220,6 +245,52 @@ class ToolSurfaceLedgerTests(unittest.TestCase):
                 self.assertTrue(entry["result"]["target"].strip())
                 self.assertGreaterEqual(len(entry["scenarios"]), 1)
                 self.assertTrue(all(scenario.strip() for scenario in entry["scenarios"]))
+
+    def test_published_run_operation_names_belong_to_the_dictionary(self) -> None:
+        """JSON-примеры называют реализованные операции публичного словаря."""
+        from tests.ci.test_acceptance_scenarios import AcceptanceServer
+        from tests.ci.test_unica_skills import collect_runtime_guidance
+
+        plugin = REPO_ROOT / "plugins/unica"
+        documents = sorted(
+            list((plugin / "skills").rglob("*.md"))
+            + list((plugin / "references").rglob("*.md"))
+        )
+        _, examples, failures = collect_runtime_guidance(
+            [(document, document.read_text(encoding="utf-8")) for document in documents]
+        )
+        self.assertEqual(failures, [])
+        self.assertTrue(examples, "no published runtime JSON examples were checked")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            workspace = root / "workspace"
+            state = root / "state"
+            workspace.mkdir()
+            state.mkdir()
+            server = AcceptanceServer(workspace, state, "2025-11-25")
+            try:
+                response = server.call("unica.run", {})
+            finally:
+                server.close()
+                server.reader.join(timeout=10)
+                server.process.stdout.close()
+
+        self.assertIsNotNone(response)
+        result = response["result"]["structuredContent"]
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("rev", result)
+        operations = {operation["op"]: operation for operation in result["data"]["operations"]}
+        for name, contract in operations.items():
+            with self.subTest(operation=name, contract="execution mode"):
+                self.assertIs(contract["previewRequired"], False)
+                self.assertIs(contract["dryRunRequired"], name != "launch")
+                self.assertNotIn("ifRevRequiredOnApply", contract)
+        for document, arguments in examples:
+            operation = arguments.get("op")
+            with self.subTest(path=document.relative_to(REPO_ROOT), operation=operation):
+                self.assertIn(operation, operations)
+                self.assertIs(operations[operation]["implemented"], True)
 
     def test_ledger_matches_the_live_registry(self) -> None:
         result = subprocess.run(
@@ -241,20 +312,34 @@ class ToolSurfaceLedgerTests(unittest.TestCase):
             self.assertIn(f"- {title}: **{states[state]}**", text)
         self.assertIn("в границах работы: **0**", text)
 
-    def test_typed_result_invariant_names_the_registry_contract_check(self) -> None:
-        text = RESULT_CONTRACT_INVARIANT.read_text(encoding="utf-8")
-        self.assertIn("id: INV.SURFACE.RESULT-CONTRACTS-MATCH-REVIEW", text)
-        self.assertIn("decision: DEC.2026-08-18.CARRIED-RULES", text)
-        self.assertIn(
-            "check: crates/unica-coder/src/application/mod.rs::tool_specs_match_reviewed_result_contracts",
-            text,
+
+class SurfaceCopiesAgreeTests(unittest.TestCase):
+    """Копии имён поверхности вне check контракта обязаны совпадать с ведомостью.
+
+    Ведомость порождается из бинаря, и её сверяет test_ledger_matches_the_live_registry.
+    Остальные списки — ожидание этого теста и константа бутстрапа — не
+    проверки контракта, а его потребители; расхождение обязано ломаться здесь,
+    одним сообщением, называющим оба места (#699).
+    """
+
+    def test_ledger_names_the_expected_compatibility_surface(self) -> None:
+        ledger = LEDGER_TOOL_HEADING.findall(LEDGER.read_text(encoding="utf-8"))
+        self.assertEqual(sorted(ledger), sorted(NATIVE_V13 + TASK_COMPATIBILITY), str(LEDGER))
+        self.assertEqual(len(ledger), len(set(ledger)), f"дубли заголовков в {LEDGER}")
+
+    def test_bootstrap_verification_copy_matches_the_ledger(self) -> None:
+        source = BOOTSTRAP_VERIFICATION.read_text(encoding="utf-8")
+        block = re.search(
+            r"EXPECTED_COMPATIBILITY_TOOLS: \[&str; (\d+)\] = \[(.*?)\];", source, re.S
         )
-        application_tests = (
-            REPO_ROOT / "crates/unica-coder/src/application/mod.rs"
-        ).read_text(encoding="utf-8")
-        self.assertRegex(
-            application_tests,
-            r"fn\s+tool_specs_match_reviewed_result_contracts\s*\(",
+        self.assertIsNotNone(block, f"нет EXPECTED_COMPATIBILITY_TOOLS в {BOOTSTRAP_VERIFICATION}")
+        names = re.findall(r'"(unica\.[a-z0-9.]+)"', block.group(2))
+        self.assertEqual(int(block.group(1)), len(names))
+        ledger = LEDGER_TOOL_HEADING.findall(LEDGER.read_text(encoding="utf-8"))
+        self.assertEqual(
+            sorted(names),
+            sorted(ledger),
+            f"{BOOTSTRAP_VERIFICATION} расходится с {LEDGER}",
         )
 
 

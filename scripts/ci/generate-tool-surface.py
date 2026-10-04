@@ -14,15 +14,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import queue
 import subprocess
 import sys
-import threading
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-REVIEW_PATH = REPO_ROOT / "arch/tool-surface-review.json"
-LEDGER_PATH = REPO_ROOT / "arch/tool-surface.md"
+REVIEW_PATH = REPO_ROOT / "tests/fixtures/v013/tool-surface-review.json"
+LEDGER_PATH = REPO_ROOT / "docs/tool-surface.md"
 DEFAULT_BINARY = REPO_ROOT / "target/debug/unica"
 
 # Above this count a tool is publishing the shared XML/DSL argument list rather
@@ -31,8 +29,8 @@ DEFAULT_BINARY = REPO_ROOT / "target/debug/unica"
 SHARED_ARGUMENT_THRESHOLD = 20
 
 # Состояние контракта — явное поле ревью, а не догадка по тексту: считать
-# метрику разбором свободной прозы значит повторить ошибку, от которой
-# `CTR.WIRE.TOOL-SURFACE` отделяет механическую ведомость и ручное ревью.
+# метрику разбором свободной прозы значит смешивать механическую ведомость
+# с ручным ревью.
 CONTRACT_STATES = {
     "typed": "Отвечают типизированным `data`",
     "partial": "Типизированы частично: часть результата всё ещё текст",
@@ -116,6 +114,8 @@ def argument_type(schema: dict) -> str:
     declared = schema.get("type")
     if isinstance(declared, str):
         return declared
+    if isinstance(declared, list) and all(isinstance(kind, str) for kind in declared):
+        return " or ".join(declared)
     if "enum" in schema:
         return "enum"
     return "any"
@@ -171,7 +171,7 @@ def selector_branches(schema: dict) -> list[dict]:
 def discriminated_object_surface(
     schema: dict,
 ) -> tuple[dict, set[str], set[str], set[str]] | None:
-    """Flatten a closed `oneOf` of complete object variants for the ledger.
+    """Flatten closed alternative object variants for the ledger.
 
     Some tools publish each action as a separate object schema so a host can
     validate forbidden action-specific arguments.  The ledger still needs to
@@ -179,6 +179,8 @@ def discriminated_object_surface(
     and branch-only optional arguments.
     """
     variants = schema.get("oneOf")
+    if variants is None and isinstance(schema.get("if"), dict):
+        variants = [schema.get("then"), schema.get("else")]
     if not isinstance(variants, list) or not variants:
         return None
     if any(
@@ -208,6 +210,23 @@ def discriminated_object_surface(
     return properties, required, conditional, branch_only
 
 
+def conditionally_required(schema: dict) -> set[str]:
+    """Аргументы, которые обязательны по условию на значение другого аргумента.
+
+    `if`/`then` — единственная форма, которой можно потребовать поле, ничего не
+    запретив: `oneOf` отверг бы законный предпросмотр с забором, совпавший с
+    обеими ветвями. Ведомость обязана назвать такое поле обязательным, иначе
+    читатель прочитает его как свободно необязательное.
+    """
+    consequence = schema.get("then")
+    if not isinstance(schema.get("if"), dict) or not isinstance(consequence, dict):
+        return set()
+    required = consequence.get("required")
+    if not isinstance(required, list):
+        return set()
+    return {str(name) for name in required}
+
+
 def render_arguments(tool: dict) -> list[str]:
     schema = tool.get("inputSchema", {})
     variant_surface = discriminated_object_surface(schema)
@@ -233,10 +252,17 @@ def render_arguments(tool: dict) -> list[str]:
             for name in branch["forbids"]
             if name not in conditional
         }
+    # Обязательность по значению другого аргумента и обязательность по ветви —
+    # разные вещи, и ведомость называет их разными словами.
+    by_value = (
+        conditionally_required(schema) - set(required)
+        if variant_surface is None
+        else set()
+    )
     lines: list[str] = []
     shared = len(properties) > SHARED_ARGUMENT_THRESHOLD
     shown = (
-        sorted(set(required) | set(conditional) | branch_only)
+        sorted(set(required) | set(conditional) | by_value | branch_only)
         if shared
         else sorted(properties)
     )
@@ -248,6 +274,8 @@ def render_arguments(tool: dict) -> list[str]:
             description = escape_cell(entry.get("description", "—"))
             if name in required:
                 obligation = "да"
+            elif name in by_value:
+                obligation = "по условию"
             elif name in conditional:
                 obligation = "по ветви"
             elif name in branch_only:
@@ -324,12 +352,11 @@ def render(tools: list[dict], review: dict) -> str:
     out.append(
         "Порождается `scripts/ci/generate-tool-surface.py` из `tools/list`"
         " собранного бинаря. Руками правится только"
-        " [`tool-surface-review.json`](tool-surface-review.json): контракт"
+        " [`tool-surface-review.json`](../tests/fixtures/v013/tool-surface-review.json): контракт"
         " результата и сценарии. Имена, описания и аргументы принадлежат"
         " реестру v0.13 в"
         " `crates/unica-coder/src/application/v13/tool_catalog.rs`; здесь они"
-        " лишь показаны рядом"
-        " (`CTR.WIRE.TOOL-SURFACE`)."
+        " лишь показаны рядом."
     )
     out.append("")
     out.append(

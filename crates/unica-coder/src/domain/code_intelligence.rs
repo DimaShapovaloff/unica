@@ -219,6 +219,7 @@ pub enum ProviderCapability {
     Definition,
     Outline,
     ObjectProfile,
+    CallGraph,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +239,14 @@ pub enum CodeIntelligenceReadRequest {
         path: String,
         include_methods: bool,
     },
+    CallGraph {
+        /// Личность узла графа, построенная из логического адреса, а не
+        /// найденная поиском: квалифицированное имя `Модуль.Метод` анализатор
+        /// не разрешает вовсе — замер дал нуль кандидатов.
+        id: String,
+        direction: CallGraphDirection,
+        limit: usize,
+    },
 }
 
 impl CodeIntelligenceReadRequest {
@@ -245,6 +254,7 @@ impl CodeIntelligenceReadRequest {
         match self {
             Self::Definition { .. } => ProviderCapability::Definition,
             Self::Outline { .. } => ProviderCapability::Outline,
+            Self::CallGraph { .. } => ProviderCapability::CallGraph,
         }
     }
 
@@ -252,6 +262,10 @@ impl CodeIntelligenceReadRequest {
         match self {
             Self::Definition { .. } => "code definition",
             Self::Outline { .. } => "code outline",
+            Self::CallGraph { direction, .. } => match direction {
+                CallGraphDirection::Callers => "call graph callers",
+                CallGraphDirection::Callees => "call graph callees",
+            },
         }
     }
 }
@@ -286,6 +300,8 @@ pub struct CodeSearchScope {
     pub source_set: String,
     pub source_root: PathBuf,
     pub filters: Vec<RelativeSearchFilter>,
+    /// Source sets nested below this root own their files independently.
+    pub excluded_subtrees: Vec<PathBuf>,
     pub legacy_selector: bool,
 }
 
@@ -295,6 +311,7 @@ impl CodeSearchScope {
             source_set,
             source_root,
             filters: Vec::new(),
+            excluded_subtrees: Vec::new(),
             legacy_selector,
         }
     }
@@ -309,6 +326,13 @@ impl CodeSearchScope {
                         | std::path::Component::Prefix(_)
                 )
             })
+        {
+            return false;
+        }
+        if self
+            .excluded_subtrees
+            .iter()
+            .any(|path| relative_path.starts_with(path))
         {
             return false;
         }
@@ -389,6 +413,22 @@ impl ProviderDeadline {
         }
     }
 
+    pub(crate) fn earlier(self, other: Self) -> Self {
+        let (first, second) = if self.started_at <= other.started_at {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        let second_end = second
+            .budget
+            .saturating_add(second.started_at.duration_since(first.started_at));
+        if first.budget <= second_end {
+            first
+        } else {
+            second
+        }
+    }
+
     pub fn remaining(self) -> Duration {
         #[cfg(test)]
         let now = (self.now)();
@@ -419,6 +459,7 @@ impl ProviderDeadline {
 pub enum ProviderSectionStatus {
     Ok,
     Empty,
+    Partial,
     LimitReached,
     TimedOut,
     Unavailable,
@@ -430,6 +471,7 @@ impl ProviderSectionStatus {
         match self {
             Self::Ok => "ok",
             Self::Empty => "empty",
+            Self::Partial => "partial",
             Self::LimitReached => "limitReached",
             Self::TimedOut => "timedOut",
             Self::Unavailable => "unavailable",
@@ -585,6 +627,13 @@ pub struct ProviderSearchSection {
     pub matches: SearchMatchCount,
     pub hits: Vec<ProviderSearchHit>,
     pub diagnostics: Vec<String>,
+    /// Freshness against current workspace sources, when this provider can
+    /// identify it. An index answer can be complete for its build while its
+    /// freshness against later edits remains unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_freshness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_build_id: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<String>,
 }
@@ -638,6 +687,19 @@ impl ProviderSearchSection {
                     );
                 }
             }
+            ProviderSectionStatus::Partial => {
+                if search_complete
+                    || hits.is_empty()
+                    || diagnostics.is_empty()
+                    || matches.relation != SearchCountRelation::LowerBound
+                    || matches.total.is_none_or(|total| total < hits.len())
+                {
+                    return Err(
+                        "partial search section must retain hits, diagnostics, and a lower bound"
+                            .to_string(),
+                    );
+                }
+            }
             ProviderSectionStatus::Unavailable | ProviderSectionStatus::Failed => {
                 if search_complete
                     || !hits.is_empty()
@@ -682,6 +744,8 @@ impl ProviderSearchSection {
             matches,
             hits,
             diagnostics,
+            index_freshness: None,
+            index_build_id: None,
             artifacts: Vec::new(),
         })
     }
@@ -731,6 +795,24 @@ impl ProviderSearchSection {
             hits,
             diagnostics,
             SearchTermination::limit_reached(),
+        )
+    }
+
+    pub fn partial(
+        identity: ProviderIdentity,
+        ranking: SearchRanking,
+        ordering: SearchOrdering,
+        hits: Vec<ProviderSearchHit>,
+        diagnostics: Vec<String>,
+    ) -> Result<Self, String> {
+        Self::bounded(
+            identity,
+            ProviderSectionStatus::Partial,
+            ranking,
+            ordering,
+            hits,
+            diagnostics,
+            SearchTermination::provider_failed(),
         )
     }
 
@@ -904,6 +986,9 @@ fn validate_search_termination(
             ProviderSectionStatus::Ok | ProviderSectionStatus::Empty,
             None
         ) | (
+            ProviderSectionStatus::Partial,
+            Some(SearchTerminationCode::ProviderFailed)
+        ) | (
             ProviderSectionStatus::LimitReached,
             Some(SearchTerminationCode::LimitReached)
         ) | (
@@ -1009,6 +1094,86 @@ pub struct CodeOutlineParameter {
 pub enum CodeIntelligenceReadData {
     Outline(CodeOutlineResult),
     Definition(CodeDefinitionResult),
+    CallGraph(CallGraphResult),
+}
+
+/// Направление ребра вызова. Вопросы «кто зовёт» и «кого зовёт» разные, и
+/// смешивать их в одном ответе с полем-признаком значило бы заставить читателя
+/// фильтровать страницу, чтобы задать свой вопрос.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallGraphDirection {
+    Callers,
+    Callees,
+}
+
+impl CallGraphDirection {
+    pub const fn analyzer_action(self) -> &'static str {
+        match self {
+            Self::Callers => "callers",
+            Self::Callees => "callees",
+        }
+    }
+
+    /// Поле счёта у ответа анализатора зависит от направления: `in_total` у
+    /// входящих рёбер, `out_total` у исходящих. Имена в snake_case — так их
+    /// пишет анализатор; замер 10.09.2026.
+    pub const fn total_field(self) -> &'static str {
+        match self {
+            Self::Callers => "in_total",
+            Self::Callees => "out_total",
+        }
+    }
+}
+
+/// Откуда взялось ребро вызова.
+///
+/// Граф вызовов BSL не точен, и анализатор об этом говорит сам: на корпусе из
+/// 242 рёбер семь были выведенными. Выдать выведенное ребро за разрешённое —
+/// соврать тому, кто по этому ответу решает, можно ли переименовать метод.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CallEdgeProvenance {
+    Resolved,
+    Inferred,
+}
+
+/// Состояние графа вызовов — закрытый признак, а не отсутствие счёта.
+///
+/// Индекс строится асинхронно, и до готовности анализатор отвечает названным
+/// `loading`. Опустить счёт нельзя: отсутствие поля неотличимо от «вызовов
+/// нет». Приём в продукте уже применён у `lines.state` и `props.contentCount`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CallGraphState {
+    Ready,
+    Indexing,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallGraphEdge {
+    /// Идентификатор метода на другом конце ребра.
+    pub id: String,
+    pub provenance: CallEdgeProvenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallGraphResult {
+    pub state: CallGraphState,
+    /// Счёт приходит от анализатора, а не из длины страницы, поэтому он верен
+    /// и тогда, когда страница урезана. `None` — только при `indexing` и
+    /// `unavailable`: состояние названо, и «не посчитано» не путается с нулём.
+    pub total: Option<u64>,
+    pub edges: Vec<CallGraphEdge>,
+    /// Ревизия графа и её свежесть по мнению самого анализатора.
+    pub revision: Option<u64>,
+    pub stale: Option<bool>,
+    /// Whether the provider returned every neighbouring call edge. Internal
+    /// admission fact; the public branch reports completeness through a cursor.
+    #[serde(skip)]
+    pub complete: bool,
 }
 
 /// Typed answer of `unica.code.definition` (ADR-0023). The index already
@@ -1019,6 +1184,10 @@ pub enum CodeIntelligenceReadData {
 pub struct CodeDefinitionResult {
     pub name: String,
     pub definitions: Vec<CodeDefinition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_freshness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_build_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1279,6 +1448,10 @@ mod tests {
     fn registry_resolves_an_executable_provider_for_read_capabilities() {
         let registry = CodeIntelligenceRegistry::new(vec![
             Arc::new(FakeProvider {
+                identity: ProviderId::GitGrep.identity(),
+                capabilities: vec![ProviderCapability::Search],
+            }),
+            Arc::new(FakeProvider {
                 identity: ProviderId::Rlm.identity(),
                 capabilities: vec![
                     ProviderCapability::Search,
@@ -1286,10 +1459,6 @@ mod tests {
                     ProviderCapability::Outline,
                     ProviderCapability::ObjectProfile,
                 ],
-            }),
-            Arc::new(FakeProvider {
-                identity: ProviderId::GitGrep.identity(),
-                capabilities: vec![ProviderCapability::Search],
             }),
         ])
         .unwrap();
@@ -1446,6 +1615,18 @@ mod tests {
             ProviderDeadline::new(deadline),
             ProviderDeadline::new(deadline)
         );
+        let start = Instant::now();
+        let earlier = ProviderDeadline::from_started_at(start, Duration::from_millis(20));
+        let later = ProviderDeadline::from_started_at(
+            start + Duration::from_millis(10),
+            Duration::from_millis(15),
+        );
+        // The later deadline has the smaller budget; selecting by budget alone
+        // would replenish the earlier invocation's remaining lifetime.
+        assert_eq!(earlier.earlier(later), earlier);
+        assert_eq!(later.earlier(earlier), earlier);
+        let expired = ProviderDeadline::from_started_at(start, Duration::ZERO);
+        assert_eq!(earlier.earlier(expired), expired);
     }
 
     #[test]
@@ -1599,5 +1780,40 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, "empty search section must carry an exact zero count");
+    }
+
+    #[test]
+    fn partial_section_requires_proven_hits_and_diagnostics() {
+        let identity = ProviderIdentity::new(ProviderRole::Semantic, "replacement-semantic");
+        assert!(ProviderSearchSection::partial(
+            identity.clone(),
+            SearchRanking::Provider,
+            SearchOrdering::Provider,
+            Vec::new(),
+            vec!["malformed result".to_string()],
+        )
+        .is_err());
+        assert!(ProviderSearchSection::partial(
+            identity,
+            SearchRanking::Provider,
+            SearchOrdering::Provider,
+            vec![ProviderSearchHit {
+                rank: Some(1),
+                provider_score: None,
+                location: SourceLocation::Unaddressable {
+                    source_set: "main".to_string(),
+                    owner_metadata_path: None,
+                    path: "Module.bsl".to_string(),
+                },
+                line: 1,
+                end_line: None,
+                symbol: None,
+                kind: None,
+                snippet: String::new(),
+                attributes: Map::new(),
+            }],
+            Vec::new(),
+        )
+        .is_err());
     }
 }

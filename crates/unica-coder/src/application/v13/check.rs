@@ -1,7 +1,197 @@
+use crate::application::invocation_store::MAX_CANONICAL_RESULT_BYTES;
+use crate::application::result_store::{ViewCursorBinding, ViewCursorStore};
+use crate::application::v13::view::PREFERRED_PAGE_BYTES;
 use crate::domain::address::QualifiedAddress;
-use crate::domain::refusal::RefusalCode;
+use crate::domain::invocation::DomainResult;
+use crate::domain::refusal::{RefusalCode, RefusalDetail};
 use serde::Serialize;
+use serde_json::{json, Value};
 use std::fmt;
+
+const CURSOR_SIZE_PLACEHOLDER: &str = "vc1.00000000000000000000000000000000";
+
+/// Page the diagnostics of one completed node check. The immutable snapshot
+/// holds the verdict and every finding; no first page is published unless
+/// each later indivisible finding fits the transport and the snapshot fits
+/// the bounded cursor store.
+pub(crate) fn page_diagnostics(
+    cursors: &ViewCursorStore,
+    binding: ViewCursorBinding,
+    fresh: Option<DomainResult>,
+    cursor: Option<&str>,
+) -> DomainResult {
+    let at = Some(binding.canonical_at.clone());
+    if let Some(cursor) = cursor {
+        let stored = match cursors.read(cursor, &binding, &binding.snapshot_id) {
+            Ok(stored) => stored,
+            Err(error) => {
+                return DomainResult::canonical_rejection(
+                    at,
+                    error.code(),
+                    "check cursor is invalid or its source revision changed",
+                )
+            }
+        };
+        let page = match prepare_check_page(
+            &stored.snapshot.node,
+            &stored.snapshot.items,
+            stored.offset,
+            binding.page_limit,
+        ) {
+            Ok(page) => page,
+            Err(message) => return check_page_refusal(at, message),
+        };
+        let next = if page.next_offset < stored.snapshot.items.len() {
+            match cursors.insert_next(&stored, page.next_offset, cursor) {
+                Some(next) => Some(next),
+                None => return check_page_refusal(at, "check continuation could not be retained"),
+            }
+        } else {
+            None
+        };
+        return check_page_result(&stored.snapshot.node, page.items, next, page.stopped_by);
+    }
+
+    let Some(mut result) = fresh else {
+        return DomainResult::canonical_rejection(
+            at,
+            RefusalCode::InvalidState,
+            "a new check page has no validation result",
+        );
+    };
+    let Some(data) = result.data.as_mut().and_then(Value::as_object_mut) else {
+        return DomainResult::canonical_rejection(
+            at,
+            RefusalCode::InvalidState,
+            "check result has no diagnostic collection",
+        );
+    };
+    let Some(Value::Array(items)) = data.remove("diagnostics") else {
+        return DomainResult::canonical_rejection(
+            at,
+            RefusalCode::InvalidState,
+            "check result has no diagnostic collection",
+        );
+    };
+    data.insert("diagnosticCount".to_string(), json!(items.len()));
+    let node = serde_json::to_value(&result).expect("a check result serializes");
+    if let Err(message) = preflight_check_pages(&node, &items) {
+        return check_page_refusal(at, message);
+    }
+    let page = match prepare_check_page(&node, &items, 0, binding.page_limit) {
+        Ok(page) => page,
+        Err(message) => return check_page_refusal(at, message),
+    };
+    let next = if page.next_offset < items.len() {
+        match cursors.insert_snapshot(binding, node.clone(), items, page.next_offset) {
+            Some(next) => Some(next),
+            None => {
+                return check_page_refusal(
+                    at,
+                    "check diagnostics exceed the bounded snapshot store",
+                )
+            }
+        }
+    } else {
+        None
+    };
+    check_page_result(&node, page.items, next, page.stopped_by)
+}
+
+struct PreparedCheckPage {
+    items: Vec<Value>,
+    next_offset: usize,
+    stopped_by: &'static str,
+}
+
+fn prepare_check_page(
+    node: &Value,
+    items: &[Value],
+    mut offset: usize,
+    limit: usize,
+) -> Result<PreparedCheckPage, &'static str> {
+    if offset > items.len() {
+        return Err("check cursor offset is invalid");
+    }
+    let base = check_page_result(node, Vec::new(), None, "complete");
+    let prefer_bytes = serialized_result_size(&base) <= PREFERRED_PAGE_BYTES;
+    let mut page_items = Vec::new();
+    let stopped_by = loop {
+        if offset == items.len() {
+            break "complete";
+        }
+        if page_items.len() == limit {
+            break "limit";
+        }
+        let mut candidate = page_items.clone();
+        candidate.push(items[offset].clone());
+        let probe = check_page_result(
+            node,
+            candidate.clone(),
+            (offset + 1 < items.len()).then(|| CURSOR_SIZE_PLACEHOLDER.to_string()),
+            "complete",
+        );
+        let bytes = serialized_result_size(&probe);
+        if bytes > MAX_CANONICAL_RESULT_BYTES {
+            if page_items.is_empty() {
+                return Err("one check diagnostic exceeds the transport result limit");
+            }
+            break "bytes";
+        }
+        if prefer_bytes && bytes > PREFERRED_PAGE_BYTES && !page_items.is_empty() {
+            break "bytes";
+        }
+        page_items = candidate;
+        offset += 1;
+    };
+    Ok(PreparedCheckPage {
+        items: page_items,
+        next_offset: offset,
+        stopped_by,
+    })
+}
+
+fn preflight_check_pages(node: &Value, items: &[Value]) -> Result<(), &'static str> {
+    if serialized_result_size(&check_page_result(node, Vec::new(), None, "complete"))
+        > MAX_CANONICAL_RESULT_BYTES
+    {
+        return Err("check result metadata exceed the transport result limit");
+    }
+    for (index, item) in items.iter().enumerate() {
+        let cursor = (index + 1 < items.len()).then(|| CURSOR_SIZE_PLACEHOLDER.to_string());
+        // `complete` is the longest stop reason. The last page may be three
+        // bytes larger than an intermediate page even without a cursor.
+        let probe = check_page_result(node, vec![item.clone()], cursor, "complete");
+        if serialized_result_size(&probe) > MAX_CANONICAL_RESULT_BYTES {
+            return Err("one check diagnostic exceeds the transport result limit");
+        }
+    }
+    Ok(())
+}
+
+fn check_page_result(
+    node: &Value,
+    items: Vec<Value>,
+    cursor: Option<String>,
+    stopped_by: &'static str,
+) -> DomainResult {
+    let mut result: DomainResult =
+        serde_json::from_value(node.clone()).expect("stored check result is a domain result");
+    result.data.as_mut().expect("check has data")["diagnostics"] = Value::Array(items);
+    result.cursor = cursor;
+    result.page = Some(json!({"stoppedBy": stopped_by}));
+    result
+}
+
+fn serialized_result_size(result: &DomainResult) -> usize {
+    serde_json::to_vec(result)
+        .expect("a check result containing JSON values serializes")
+        .len()
+}
+
+fn check_page_refusal(at: Option<String>, message: &'static str) -> DomainResult {
+    DomainResult::canonical_rejection(at, RefusalCode::ResultTooLarge, message)
+}
 
 /// The native validators `unica.check` can run. The list is closed: a node
 /// kind owns its validators, and the caller never names one on the wire.
@@ -103,6 +293,9 @@ pub(crate) enum CheckStep {
     Native(CheckValidator),
     /// The typed metadata validator of one object descriptor.
     Meta,
+    /// Диагностика BSL провайдером анализа. Отдельный шаг, а не «родной»
+    /// валидатор: он поднимает внешний инструмент, и это надо видеть в плане.
+    Bsl,
 }
 
 impl CheckStep {
@@ -110,6 +303,7 @@ impl CheckStep {
         match self {
             Self::Native(validator) => validator.name(),
             Self::Meta => "meta",
+            Self::Bsl => "bsl",
         }
     }
 }
@@ -135,6 +329,10 @@ pub(crate) fn plan_for_node(kind: &str, facts: NodeFacts) -> Vec<CheckStep> {
         "Role" => vec![CheckStep::Native(CheckValidator::Role)],
         "Subsystem" => vec![CheckStep::Native(CheckValidator::Subsystem)],
         "Interface" | "CommandInterface" => vec![CheckStep::Native(CheckValidator::Interface)],
+        // Узел с кодом проверяется анализатором BSL. Прежде план у него был
+        // пуст, и `check` отвечал «читается» — то есть молчал о находках,
+        // ради которых его и зовут.
+        "Module" | "Body" => vec![CheckStep::Bsl],
         other if crate::domain::metadata::MetadataKind::parse(other).is_ok() => {
             vec![CheckStep::Meta]
         }
@@ -149,10 +347,23 @@ pub(crate) enum CheckError {
 }
 
 impl CheckError {
+    /// Уточнение отказа, когда код покрывает несколько исходов.
+    ///
+    /// Недоступная зависимость валидатора — это отсутствующий поставщик:
+    /// собственного кода у неё нет с тех пор, как `dependency_unavailable`
+    /// снят из словаря как синоним. Уточнение держит код при себе, поэтому
+    /// разойтись они не могут.
+    pub(crate) const fn detail(&self) -> Option<RefusalDetail> {
+        match self {
+            Self::BadValue { .. } => None,
+            Self::DependencyUnavailable => Some(RefusalDetail::ProviderAbsent),
+        }
+    }
+
     pub(crate) const fn code(&self) -> RefusalCode {
         match self {
             Self::BadValue { .. } => RefusalCode::BadValue,
-            Self::DependencyUnavailable => RefusalCode::DependencyUnavailable,
+            Self::DependencyUnavailable => RefusalDetail::ProviderAbsent.code(),
         }
     }
 }
@@ -328,10 +539,178 @@ fn sanitize_message(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_native_outcome, plan_for_node, CheckStep, CheckValidator, NativeCheckOutcome,
-        NodeFacts, TemplateFlavour,
+        normalize_native_outcome, page_diagnostics, plan_for_node, CheckStep, CheckValidator,
+        NativeCheckOutcome, NodeFacts, TemplateFlavour,
     };
+    use crate::application::result_store::{ViewCursorBinding, ViewCursorStore, DEFAULT_TTL};
     use crate::domain::address::QualifiedAddress;
+    use crate::domain::invocation::DomainResult;
+    use serde_json::json;
+
+    fn check_binding(at: &str, revision: &str, limit: usize) -> ViewCursorBinding {
+        ViewCursorBinding {
+            canonical_at: at.to_string(),
+            projection: "check".to_string(),
+            normalized_filter: String::new(),
+            source_set_identity: "workspace:main".to_string(),
+            snapshot_id: revision.to_string(),
+            page_limit: limit,
+        }
+    }
+
+    fn check_result(count: usize) -> DomainResult {
+        let mut result = DomainResult::success("validation reported findings");
+        result.at = Some("main:CommonModule.Example.Module".to_string());
+        result.rev = Some("revision-1".to_string());
+        result.data = Some(json!({
+            "at": "main:CommonModule.Example.Module",
+            "kind": "Module",
+            "status": "failed",
+            "validators": ["bsl"],
+            "diagnostics": (0..count).map(|index| json!({
+                "severity": "error",
+                "code": format!("finding-{index}"),
+                "message": format!("finding {index}"),
+            })).collect::<Vec<_>>(),
+        }));
+        result
+    }
+
+    #[test]
+    fn check_pages_preserve_verdict_and_every_diagnostic_with_replay() {
+        let store = ViewCursorStore::default();
+        let binding = check_binding("main:CommonModule.Example.Module", "revision-1", 20);
+        let mut page = page_diagnostics(&store, binding.clone(), Some(check_result(53)), None);
+        assert!(page.ok, "{page:?}");
+        assert_eq!(page.data.as_ref().unwrap()["status"], "failed");
+        assert_eq!(page.data.as_ref().unwrap()["diagnosticCount"], 53);
+        assert_eq!(page.page.as_ref().unwrap()["stoppedBy"], "limit");
+        let mut found = Vec::new();
+        loop {
+            found.extend(
+                page.data.as_ref().unwrap()["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["code"].as_str().unwrap().to_string()),
+            );
+            let Some(cursor) = page.cursor.clone() else {
+                break;
+            };
+            let replay = page_diagnostics(&store, binding.clone(), None, Some(&cursor));
+            assert_eq!(
+                replay,
+                page_diagnostics(&store, binding.clone(), None, Some(&cursor))
+            );
+            assert_eq!(replay.data.as_ref().unwrap()["status"], "failed");
+            page = replay;
+        }
+        assert_eq!(
+            found,
+            (0..53)
+                .map(|index| format!("finding-{index}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(page.page.as_ref().unwrap()["stoppedBy"], "complete");
+    }
+
+    #[test]
+    fn check_cursor_rejects_other_node_and_replays_saved_diagnostics_after_source_change() {
+        let store = ViewCursorStore::default();
+        let binding = check_binding("main:CommonModule.Example.Module", "revision-1", 20);
+        let first = page_diagnostics(&store, binding.clone(), Some(check_result(21)), None);
+        let cursor = first.cursor.as_deref().unwrap();
+        let other = page_diagnostics(
+            &store,
+            check_binding("main:CommonModule.Other.Module", "revision-1", 20),
+            None,
+            Some(cursor),
+        );
+        assert_eq!(other.diagnostics[0]["code"], "invalid_cursor");
+        let stale = page_diagnostics(
+            &store,
+            check_binding("main:CommonModule.Example.Module", "revision-2", 20),
+            None,
+            Some(cursor),
+        );
+        assert!(stale.ok);
+        assert_eq!(stale, page_diagnostics(&store, binding, None, Some(cursor)));
+    }
+
+    #[test]
+    fn check_returns_whole_large_finding_and_refuses_late_oversize_before_page_one() {
+        let store = ViewCursorStore::default();
+        let binding = check_binding("main:CommonModule.Example.Module", "revision-1", 20);
+        let mut large = check_result(2);
+        large.data.as_mut().unwrap()["diagnostics"][0]["message"] = json!("x".repeat(70_000));
+        let first = page_diagnostics(&store, binding.clone(), Some(large), None);
+        assert!(first.ok, "{first:?}");
+        assert_eq!(
+            first.data.as_ref().unwrap()["diagnostics"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(first.page.as_ref().unwrap()["stoppedBy"], "bytes");
+        let next = page_diagnostics(&store, binding.clone(), None, first.cursor.as_deref());
+        assert_eq!(
+            next.data.as_ref().unwrap()["diagnostics"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let mut oversize = check_result(2);
+        oversize.data.as_mut().unwrap()["diagnostics"][1]["message"] =
+            json!("x".repeat(8 * 1024 * 1024));
+        let refused = page_diagnostics(&store, binding, Some(oversize), None);
+        assert!(!refused.ok);
+        assert_eq!(refused.diagnostics[0]["code"], "result_too_large");
+        assert!(refused.cursor.is_none());
+    }
+
+    #[test]
+    fn check_refuses_before_first_page_when_snapshot_cannot_be_retained() {
+        let store = ViewCursorStore::new(DEFAULT_TTL, 128, 400);
+        let result = page_diagnostics(
+            &store,
+            check_binding("main:CommonModule.Example.Module", "revision-1", 20),
+            Some(check_result(21)),
+            None,
+        );
+        assert!(!result.ok);
+        assert_eq!(result.diagnostics[0]["code"], "result_too_large");
+        assert!(result.cursor.is_none());
+    }
+
+    #[test]
+    fn late_finding_at_transport_edge_is_refused_before_issuing_a_cursor() {
+        let mut result = check_result(2);
+        result.data.as_mut().unwrap()["diagnostics"][1]["message"] = json!("");
+        let mut node_result = result.clone();
+        let node_data = node_result.data.as_mut().unwrap().as_object_mut().unwrap();
+        node_data.remove("diagnostics");
+        node_data.insert("diagnosticCount".to_string(), json!(2));
+        let node = serde_json::to_value(node_result).unwrap();
+        let item = result.data.as_ref().unwrap()["diagnostics"][1].clone();
+        let baseline = super::check_page_result(&node, vec![item], None, "bytes");
+        let message_len = crate::application::invocation_store::MAX_CANONICAL_RESULT_BYTES
+            - super::serialized_result_size(&baseline);
+        result.data.as_mut().unwrap()["diagnostics"][1]["message"] = json!("x".repeat(message_len));
+
+        let store = ViewCursorStore::default();
+        let answer = page_diagnostics(
+            &store,
+            check_binding("main:CommonModule.Example.Module", "revision-1", 1),
+            Some(result),
+            None,
+        );
+        assert!(!answer.ok, "{answer:?}");
+        assert_eq!(answer.diagnostics[0]["code"], "result_too_large");
+        assert!(answer.cursor.is_none());
+    }
 
     #[test]
     fn every_node_kind_owns_its_validators_without_a_caller_choice() {
@@ -388,7 +767,13 @@ mod tests {
             [CheckStep::Native(CheckValidator::Interface)]
         );
         assert_eq!(plan_for_node("Catalog", plain), [CheckStep::Meta]);
-        assert!(plan_for_node("Module", plain).is_empty());
+        // Узел с кодом owns анализатор BSL. Прежде план у него был пуст, и
+        // `check` отвечал «читается», молча пропуская находки, ради которых
+        // его и зовут.
+        assert_eq!(plan_for_node("Module", plain), [CheckStep::Bsl]);
+        assert_eq!(plan_for_node("Body", plain), [CheckStep::Bsl]);
+        // Метод разбирается не отдельно: анализатор читает модуль целиком, и
+        // отдельный шаг на методе поднимал бы инструмент дважды на один файл.
         assert!(plan_for_node("Method", plain).is_empty());
     }
 
@@ -459,7 +844,7 @@ mod tests {
             NativeCheckOutcome::unavailable("validator engine is not installed"),
         )
         .unwrap_err();
-        assert_eq!(error.code().as_str(), "dependency_unavailable");
+        assert_eq!(error.code().as_str(), "provider_unavailable");
         assert!(!error.to_string().contains("engine"));
     }
 }

@@ -886,6 +886,7 @@ pub(crate) struct CfInfoData {
     pub(crate) child_objects: Vec<CfChildObjectCount>,
     pub(crate) total_objects: usize,
     pub(crate) home_page: Option<CfHomePageData>,
+    pub(crate) interface: Option<CfInterfaceData>,
 }
 
 #[derive(serde::Serialize)]
@@ -913,6 +914,20 @@ pub(crate) struct CfInfoProperties {
 pub(crate) struct CfChildObjectCount {
     pub(crate) kind: String,
     pub(crate) count: usize,
+}
+
+/// Командный интерфейс конфигурации.
+///
+/// В корневом `Ext/CommandInterface.xml` лежит только порядок подсистем
+/// верхнего уровня — команд там нет, они у подсистем. Поэтому интерфейс
+/// конфигурации это свойство корня, рядом с `homePage`, а не отдельный узел:
+/// листать и адресовать поштучно тут нечего.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CfInterfaceData {
+    /// Ссылки на подсистемы в объявленном порядке, как их пишет платформа:
+    /// `Subsystem.Планирование`. Набором исходников их дополняет проекция.
+    pub(crate) subsystem_order: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -974,10 +989,42 @@ pub(crate) fn cf_home_page_item_data(items: &[CfHomePageItem]) -> Vec<CfHomePage
         .collect()
 }
 
+/// Разбирает корневой `Ext/CommandInterface.xml`.
+///
+/// Документ несёт единственную секцию — `SubsystemsOrder`, список ссылок вида
+/// `Subsystem.Планирование` в порядке, заданном разработчиком. Порядок —
+/// содержательный факт: он задаёт, как разделы встают в интерфейсе.
+pub(crate) fn parse_cf_command_interface_xml(text: &str) -> Result<CfInterfaceData, String> {
+    const CI_NS: &str = "http://v8.1c.ru/8.3/xcf/extrnprops";
+
+    let doc = Document::parse(text.trim_start_matches('\u{feff}'))
+        .map_err(|err| format!("CommandInterface XML parse error: {err}"))?;
+    let root = doc.root_element();
+    if root.tag_name().name() != "CommandInterface" {
+        return Err(
+            "[ERROR] Not a command-interface XML file (no CommandInterface root)".to_string(),
+        );
+    }
+    let subsystem_order = root
+        .children()
+        .filter(|node| node.tag_name().name() == "SubsystemsOrder")
+        .flat_map(|section| section.children())
+        .filter(|node| {
+            node.tag_name().name() == "Subsystem"
+                && node.tag_name().namespace().is_none_or(|ns| ns == CI_NS)
+        })
+        .filter_map(|node| node.text())
+        .map(|text| text.trim().to_string())
+        .filter(|reference| !reference.is_empty())
+        .collect();
+    Ok(CfInterfaceData { subsystem_order })
+}
+
 pub(crate) fn parse_cf_info_xml(
     text: &str,
     support: ConfigurationSupportData,
     home_page: Option<CfHomePageData>,
+    interface: Option<CfInterfaceData>,
 ) -> Result<ParsedCfInfo, String> {
     const MD_NS: &str = "http://v8.1c.ru/8.3/MDClasses";
 
@@ -1065,6 +1112,7 @@ pub(crate) fn parse_cf_info_xml(
             .collect(),
         total_objects,
         home_page,
+        interface,
     };
     Ok(ParsedCfInfo {
         data,
@@ -1091,7 +1139,13 @@ pub(crate) fn analyze_cf_info(
             left: cf_home_page_item_data(&layout.left),
             right: cf_home_page_item_data(&layout.right),
         });
-        let parsed = parse_cf_info_xml(&text, support, home_page)?;
+        // Тот же документ, что читает канонический корень: интерфейс
+        // конфигурации — её свойство, и здесь он не должен расходиться.
+        let interface = fs::read_to_string(config_dir.join("Ext/CommandInterface.xml"))
+            .ok()
+            .map(|text| parse_cf_command_interface_xml(&text))
+            .transpose()?;
+        let parsed = parse_cf_info_xml(&text, support, home_page, interface)?;
         Ok((parsed.data, config_path))
     })();
 
@@ -4420,7 +4474,7 @@ pub(crate) struct CfInitPlannedXml {
     pub(crate) client_application_interface: PathBuf,
 }
 
-/// ADR-0073: проверить спланированный образ `cf.init`, ничего не публикуя.
+/// Проверить спланированный образ `cf.init`, ничего не публикуя.
 ///
 /// Полная проверка конфигурации читает соседей — язык, начальную страницу,
 /// формы, — поэтому образ собирается целиком: существующее содержимое цели
@@ -4556,7 +4610,7 @@ pub(crate) fn create_configuration_scaffold_with_data(
     cf_init_execute(args, context, false)
 }
 
-/// ADR-0073: предпросмотр строит тот же план, что применение — та же
+/// Предпросмотр строит тот же план, что применение — та же
 /// валидация, те же гварды, те же байты и пути, — но транзакция не коммитится.
 pub(crate) fn preview_configuration_scaffold_with_data(
     args: &Map<String, Value>,
@@ -4785,7 +4839,7 @@ fn cf_init_execute(
             Value::String(config.display().to_string()),
         )]);
         if preview {
-            // ADR-0073 §1: предпросмотр обязан выполнить ту же предметную
+            // Предпросмотр обязан выполнить ту же предметную
             // валидацию, что применение. Create-only конфликты транзакция уже
             // отвергла при планировании; здесь добавляются те же семантические
             // проверки плановых байтов и полная проверка пост-образа, который
@@ -4926,7 +4980,7 @@ pub(crate) mod cf_init_transaction_tests {
         }
     }
 
-    /// ADR-0073: предпросмотр строит тот же план и ту же форму данных, что
+    /// Предпросмотр строит тот же план и ту же форму данных, что
     /// применение, и не пишет ни байта.
     #[test]
     fn cf_init_preview_shares_the_apply_data_shape_and_writes_nothing() {
@@ -5137,7 +5191,7 @@ pub(crate) mod cf_init_transaction_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// ADR-0073 §1: create-only конфликт виден предпросмотру так же, как
+    /// Create-only конфликт виден предпросмотру так же, как
     /// применению, для каждого планового артефакта по отдельности.
     #[test]
     fn cf_init_preview_and_apply_agree_on_each_pre_existing_artifact() {
@@ -5170,7 +5224,7 @@ pub(crate) mod cf_init_transaction_tests {
         }
     }
 
-    /// ADR-0073 §1: предпросмотр выполняет ту же предметную валидацию, что и
+    /// Предпросмотр выполняет ту же предметную валидацию, что и
     /// применение. Имя, которое применение отвергает пост-валидацией, обязано
     /// быть отвергнуто и предпросмотром — иначе безопасный вызов по умолчанию
     /// обещает то, чего применение не сделает.
@@ -5437,5 +5491,54 @@ pub(super) mod cf_read_selector_bridge_tests {
         assert_eq!(logical.ok, physical.ok, "{logical:?} vs {physical:?}");
         assert_eq!(logical.errors, physical.errors);
         let _ = fs::remove_dir_all(&context.workspace_root);
+    }
+}
+
+#[cfg(test)]
+mod configuration_interface_tests {
+    use super::*;
+
+    /// Форма взята из настоящего корневого `Ext/CommandInterface.xml`
+    /// конфигурации класса УТ: единственная секция `SubsystemsOrder` и ссылки
+    /// на подсистемы верхнего уровня. Команд в корневом документе не бывает —
+    /// они у подсистем, и потому интерфейс конфигурации это свойство, а не
+    /// узел с ветвью.
+    const ROOT_DOCUMENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<CommandInterface xmlns="http://v8.1c.ru/8.3/xcf/extrnprops" version="2.20">
+	<SubsystemsOrder>
+		<Subsystem>Subsystem.Планирование</Subsystem>
+		<Subsystem>Subsystem.Продажи</Subsystem>
+	</SubsystemsOrder>
+</CommandInterface>"#;
+
+    #[test]
+    fn the_root_interface_is_the_declared_order_of_top_level_subsystems() {
+        let parsed = parse_cf_command_interface_xml(ROOT_DOCUMENT).expect("документ разбирается");
+        assert_eq!(
+            parsed.subsystem_order,
+            vec!["Subsystem.Планирование", "Subsystem.Продажи"],
+            "порядок содержателен: он задаёт, как разделы встают в интерфейсе"
+        );
+    }
+
+    #[test]
+    fn a_document_that_is_not_a_command_interface_is_refused_by_name() {
+        let error = parse_cf_command_interface_xml(
+            r#"<?xml version="1.0"?><MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"/>"#,
+        )
+        .expect_err("чужой корень не принимается");
+        assert!(
+            error.contains("no CommandInterface root"),
+            "отказ обязан назвать, чего не хватило: {error}"
+        );
+    }
+
+    #[test]
+    fn an_interface_without_an_order_section_is_empty_not_a_failure() {
+        let parsed = parse_cf_command_interface_xml(
+            r#"<CommandInterface xmlns="http://v8.1c.ru/8.3/xcf/extrnprops"/>"#,
+        )
+        .expect("пустой интерфейс — законное состояние");
+        assert!(parsed.subsystem_order.is_empty());
     }
 }
