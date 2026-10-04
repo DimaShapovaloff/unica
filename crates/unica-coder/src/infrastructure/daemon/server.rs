@@ -7615,6 +7615,301 @@ struct ActorLogicalReadLease {"#,
     }
 
     #[test]
+    fn canonical_html_field_creation_binding_and_neighbor_edit_preserve_form_contract() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("src");
+        std::fs::create_dir_all(source.join("Documents")).unwrap();
+        std::fs::write(
+            workspace.path().join("v8project.yaml"),
+            "format: DESIGNER\nsource-set:\n  - name: main\n    type: CONFIGURATION\n    path: src\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("Configuration.xml"),
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Configuration><Properties><Name>Store</Name></Properties><ChildObjects><Document>Order</Document></ChildObjects></Configuration></MetaDataObject>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("Documents/Order.xml"),
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:app="http://v8.1c.ru/8.2/managed-application/core" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.20"><Document uuid="11111111-1111-4111-8111-111111111111"><Properties><Name>Order</Name><Synonym/><Comment/></Properties><ChildObjects/></Document></MetaDataObject>"#,
+        )
+        .unwrap();
+        let runtime = V5CanonicalInvocationRuntime::new(
+            Arc::new(
+                crate::infrastructure::daemon::v13_service::CanonicalV13ReadService::default(),
+            ),
+            Arc::new(TokioClock),
+        );
+        let workspace_hint = std::fs::canonicalize(workspace.path()).unwrap();
+        let call = |tool, arguments| {
+            let request =
+                InvocationRequest::new(tool, arguments, workspace_hint.to_string_lossy(), 7_000)
+                    .unwrap();
+            direct_v5(&runtime, request).unwrap()
+        };
+        let apply_pair = |at: &str, ops: serde_json::Value| {
+            let before = crate::test_support::tree_snapshot(&source);
+            let preview = call(
+                ToolIdentity::Apply,
+                serde_json::json!({"at": at, "ops": ops}),
+            );
+            assert!(preview.ok, "preview failed: {preview:?}");
+            assert_eq!(crate::test_support::tree_snapshot(&source), before);
+            let token = &preview.data.as_ref().unwrap()["executionToken"];
+            assert!(token.is_string(), "{preview:?}");
+            let published = call(
+                ToolIdentity::Apply,
+                serde_json::json!({"executionToken": token}),
+            );
+            assert!(published.ok, "publication failed: {published:?}");
+            let plan_hash = &preview.data.as_ref().unwrap()["planHash"];
+            assert!(plan_hash.is_string(), "{preview:?}");
+            assert_eq!(plan_hash, &published.data.as_ref().unwrap()["planHash"]);
+        };
+        let at = "main:Document.Order.Form.Main";
+        let item_at = "main:Document.Order.Form.Main.Item.Content.Item.Html";
+        apply_pair(
+            at,
+            serde_json::json!([{"op": "form.create", "args": {
+                "values": {"name": "Main", "type": "ObjectForm"}
+            }}]),
+        );
+        apply_pair(
+            at,
+            serde_json::json!([
+                {"op": "formAttribute.add", "args": {"items": [
+                    {"name": "HtmlSource", "type": "String"}
+                ]}},
+                {"op": "element.add", "args": {"items": [
+                    {"name": "Content", "type": "Group"}, {
+                    "name": "Html", "type": "HTMLDocumentField", "path": "HtmlSource", "into": "Content",
+                    "titleLocation": "none", "width": 1, "height": 1,
+                    "autoMaxWidth": false, "skipOnInput": true, "on": ["OnClick"]
+                }]}}
+            ]),
+        );
+        apply_pair(
+            at,
+            serde_json::json!([{"op": "event.bind", "args": {"values": {
+                "element": "Html", "event": "DocumentComplete", "handler": "HtmlDocumentComplete"
+            }}}]),
+        );
+
+        let form_path = source.join("Documents/Order/Forms/Main/Ext/Form.xml");
+        let xml = std::fs::read_to_string(&form_path).unwrap();
+        let xml = xml.trim_start_matches('\u{feff}');
+        let parsed = roxmltree::Document::parse(xml).unwrap();
+        let html = parsed
+            .descendants()
+            .find(|node| {
+                node.has_tag_name("HTMLDocumentField") && node.attribute("name") == Some("Html")
+            })
+            .expect("typed element.add creates the platform HTML element");
+        let group = html.parent().unwrap().parent().unwrap();
+        assert!(group.has_tag_name("UsualGroup"), "{xml}");
+        assert_eq!(group.attribute("name"), Some("Content"));
+        for (property, value) in [
+            ("DataPath", "HtmlSource"),
+            ("TitleLocation", "None"),
+            ("Width", "1"),
+            ("Height", "1"),
+            ("AutoMaxWidth", "false"),
+            ("SkipOnInput", "true"),
+        ] {
+            assert_eq!(
+                html.children()
+                    .find(|node| node.has_tag_name(property))
+                    .and_then(|node| node.text()),
+                Some(value),
+                "{property}: {xml}"
+            );
+        }
+        for companion in ["ContextMenu", "ExtendedTooltip"] {
+            let nodes: Vec<_> = html
+                .children()
+                .filter(|node| node.has_tag_name(companion))
+                .collect();
+            assert_eq!(nodes.len(), 1, "{companion}: {xml}");
+            assert!(nodes[0].attribute("id").is_some(), "{xml}");
+        }
+        let events: Vec<_> = html
+            .descendants()
+            .filter(|node| node.has_tag_name("Event"))
+            .collect();
+        assert_eq!(events.len(), 2, "{xml}");
+        assert!(
+            events
+                .iter()
+                .any(|node| node.attribute("name") == Some("OnClick")
+                    && node.text().is_some_and(|handler| !handler.is_empty())),
+            "{xml}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|node| node.attribute("name") == Some("DocumentComplete")
+                    && node.text() == Some("HtmlDocumentComplete")),
+            "{xml}"
+        );
+        let preserved_html = xml[html.range()].to_string();
+
+        for target in [at, item_at] {
+            let viewed = call(ToolIdentity::View, serde_json::json!({"at": target}));
+            assert!(viewed.ok, "{viewed:?}");
+            assert_eq!(viewed.at.as_deref(), Some(target));
+            if target == item_at {
+                assert_eq!(
+                    viewed.data.as_ref().unwrap()["props"]["tag"],
+                    "[HTMLDocumentField]"
+                );
+            }
+        }
+        let checked = call(ToolIdentity::Check, serde_json::json!({"at": at}));
+        assert!(checked.ok, "{checked:?}");
+        assert_eq!(
+            checked.data.as_ref().unwrap()["diagnosticCount"],
+            0,
+            "{checked:?}"
+        );
+
+        // A later operation must not discard an HTML field it did not create.
+        apply_pair(
+            at,
+            serde_json::json!([{"op": "element.add", "args": {"items": [
+                {"name": "Neighbor", "type": "InputField", "path": "HtmlSource", "into": "Content", "after": "Html"}
+            ]}}]),
+        );
+        let with_neighbor = std::fs::read_to_string(&form_path).unwrap();
+        let with_neighbor = with_neighbor.trim_start_matches('\u{feff}');
+        let parsed = roxmltree::Document::parse(with_neighbor).unwrap();
+        let html = parsed
+            .descendants()
+            .find(|node| node.has_tag_name("HTMLDocumentField"))
+            .unwrap();
+        assert_eq!(&with_neighbor[html.range()], preserved_html);
+        assert_eq!(
+            html.next_sibling_element().unwrap().attribute("name"),
+            Some("Neighbor")
+        );
+        let child_items = parsed
+            .descendants()
+            .find(|node| node.has_tag_name("ChildItems"))
+            .unwrap();
+        let ids: Vec<_> = child_items
+            .descendants()
+            .filter_map(|node| node.attribute("id"))
+            .collect();
+        let unique: std::collections::BTreeSet<_> = ids.iter().copied().collect();
+        assert_eq!(
+            ids.len(),
+            unique.len(),
+            "UI elements and companions have distinct IDs: {with_neighbor}"
+        );
+
+        // Poison a batch after a valid addition: neither operation may leak to disk.
+        let before = crate::test_support::tree_snapshot(&source);
+        {
+            let refused = call(
+                ToolIdentity::Apply,
+                serde_json::json!({
+                    "at": at,
+                    "ops": [
+                        {"op": "element.add", "args": {"items": [{"name": "MustNotAppear", "type": "InputField", "path": "HtmlSource"}]}},
+                        {"op": "event.bind", "args": {"values": {"element": "Html", "event": "OnChange", "handler": "InvalidHandler"}}}
+                    ]
+                }),
+            );
+            assert!(!refused.ok, "{refused:?}");
+            assert!(refused
+                .data
+                .as_ref()
+                .is_none_or(|data| data.get("executionToken").is_none()));
+            assert!(
+                refused
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.to_string().contains("FORM_EVENT_NOT_ALLOWED")),
+                "{refused:?}"
+            );
+            assert_eq!(crate::test_support::tree_snapshot(&source), before);
+        }
+        for invalid_item in [
+            serde_json::json!({"name": "MixedInput", "type": "InputField", "html": "MixedInput", "path": "HtmlSource"}),
+            serde_json::json!({"name": "MixedGroup", "type": "Group", "html": "MixedGroup"}),
+            serde_json::json!({"name": "MixedBar", "type": "CommandBar", "html": "MixedBar"}),
+            serde_json::json!({"name": "LegacyHtml", "html": "LegacyHtml", "path": "HtmlSource"}),
+            serde_json::json!({"name": "RepeatedHtml", "type": "HTMLDocumentField", "html": "RepeatedHtml"}),
+            serde_json::json!({"name": "InvalidHtml", "type": "HTMLDocumentField", "on": ["OnChange"]}),
+            serde_json::json!({"name": "InvalidHtml", "type": "HTMLDocumentField", "width": -1}),
+            serde_json::json!({"name": "InvalidGroup", "type": "Group", "children": [
+                {"name": "InvalidHtml", "type": "HTMLDocumentField"}
+            ]}),
+        ] {
+            {
+                let refused = call(
+                    ToolIdentity::Apply,
+                    serde_json::json!({
+                        "at": at,
+                        "ops": [{"op": "element.add", "args": {"items": [invalid_item]}}]
+                    }),
+                );
+                assert!(
+                    !refused.ok,
+                    "invalid HTML definition was accepted: {refused:?}"
+                );
+                assert!(!refused.diagnostics.is_empty(), "{refused:?}");
+                assert!(refused
+                    .data
+                    .as_ref()
+                    .is_none_or(|data| data.get("executionToken").is_none()));
+                assert_eq!(crate::test_support::tree_snapshot(&source), before);
+            }
+        }
+
+        let original = std::fs::read_to_string(&form_path).unwrap();
+        let parsed = roxmltree::Document::parse(original.trim_start_matches('\u{feff}')).unwrap();
+        let imported_id = parsed
+            .descendants()
+            .find(|node| node.attribute("name") == Some("Html"))
+            .unwrap()
+            .attribute("id")
+            .unwrap();
+        let marker = format!("name=\"Html\" id=\"{imported_id}\"");
+        assert_eq!(original.matches(&marker).count(), 1);
+        for highest in [usize::MAX, usize::MAX - 1, usize::MAX - 2] {
+            let exhausted = original.replace(&marker, &format!("name=\"Html\" id=\"{highest}\""));
+            std::fs::write(&form_path, exhausted).unwrap();
+            let before = crate::test_support::tree_snapshot(&source);
+            let refused = call(
+                ToolIdentity::Apply,
+                serde_json::json!({
+                    "at": at,
+                    "ops": [{"op": "element.add", "args": {"items": [{
+                        "name": "OverflowHtml", "type": "HTMLDocumentField", "path": "HtmlSource"
+                    }]}}]
+                }),
+            );
+            assert!(!refused.ok, "highest={highest}: {refused:?}");
+            assert!(
+                refused
+                    .data
+                    .as_ref()
+                    .is_none_or(|data| data.get("executionToken").is_none()),
+                "{refused:?}"
+            );
+            assert!(
+                refused
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.to_string().contains("Form ID space exhausted")),
+                "{refused:?}"
+            );
+            assert!(refused.changed.is_empty(), "{refused:?}");
+            assert_eq!(crate::test_support::tree_snapshot(&source), before);
+        }
+    }
+
+    #[test]
     fn canonical_apply_constant_type_create_edit_view_and_atomic_refusal() {
         let workspace = tempfile::tempdir().unwrap();
         let source = workspace.path().join("src");

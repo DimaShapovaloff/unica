@@ -6796,6 +6796,7 @@ pub(crate) fn form_edit_element_summary(element: &Value) -> Option<String> {
         FormEditElementDefinitionKind::Group => "Group",
         FormEditElementDefinitionKind::CheckBox => "CheckBox",
         FormEditElementDefinitionKind::InputField => "Input",
+        FormEditElementDefinitionKind::HtmlDocumentField => "HTMLDocumentField",
         FormEditElementDefinitionKind::AutoCommandBar => return None,
     };
     let name = form_edit_element_display_name(element)?;
@@ -7519,6 +7520,7 @@ enum FormEditElementDefinitionKind {
     Group,
     CheckBox,
     InputField,
+    HtmlDocumentField,
     AutoCommandBar,
 }
 
@@ -7540,6 +7542,7 @@ impl FormEditElementDefinitionKind {
             (Self::Page, "page", object.contains_key("page")),
             (Self::CheckBox, "check", object.contains_key("check")),
             (Self::InputField, "input", object.contains_key("input")),
+            (Self::HtmlDocumentField, "html", object.contains_key("html")),
             (
                 Self::AutoCommandBar,
                 "autoCmdBar/autoCommandBar",
@@ -7593,6 +7596,7 @@ impl FormEditElementDefinitionKind {
             Self::Group => FormElementKind::Group,
             Self::CheckBox => FormElementKind::CheckBoxField,
             Self::InputField => FormElementKind::InputField,
+            Self::HtmlDocumentField => FormElementKind::HtmlDocumentField,
         }
     }
 
@@ -7608,6 +7612,7 @@ impl FormEditElementDefinitionKind {
             Self::Group => (&["group"], "group"),
             Self::CheckBox => (&["check"], "checkbox"),
             Self::InputField => (&["input"], "input"),
+            Self::HtmlDocumentField => (&["html"], "HTML document field"),
             Self::AutoCommandBar => (&["autoCmdBar", "autoCommandBar"], "auto command bar"),
         };
         form_edit_definition_element_name(object, keys, description)
@@ -8079,6 +8084,7 @@ fn form_compile_binding_property_supported(
         "path" => matches!(
             kind,
             FormEditElementDefinitionKind::Table
+                | FormEditElementDefinitionKind::HtmlDocumentField
                 | FormEditElementDefinitionKind::LabelField
                 | FormEditElementDefinitionKind::CheckBox
                 | FormEditElementDefinitionKind::InputField
@@ -8628,7 +8634,8 @@ fn form_compile_validate_element_property_tree(elements: &[Value]) -> Result<(),
                     form_compile_title_location,
                 )?;
             }
-            FormEditElementDefinitionKind::InputField => {
+            FormEditElementDefinitionKind::InputField
+            | FormEditElementDefinitionKind::HtmlDocumentField => {
                 form_compile_validate_normalized_element_enum(
                     object,
                     "titleLocation",
@@ -8875,6 +8882,9 @@ fn emit_form_element_with_context(
         }
         FormEditElementDefinitionKind::InputField => {
             emit_form_input(lines, object, kind.name(object)?, indent, ids)
+        }
+        FormEditElementDefinitionKind::HtmlDocumentField => {
+            emit_form_html_document_field(lines, object, kind.name(object)?, indent, ids)
         }
         FormEditElementDefinitionKind::AutoCommandBar => Ok(()),
     }
@@ -9630,6 +9640,79 @@ fn emit_form_decoration_title(
         );
     }
     lines.extend(rendered);
+}
+
+fn emit_form_html_document_field(
+    lines: &mut Vec<String>,
+    element: &Map<String, Value>,
+    name: &str,
+    indent: &str,
+    ids: &mut FormIdAllocator,
+) -> Result<(), String> {
+    let id = ids.next()?;
+    lines.push(format!(
+        "{indent}<HTMLDocumentField name=\"{}\" id=\"{id}\">",
+        escape_xml(name)
+    ));
+    let inner = format!("{indent}\t");
+    emit_form_binding_path_property(lines, element, "path", "DataPath", &inner);
+    if let Some(title) = element.get("title").and_then(Value::as_str) {
+        emit_form_mltext(lines, &inner, "Title", title);
+    }
+    emit_form_element_tooltip(lines, element, &inner);
+    for key in [
+        "visible",
+        "hidden",
+        "userVisible",
+        "enabled",
+        "disabled",
+        "readOnly",
+    ] {
+        form_compile_validate_element_boolean(element, key)?;
+    }
+    emit_form_common_flags(lines, element, &inner);
+    form_compile_validate_element_boolean(element, "skipOnInput")?;
+    if let Some(value) = element.get("skipOnInput").and_then(Value::as_bool) {
+        lines.push(format!("{inner}<SkipOnInput>{value}</SkipOnInput>"));
+    }
+    if let Some(value) = element.get("titleLocation").and_then(Value::as_str) {
+        let location = form_compile_title_location(value).unwrap_or(value);
+        lines.push(format!(
+            "{inner}<TitleLocation>{}</TitleLocation>",
+            escape_xml(location)
+        ));
+    }
+    for (key, tag, auto_key, auto_tag) in [
+        ("width", "Width", "autoMaxWidth", "AutoMaxWidth"),
+        ("height", "Height", "autoMaxHeight", "AutoMaxHeight"),
+    ] {
+        if let Some(value) = element.get(key) {
+            let number = value.as_u64().filter(|number| *number <= u32::MAX as u64)
+                .ok_or_else(|| format!("form HTML field property {key} must be an integer in 0..=4294967295 for 8.3.27"))?;
+            lines.push(format!("{inner}<{tag}>{number}</{tag}>"));
+        }
+        form_compile_validate_element_boolean(element, auto_key)?;
+        if let Some(value) = element.get(auto_key).and_then(Value::as_bool) {
+            lines.push(format!("{inner}<{auto_tag}>{value}</{auto_tag}>"));
+        }
+    }
+    emit_form_companion(
+        lines,
+        "ContextMenu",
+        &format!("{name}КонтекстноеМеню"),
+        &inner,
+        ids,
+    )?;
+    emit_form_companion(
+        lines,
+        "ExtendedTooltip",
+        &format!("{name}РасширеннаяПодсказка"),
+        &inner,
+        ids,
+    )?;
+    emit_form_element_events(lines, element, name, &inner);
+    lines.push(format!("{indent}</HTMLDocumentField>"));
+    Ok(())
 }
 
 pub(crate) fn emit_form_label_field(
@@ -18125,6 +18208,246 @@ pub(crate) mod tests {
         };
         assert!(error.contains("FORM_EVENT_NOT_ALLOWED"), "{error}");
         assert!(error.contains("non-empty path/DataPath"), "{error}");
+    }
+
+    #[test]
+    fn html_document_field_edit_refuses_each_exhausted_allocation_without_writing() {
+        let context = temp_context("html-exhausted-ids");
+        let form_path = context.cwd.join("Form.xml");
+        for (highest, allocation) in [
+            (usize::MAX, "HTMLDocumentField"),
+            (usize::MAX - 1, "ContextMenu"),
+            (usize::MAX - 2, "ExtendedTooltip"),
+        ] {
+            // A known input kind isolates HTML emission from the imported-kind scan.
+            let original = form_edit_remove_test_xml(&format!(
+                r#"<InputField name="Imported" id="{highest}"/>"#
+            ));
+            fs::write(&form_path, &original).unwrap();
+            let args = Map::from_iter([
+                (
+                    "FormPath".to_string(),
+                    json!(form_path.display().to_string()),
+                ),
+                (
+                    "definition".to_string(),
+                    json!({"elements": [{"html": "AddedHtml"}]}),
+                ),
+            ]);
+            let before = crate::test_support::tree_snapshot(&context.cwd);
+            for edit in [preview_form_edit, edit_form] {
+                let outcome = edit(&args, &context);
+                assert!(!outcome.ok, "{allocation}: {outcome:?}");
+                assert!(
+                    outcome
+                        .errors
+                        .iter()
+                        .any(|error| error.contains("Form ID space exhausted")),
+                    "{allocation}: {outcome:?}"
+                );
+                assert!(outcome.changes.is_empty(), "{allocation}: {outcome:?}");
+                assert_eq!(crate::test_support::tree_snapshot(&context.cwd), before);
+            }
+        }
+        let _ = fs::remove_dir_all(&context.cwd);
+    }
+
+    #[test]
+    fn html_document_field_edit_reserves_imported_ids_in_managed_and_extension_forms() {
+        let context = temp_context("html-imported-ids");
+        let form_path = context.cwd.join("Form.xml");
+        for extension in [false, true] {
+            let highest = if extension { 1_000_000usize } else { 5 };
+            let imported = format!(
+                r#"<UsualGroup name="Container" id="1"><ExtendedTooltip name="ContainerTooltip" id="2"/><ChildItems><HTMLDocumentField name="Imported" id="{highest}"><ContextMenu name="ImportedMenu" id="3"/><ExtendedTooltip name="ImportedTooltip" id="4"/></HTMLDocumentField></ChildItems></UsualGroup>"#
+            );
+            let original = editable_form_xml(extension).replace(
+                "\t<ChildItems>\n\t</ChildItems>",
+                &format!("<ChildItems>{imported}</ChildItems>"),
+            );
+            fs::write(&form_path, &original).unwrap();
+            let args = Map::from_iter([
+                (
+                    "FormPath".to_string(),
+                    json!(form_path.display().to_string()),
+                ),
+                (
+                    "definition".to_string(),
+                    json!({
+                        "attributes": [{"name": "HtmlSource", "type": "string"}],
+                        "elements": [{"html": "AddedHtml", "path": "HtmlSource"}]
+                    }),
+                ),
+            ]);
+            let before = crate::test_support::tree_snapshot(&context.cwd);
+            let preview = preview_form_edit(&args, &context);
+            assert!(preview.ok, "extension={extension}: {preview:?}");
+            assert_eq!(crate::test_support::tree_snapshot(&context.cwd), before);
+            let applied = edit_form(&args, &context);
+            assert!(applied.ok, "extension={extension}: {applied:?}");
+            let updated = fs::read_to_string(&form_path).unwrap();
+            let document = Document::parse(&updated).unwrap();
+            let added = document
+                .descendants()
+                .find(|node| node.attribute("name") == Some("AddedHtml"))
+                .unwrap();
+            let ids = added
+                .descendants()
+                .filter_map(|node| node.attribute("id"))
+                .map(|id| id.parse::<usize>().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(ids, [highest + 1, highest + 2, highest + 3]);
+            let ui_ids = document
+                .descendants()
+                .filter(|node| {
+                    node.ancestors()
+                        .any(|ancestor| ancestor.has_tag_name("ChildItems"))
+                })
+                .filter_map(|node| node.attribute("id"))
+                .collect::<Vec<_>>();
+            assert_eq!(ui_ids.len(), ui_ids.iter().collect::<HashSet<_>>().len());
+            assert!(
+                updated.contains(&imported),
+                "imported subtree changed: {updated}"
+            );
+        }
+        let _ = fs::remove_dir_all(&context.cwd);
+    }
+
+    #[test]
+    fn html_document_field_matches_platform_fixture_and_preserves_requested_properties() {
+        let (xml, _) = form_compile_xml(
+            &json!({
+                "attributes": [{"name": "АдресHTML", "type": "string"}],
+                "elements": [{"html": "ПолеHTML", "path": "АдресHTML",
+                    "title": "Описание & детали", "titleLocation": "none",
+                    "skipOnInput": true, "width": 1, "height": 2,
+                    "autoMaxWidth": false, "autoMaxHeight": true,
+                    "visible": false, "enabled": false, "readOnly": true,
+                    "on": ["OnClick", "DocumentComplete"],
+                "handlers": {"OnClick": "ПолеHTMLПриНажатии", "DocumentComplete": "ПолеHTMLДокументСформирован"}}]
+            }),
+            "2.20",
+        )
+        .unwrap();
+        let doc = Document::parse(&xml).unwrap();
+        let field = doc
+            .descendants()
+            .find(|n| n.has_tag_name("HTMLDocumentField"))
+            .unwrap();
+        let fixture = include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/platform_8_3_27/support-edit-bin-only/src/DataProcessors/ТестHTML/Forms/Форма/Ext/Form.xml"));
+        let oracle = Document::parse(fixture.trim_start_matches('\u{feff}')).unwrap();
+        let oracle_field = oracle
+            .descendants()
+            .find(|n| n.has_tag_name("HTMLDocumentField"))
+            .unwrap();
+        for tag in [
+            "DataPath",
+            "SkipOnInput",
+            "TitleLocation",
+            "ContextMenu",
+            "ExtendedTooltip",
+        ] {
+            let actual = field.children().find(|n| n.has_tag_name(tag)).unwrap();
+            let expected = oracle_field
+                .children()
+                .find(|n| n.has_tag_name(tag))
+                .unwrap();
+            assert_eq!(actual.text(), expected.text(), "{tag}");
+            assert_eq!(
+                actual.attribute("name"),
+                expected.attribute("name"),
+                "{tag}"
+            );
+        }
+        let child_names = field
+            .children()
+            .filter(|node| node.is_element())
+            .map(|node| node.tag_name().name())
+            .collect::<Vec<_>>();
+        let binding_order = |node: roxmltree::Node<'_, '_>| {
+            node.children()
+                .filter(|child| child.is_element())
+                .map(|child| child.tag_name().name())
+                .filter(|name| ["DataPath", "SkipOnInput", "TitleLocation"].contains(name))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(binding_order(field), binding_order(oracle_field));
+        // Two 8.3.27.2074 exports preserve this dimension/automatic-bound
+        // order; matching child values alone misses platform normalization.
+        assert_eq!(
+            child_names
+                .iter()
+                .copied()
+                .filter(|name| ["Width", "AutoMaxWidth", "Height", "AutoMaxHeight"].contains(name))
+                .collect::<Vec<_>>(),
+            ["Width", "AutoMaxWidth", "Height", "AutoMaxHeight"]
+        );
+        for (tag, value) in [
+            ("Width", "1"),
+            ("Height", "2"),
+            ("AutoMaxWidth", "false"),
+            ("AutoMaxHeight", "true"),
+            ("Visible", "false"),
+            ("Enabled", "false"),
+            ("ReadOnly", "true"),
+        ] {
+            assert_eq!(
+                field
+                    .children()
+                    .find(|n| n.has_tag_name(tag))
+                    .unwrap()
+                    .text(),
+                Some(value)
+            );
+        }
+        assert!(field
+            .descendants()
+            .any(|n| n.has_tag_name("content") && n.text() == Some("Описание & детали")));
+        let events: Vec<_> = field
+            .descendants()
+            .filter(|n| n.has_tag_name("Event"))
+            .map(|n| (n.attribute("name").unwrap(), n.text().unwrap()))
+            .collect();
+        assert_eq!(
+            events,
+            [
+                ("OnClick", "ПолеHTMLПриНажатии"),
+                ("DocumentComplete", "ПолеHTMLДокументСформирован")
+            ]
+        );
+        let ids: Vec<_> = field
+            .descendants()
+            .filter_map(|n| n.attribute("id"))
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            3
+        );
+    }
+
+    #[test]
+    fn html_document_field_rejects_invalid_events_bindings_and_properties() {
+        for (key, value, expected) in [
+            ("on", json!(["OnChange"]), "FORM_EVENT_NOT_ALLOWED"),
+            ("on", json!(["Click"]), "FORM_EVENT_NOT_ALLOWED"),
+            ("path", json!("Missing"), "missing top-level form attribute"),
+            ("titleLocation", json!("invalid"), "titleLocation"),
+            ("width", json!(-1), "width"),
+            ("height", json!(4294967296_u64), "height"),
+            ("skipOnInput", json!("true"), "boolean"),
+            ("autoMaxWidth", json!(0), "boolean"),
+            ("readOnly", json!("false"), "boolean"),
+        ] {
+            let mut element = json!({"html": "Html", "path": "Source"});
+            element[key] = value;
+            let definition = json!({"attributes": [{"name": "Source", "type": "string"}], "elements": [element]});
+            let error = form_compile_xml(&definition, "2.20").unwrap_err();
+            assert!(error.contains(expected), "{key}: {error}");
+        }
     }
 
     #[test]
